@@ -1,0 +1,11 @@
+# Railway 构建配置
+# 限制 Node.js 内存，避免 OOM
+
+[phases.setup]
+nixPkgs = ["nodejs_20"]
+
+[phases.build]
+cmds = ["npm ci", "npx prisma generate", "NODE_OPTIONS='--max-old-space-size=1024' npx next build"]
+
+[start]
+cmd = "npm run start"
