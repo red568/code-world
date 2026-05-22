@@ -1,0 +1,31 @@
+/**
+ * SSE 事件类型定义
+ *
+ * Worker 推送这些事件到 Redis pub/sub，
+ * SSE 端点订阅并转发给浏览器。
+ */
+
+import { type ProjectStatus } from "@/generated/prisma/client";
+
+export type SSEEvent =
+  | { type: "status_change"; data: { status: ProjectStatus; message: string } }
+  | { type: "spec_chunk"; data: { chunk: string } }
+  | { type: "spec_done"; data: { specJson: Record<string, unknown> } }
+  | { type: "codegen_file_start"; data: { path: string } }
+  | { type: "codegen_chunk"; data: { path: string; chunk: string } }
+  | { type: "codegen_file_done"; data: { path: string } }
+  | { type: "codegen_done"; data: { fileCount: number } }
+  | { type: "review_issue"; data: { severity: string; file: string; problem: string } }
+  | { type: "review_done"; data: { passed: boolean; issueCount: number } }
+  | { type: "build_log"; data: { stream: "stdout" | "stderr"; line: string } }
+  | { type: "fix_start"; data: { attempt: number; diagnosis: string } }
+  | { type: "fix_done"; data: { attempt: number; success: boolean } }
+  | { type: "preview_ready"; data: { previewUrl: string } }
+  | { type: "error"; data: { message: string; code: string } };
+
+/**
+ * 获取项目事件的 Redis pub/sub 频道名
+ */
+export function getProjectChannel(projectId: string): string {
+  return `project:${projectId}:events`;
+}

@@ -1,0 +1,162 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── 用户 ───────────────────────────────────────────────────────────────────────
+
+model User {
+  id        String    @id @default(uuid())
+  email     String    @unique
+  name      String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  projects  Project[]
+}
+
+// ─── 项目 ───────────────────────────────────────────────────────────────────────
+
+enum ProjectStatus {
+  created
+  spec_generating
+  code_generating
+  reviewing
+  building
+  fixing
+  running
+  failed
+  stopped
+}
+
+model Project {
+  id             String        @id @default(uuid())
+  userId         String
+  title          String        @default("Untitled")
+  originalPrompt String
+  specJson       Json?
+  status         ProjectStatus @default(created)
+  sandboxId      String?
+  previewUrl     String?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  user           User            @relation(fields: [userId], references: [id])
+  messages       Message[]
+  files          ProjectFile[]
+  buildLogs      BuildLog[]
+  agentRuns      AgentRun[]
+  sandboxSession SandboxSession?
+
+  @@index([userId])
+}
+
+// ─── 聊天消息 ────────────────────────────────────────────────────────────────────
+
+enum MessageRole {
+  user
+  assistant
+  system
+}
+
+model Message {
+  id        String      @id @default(uuid())
+  projectId String
+  role      MessageRole
+  content   String
+  createdAt DateTime    @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+}
+
+// ─── 项目文件快照 ─────────────────────────────────────────────────────────────────
+
+model ProjectFile {
+  id        String   @id @default(uuid())
+  projectId String
+  path      String
+  content   String
+  version   Int      @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, path])
+  @@index([projectId])
+}
+
+// ─── 构建日志 ────────────────────────────────────────────────────────────────────
+
+model BuildLog {
+  id        String   @id @default(uuid())
+  projectId String
+  command   String
+  stdout    String   @default("")
+  stderr    String   @default("")
+  exitCode  Int?
+  diagnosis String?
+  attempt   Int      @default(1)
+  createdAt DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+}
+
+// ─── Agent 运行记录 ──────────────────────────────────────────────────────────────
+
+enum AgentRunType {
+  spec
+  codegen
+  review
+  fix
+}
+
+enum AgentRunStatus {
+  running
+  completed
+  failed
+}
+
+model AgentRun {
+  id           String         @id @default(uuid())
+  projectId    String
+  type         AgentRunType
+  inputSummary String?
+  outputJson   Json?
+  status       AgentRunStatus @default(running)
+  createdAt    DateTime       @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+}
+
+// ─── Sandbox 会话 ────────────────────────────────────────────────────────────────
+
+enum SandboxStatus {
+  creating
+  running
+  stopped
+  expired
+}
+
+model SandboxSession {
+  id         String        @id @default(uuid())
+  projectId  String        @unique
+  sandboxId  String
+  provider   String        @default("e2b")
+  status     SandboxStatus @default(creating)
+  previewUrl String?
+  startedAt  DateTime      @default(now())
+  stoppedAt  DateTime?
+  expiresAt  DateTime?
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
