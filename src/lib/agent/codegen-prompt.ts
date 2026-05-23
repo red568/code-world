@@ -153,10 +153,15 @@ const SINGLE_FILE_SYSTEM_PROMPT = `你是一个高级前端工程师。根据产
 - CSS 全部通过 Tailwind 类名实现
 - 图片使用 placeholder URL（如 https://placehold.co/600x400）或 SVG 内联
 
+## TypeScript 严格模式要求（tsconfig strict: true）
+- 不要使用 any
+- 处理所有 null/undefined 可能性（用 ?? 或 ! 或条件检查）
+- 确保传递的 props 与目标组件的 interface 定义完全一致
+- 如果依赖文件有签名信息，严格按照其 interface 定义传参
+
 ## 代码质量要求
 - 变量命名清晰，使用 PascalCase 组件名、camelCase 变量名
 - 页面内容丰富真实，不使用大量 Lorem ipsum
-- 确保 TypeScript 类型正确，避免使用 any
 - 单个文件不超过 300 行
 
 ## 输出格式
@@ -219,8 +224,9 @@ ${depsInfo}
 
 export function parseSingleFileResult(raw: string): string {
   return raw
-    .replace(/^```(?:tsx?|jsx?|css)?\s*/m, "")
+    .replace(/^```(?:tsx?|jsx?|css|typescript|javascript)?\s*/m, "")
     .replace(/```\s*$/m, "")
+    .replace(/^(?:typescript|javascript|tsx|jsx)\s*\n/i, "")
     .trim();
 }
 
@@ -234,13 +240,14 @@ export function extractFileSignature(content: string): string {
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    // 匹配 export 语句
-    if (/^export\s+(default\s+)?(function|const|class|interface|type)\s/.test(line)) {
-      signatureLines.push(line.replace(/\{[\s\S]*$/, "{...}").trim());
+    // 匹配 export 语句（函数签名，不含函数体）
+    if (/^export\s+(default\s+)?(function|const|class)\s/.test(line)) {
+      // 只取函数签名行
+      const sigLine = line.replace(/\{[\s\S]*$/, "{...}").trim();
+      signatureLines.push(sigLine);
     }
-    // 匹配 Props interface（含非 export 的）
-    if (/^(export\s+)?interface\s+\w+Props/.test(line)) {
-      // 收集整个 interface
+    // 匹配所有 exported interface 和 type（包括数据模型如 Article, Post 等）
+    if (/^(export\s+)?(interface|type)\s+\w+/.test(line)) {
       let block = line;
       let braces = (line.match(/\{/g) || []).length - (line.match(/\}/g) || []).length;
       let j = i + 1;
