@@ -18,7 +18,8 @@ export default function ProjectPage({
 }) {
   const { id } = use(params);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const { state } = useProjectStream(id);
+  const [sending, setSending] = useState(false);
+  const { state, reset } = useProjectStream(id);
 
   useEffect(() => {
     fetch(`/api/projects/${id}`)
@@ -37,12 +38,19 @@ export default function ProjectPage({
   }, [id]);
 
   const isGenerating =
-    state.phase !== "idle" &&
+    sending ||
+    (state.phase !== "idle" &&
     state.phase !== "running" &&
-    state.phase !== "failed";
+    state.phase !== "failed");
+
+  useEffect(() => {
+    if (state.phase !== "idle") setSending(false);
+  }, [state.phase]);
 
   const handleSend = useCallback(
     async (content: string) => {
+      reset();
+      setSending(true);
       setMessages((prev) => [...prev, { role: "user", content }]);
       try {
         await fetch(`/api/projects/${id}/messages`, {
@@ -51,6 +59,7 @@ export default function ProjectPage({
           body: JSON.stringify({ content }),
         });
       } catch (err) {
+        setSending(false);
         setMessages((prev) => [
           ...prev,
           {
@@ -60,7 +69,7 @@ export default function ProjectPage({
         ]);
       }
     },
-    [id]
+    [id, reset]
   );
 
   return (

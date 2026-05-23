@@ -46,21 +46,25 @@ function stepStatusFromPhase(currentPhase: string, stepPhase: string): StepStatu
   return "pending";
 }
 
-function buildCurrentRoundSteps(streamState: StreamState): TimelineStep[] {
+function buildCurrentRoundSteps(streamState: StreamState, isGenerating: boolean): TimelineStep[] {
   const { phase, timestamps, files, reviewIssues, fixAttempt, message, error } = streamState;
   const steps: TimelineStep[] = [];
+
+  const waitingForServer = phase === "idle" && isGenerating;
 
   const specTs = timestamps.spec_generating;
   steps.push({
     id: "spec",
     type: "spec",
     label: "分析需求",
-    status: stepStatusFromPhase(phase, "spec_generating"),
-    startedAt: specTs?.startedAt,
+    status: waitingForServer ? "active" : stepStatusFromPhase(phase, "spec_generating"),
+    startedAt: waitingForServer ? Date.now() : specTs?.startedAt,
     finishedAt: specTs?.finishedAt,
-    detail: phase === "spec_generating" && streamState.specText
-      ? streamState.specText.slice(0, 80) + "..."
-      : undefined,
+    detail: waitingForServer
+      ? "等待响应..."
+      : phase === "spec_generating" && streamState.specText
+        ? streamState.specText.slice(0, 80) + "..."
+        : undefined,
   });
 
   const codeTs = timestamps.code_generating;
@@ -160,7 +164,7 @@ function buildHistoryRoundSteps(): TimelineStep[] {
   ];
 }
 
-function buildRounds(messages: Message[], streamState: StreamState): TRound[] {
+function buildRounds(messages: Message[], streamState: StreamState, isGenerating: boolean): TRound[] {
   const rounds: TRound[] = [];
   const userMessages = messages.filter((m) => m.role === "user");
 
@@ -170,7 +174,7 @@ function buildRounds(messages: Message[], streamState: StreamState): TRound[] {
       id: idx,
       userMessage: msg.content,
       steps: isCurrentRound
-        ? buildCurrentRoundSteps(streamState)
+        ? buildCurrentRoundSteps(streamState, isGenerating)
         : buildHistoryRoundSteps(),
     });
   });
@@ -188,8 +192,8 @@ export function ChatPanel({
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const rounds = useMemo(
-    () => buildRounds(messages, streamState),
-    [messages, streamState]
+    () => buildRounds(messages, streamState, isGenerating),
+    [messages, streamState, isGenerating]
   );
 
   useEffect(() => {
