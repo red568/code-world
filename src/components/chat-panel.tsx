@@ -75,8 +75,6 @@ function buildCurrentRoundSteps(streamState: StreamState): TimelineStep[] {
     type: "plan",
     label: files.length > 0 ? `规划文件（${files.length} 个）` : "规划文件",
     status: codegenStatus === "pending" ? "pending" : "done",
-    startedAt: codeTs?.startedAt,
-    finishedAt: codeTs?.startedAt ? (codeTs.startedAt + 500) : undefined,
   });
 
   const doneCount = fileItems.filter((f) => f.status === "done").length;

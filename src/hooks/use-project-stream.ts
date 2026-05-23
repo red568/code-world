@@ -133,8 +133,22 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
     case "STATUS_CHANGE": {
       const now = Date.now();
       let acts = state.activities;
+      let baseState = state;
+
       if (action.status === "spec_generating") {
-        acts = addActivity(acts, "thinking", "分析需求");
+        baseState = {
+          ...state,
+          specText: "",
+          files: [],
+          buildLogs: [],
+          reviewIssues: [],
+          fixAttempt: 0,
+          error: null,
+          codegenChars: 0,
+          activities: [],
+          timestamps: {},
+        };
+        acts = addActivity([], "thinking", "分析需求");
       } else if (action.status === "code_generating") {
         acts = finishActiveByType(acts, "thinking");
         acts = addActivity(acts, "thinking", "规划代码结构");
@@ -156,18 +170,24 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
         acts = addActivity(acts, "error", action.message);
         acts = finishAll(acts);
       }
-      const newTimestamps = { ...state.timestamps };
-      if (state.phase !== "idle" && !newTimestamps[state.phase]?.finishedAt) {
-        newTimestamps[state.phase] = { ...newTimestamps[state.phase]!, finishedAt: now };
+      const newTimestamps = { ...baseState.timestamps };
+      if (baseState.phase !== "idle" && newTimestamps[baseState.phase] && !newTimestamps[baseState.phase]!.finishedAt) {
+        newTimestamps[baseState.phase] = { ...newTimestamps[baseState.phase]!, finishedAt: now };
       }
       const nextPhase = action.status as ProjectPhase;
       if (!newTimestamps[nextPhase]) {
         newTimestamps[nextPhase] = { startedAt: now };
       }
-      return { ...state, phase: nextPhase, message: action.message, activities: acts, timestamps: newTimestamps };
+      return { ...baseState, phase: nextPhase, message: action.message, activities: acts, timestamps: newTimestamps };
     }
-    case "SPEC_CHUNK":
-      return { ...state, phase: "spec_generating", specText: state.specText + action.chunk };
+    case "SPEC_CHUNK": {
+      const ts = state.timestamps;
+      const needsInit = !ts.spec_generating;
+      const newTs = needsInit
+        ? { spec_generating: { startedAt: Date.now() } }
+        : ts;
+      return { ...state, phase: "spec_generating", specText: state.specText + action.chunk, timestamps: newTs };
+    }
     case "SPEC_DONE":
       return { ...state, activities: finishActiveByType(state.activities, "thinking") };
     case "PLAN_READY": {
@@ -224,8 +244,15 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
     }
     case "FIX_DONE":
       return { ...state, activities: finishActiveByType(state.activities, "thinking") };
-    case "PREVIEW_READY":
-      return { ...state, phase: "running", previewUrl: action.previewUrl };
+    case "PREVIEW_READY": {
+      const now = Date.now();
+      const newTs = { ...state.timestamps };
+      if (state.phase === "building" && newTs.building && !newTs.building.finishedAt) {
+        newTs.building = { ...newTs.building, finishedAt: now };
+      }
+      newTs.running = { startedAt: now, finishedAt: now };
+      return { ...state, phase: "running", previewUrl: action.previewUrl, timestamps: newTs };
+    }
     case "ERROR": {
       const acts = finishAll(state.activities);
       return { ...state, phase: "failed", error: action.message, activities: [...acts, { id: ++activityId, type: "error", label: action.message, status: "done" }] };
