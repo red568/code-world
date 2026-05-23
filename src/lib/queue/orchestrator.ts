@@ -21,6 +21,7 @@ import {
   buildFixMessages,
   parseFixResult,
   classifyError,
+  extractErrorFiles,
   type SpecResult,
   type CodegenFile,
   type CodePlan,
@@ -473,11 +474,25 @@ async function runBuildAndFix(
     });
 
     const fileTree = await listProjectFiles(sandbox);
-    const relatedFiles: CodegenFile[] = [];
     const dbFiles = await prisma.projectFile.findMany({ where: { projectId } });
 
-    for (const f of dbFiles) {
-      relatedFiles.push({ path: f.path, content: f.content });
+    // 从 stderr 提取报错文件，只传相关文件给 Fix LLM
+    const errorFilePaths = extractErrorFiles(buildResult.stderr);
+    let relatedFiles: CodegenFile[] = [];
+    if (errorFilePaths.length > 0) {
+      relatedFiles = dbFiles
+        .filter((f) => errorFilePaths.some((ep) => f.path.includes(ep) || ep.includes(f.path)))
+        .map((f) => ({ path: f.path, content: f.content }));
+      // 始终包含 App.tsx（通常是 import 错误的源头）
+      const appFile = dbFiles.find((f) => f.path === "src/App.tsx");
+      if (appFile && !relatedFiles.some((f) => f.path === "src/App.tsx")) {
+        relatedFiles.push({ path: appFile.path, content: appFile.content });
+      }
+      log(projectId, "fix", `从 stderr 提取到 ${errorFilePaths.length} 个报错文件: ${errorFilePaths.join(", ")}`);
+    } else {
+      // stderr 中无法提取文件名时，回退传全部文件
+      relatedFiles = dbFiles.map((f) => ({ path: f.path, content: f.content }));
+      log(projectId, "fix", `无法从 stderr 提取文件名，传入全部 ${relatedFiles.length} 个文件`);
     }
 
     const currentPackageJson =
