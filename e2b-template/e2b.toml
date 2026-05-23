@@ -1,0 +1,15 @@
+# This is a config for E2B sandbox template.
+# You can use template ID (i1lhqox6ktdfdcf996lq) or template name (vite-react-tailwind) to create a sandbox:
+
+# Python SDK
+# from e2b import Sandbox, AsyncSandbox
+# sandbox = Sandbox.create("vite-react-tailwind") # Sync sandbox
+# sandbox = await AsyncSandbox.create("vite-react-tailwind") # Async sandbox
+
+# JS SDK
+# import { Sandbox } from 'e2b'
+# const sandbox = await Sandbox.create('vite-react-tailwind')
+
+dockerfile = "e2b.Dockerfile"
+template_name = "vite-react-tailwind"
+template_id = "i1lhqox6ktdfdcf996lq"
