@@ -157,7 +157,7 @@ const SINGLE_FILE_SYSTEM_PROMPT = `你是一个高级前端工程师。根据产
 - 变量命名清晰，使用 PascalCase 组件名、camelCase 变量名
 - 页面内容丰富真实，不使用大量 Lorem ipsum
 - 确保 TypeScript 类型正确，避免使用 any
-- 单个文件不超过 200 行
+- 单个文件不超过 300 行
 
 ## 输出格式
 直接输出文件的完整代码内容，不要包含 markdown 代码块标记，不要包含 JSON 包装，不要包含文件路径注释。
