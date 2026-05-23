@@ -12,21 +12,13 @@ import {
   parseSpecResult,
   buildIterateCodegenMessages,
   parseCodegenResult,
-  buildPlanMessages,
-  parsePlanResult,
-  buildSingleFileMessages,
-  parseSingleFileResult,
-  extractFileSignature,
-  buildReviewMessages,
-  parseReviewResult,
   buildFixMessages,
   parseFixResult,
   classifyError,
   extractErrorFiles,
+  CodegenConversation,
   type SpecResult,
   type CodegenFile,
-  type CodePlan,
-  type ReviewResult,
 } from "@/lib/agent";
 import {
   createSandbox,
@@ -35,7 +27,6 @@ import {
   buildProject,
   startDevServer,
   listProjectFiles,
-  readFile,
   stopSandbox,
 } from "@/lib/sandbox";
 import { getTemplateFiles, TEMPLATE_PACKAGE_JSON } from "@/lib/template/files";
@@ -129,63 +120,41 @@ async function runSpec(projectId: string, prompt: string): Promise<SpecResult> {
   return spec;
 }
 
-// ─── 阶段 2a：Code Plan 生成 ────────────────────────────────────────────────────
+// ─── 阶段 2：多轮会话式代码生成（Plan + Codegen + Review 在同一会话中）──────────
 
-async function runPlan(
+async function runConversationCodegen(
   projectId: string,
   spec: SpecResult
-): Promise<CodePlan> {
+): Promise<CodegenFile[]> {
   const startTime = Date.now();
-  log(projectId, "plan", "开始生成 Code Plan");
+  log(projectId, "codegen", "开始多轮会话式代码生成");
   await updateProjectStatus(projectId, "code_generating", "正在规划代码结构...");
 
-  const messages = buildPlanMessages(spec);
-  const response = await chatCompletion(messages, { maxTokens: 8192, label: `plan:${projectId.slice(0, 8)}` });
+  const conversation = new CodegenConversation(projectId, spec);
 
-  if (!response || response.trim().length === 0) {
-    throw new Error("Code Plan 生成失败：LLM 返回空响应");
-  }
-
-  const plan = parsePlanResult(response);
+  // Turn 1: 生成 Plan
+  const plan = await conversation.generatePlan();
 
   await publishEvent(projectId, {
     type: "plan_ready",
     data: {
       fileCount: plan.files.length,
-      files: plan.files.map((f) => ({ path: f.path, role: f.role })),
+      files: plan.files.map((f: { path: string; role: string }) => ({ path: f.path, role: f.role })),
     },
   });
 
   await recordAgentRun(projectId, "codegen", `plan: ${plan.files.length} files`, {
-    plan: plan.files.map((f) => f.path),
+    plan: plan.files.map((f: { path: string }) => f.path),
     notes: plan.notes,
   });
 
-  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-  log(projectId, "plan", `完成 | files=${plan.files.length} | ${duration}s | notes="${plan.notes?.slice(0, 60)}"`);
-  return plan;
-}
+  const planDuration = ((Date.now() - startTime) / 1000).toFixed(1);
+  log(projectId, "plan", `完成 | files=${plan.files.length} | ${planDuration}s`);
 
-// ─── 阶段 2b：按 Plan 逐文件生成代码 ────────────────────────────────────────────
-
-const MAX_SINGLE_FILE_RETRIES = 2;
-
-async function runCodegen(
-  projectId: string,
-  spec: SpecResult
-): Promise<CodegenFile[]> {
-  const startTime = Date.now();
-
-  // Step 1: 生成 Code Plan
-  const plan = await runPlan(projectId, spec);
-
-  // Step 2: 按 generation_order 逐文件生成
-  log(projectId, "codegen", `开始逐文件生成 | order=${plan.generation_order.length} files`);
+  // Turn 2~N: 按顺序生成每个文件
   await updateProjectStatus(projectId, "code_generating", "正在生成代码...");
-
   const planFileMap = new Map(plan.files.map((f) => [f.path, f]));
   const generatedFiles: CodegenFile[] = [];
-  const generatedExports: { path: string; exports: string[]; signature?: string }[] = [];
 
   for (const filePath of plan.generation_order) {
     const planFile = planFileMap.get(filePath);
@@ -199,45 +168,11 @@ async function runCodegen(
       data: { path: filePath },
     });
 
-    let content: string | null = null;
-    for (let retry = 0; retry <= MAX_SINGLE_FILE_RETRIES; retry++) {
-      const fileStart = Date.now();
-      const label = retry === 0
-        ? `file:${filePath}:${projectId.slice(0, 8)}`
-        : `file:${filePath}:retry${retry}:${projectId.slice(0, 8)}`;
+    const fileStart = Date.now();
+    const content = await conversation.generateFile(planFile);
+    const fileDuration = ((Date.now() - fileStart) / 1000).toFixed(1);
+    log(projectId, "codegen", `✓ ${filePath} | ${content.length} chars | ${fileDuration}s`);
 
-      try {
-        const messages = buildSingleFileMessages({
-          spec,
-          target: planFile,
-          generatedFiles: generatedExports,
-        });
-
-        let fullResponse = "";
-        for await (const chunk of chatCompletionStream(messages, { maxTokens: 4096, label })) {
-          fullResponse += chunk;
-        }
-
-        if (!fullResponse || fullResponse.trim().length === 0) {
-          throw new Error("LLM 返回空响应");
-        }
-
-        content = parseSingleFileResult(fullResponse);
-        const fileDuration = ((Date.now() - fileStart) / 1000).toFixed(1);
-        log(projectId, "codegen", `✓ ${filePath} | ${content.length} chars | ${fileDuration}s${retry > 0 ? ` (retry ${retry})` : ""}`);
-        break;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        log(projectId, "codegen", `✗ ${filePath} 生成失败 (attempt ${retry + 1}): ${msg}`);
-        if (retry === MAX_SINGLE_FILE_RETRIES) {
-          throw new Error(`文件 ${filePath} 生成失败，已重试 ${MAX_SINGLE_FILE_RETRIES} 次: ${msg}`);
-        }
-      }
-    }
-
-    if (!content) continue;
-
-    // 保存到数据库
     await prisma.projectFile.upsert({
       where: { projectId_path: { projectId, path: filePath } },
       create: { projectId, path: filePath, content },
@@ -245,7 +180,6 @@ async function runCodegen(
     });
 
     generatedFiles.push({ path: filePath, content });
-    generatedExports.push({ path: filePath, exports: planFile.exports, signature: extractFileSignature(content) });
 
     await publishEvent(projectId, {
       type: "codegen_file_done",
@@ -253,13 +187,38 @@ async function runCodegen(
     });
   }
 
-  // Step 3: 验证所有 Plan 中的文件都已生成
-  const generatedPaths = new Set(generatedFiles.map((f) => f.path));
-  const missingFiles = plan.files.filter((f) => !generatedPaths.has(f.path));
-  if (missingFiles.length > 0) {
-    const missing = missingFiles.map((f) => f.path).join(", ");
-    throw new Error(`Code Plan 验证失败：以下文件未生成: ${missing}`);
+  // Final Turn: Review（在同一会话中，LLM 能看到之前所有代码）
+  log(projectId, "review", "开始会话内 Review");
+  await updateProjectStatus(projectId, "reviewing", "正在审查代码一致性...");
+
+  const reviewResult = await conversation.review();
+
+  if (!reviewResult.passed && reviewResult.issues.length > 0) {
+    log(projectId, "review", `发现 ${reviewResult.issues.length} 个问题，自动应用修复`);
+    for (const issue of reviewResult.issues) {
+      if (issue.fix && issue.file) {
+        const idx = generatedFiles.findIndex((f) => f.path === issue.file);
+        if (idx >= 0) {
+          generatedFiles[idx] = { path: issue.file, content: issue.fix };
+        } else {
+          generatedFiles.push({ path: issue.file, content: issue.fix });
+        }
+        await prisma.projectFile.upsert({
+          where: { projectId_path: { projectId, path: issue.file } },
+          create: { projectId, path: issue.file, content: issue.fix },
+          update: { content: issue.fix, version: { increment: 1 } },
+        });
+        log(projectId, "review", `  修复: ${issue.file} — ${issue.problem}`);
+      }
+    }
+  } else {
+    log(projectId, "review", "Review 通过，无问题");
   }
+
+  await publishEvent(projectId, {
+    type: "review_done",
+    data: { passed: reviewResult.passed, issueCount: reviewResult.issues.length },
+  });
 
   await publishEvent(projectId, {
     type: "codegen_done",
@@ -269,7 +228,7 @@ async function runCodegen(
   await recordAgentRun(
     projectId,
     "codegen",
-    `${generatedFiles.length} files (plan-based)`,
+    `${generatedFiles.length} files (conversation-based)`,
     { filePaths: generatedFiles.map((f) => f.path) }
   );
 
@@ -337,47 +296,6 @@ async function runIterateCodegen(
   const duration = ((Date.now() - startTime) / 1000).toFixed(1);
   log(projectId, "iterate", `完成 | files=${result.files.length} | ${duration}s`);
   return result.files;
-}
-
-// ─── 阶段 3：Review 代码审查 ────────────────────────────────────────────────────
-
-async function runReview(
-  projectId: string,
-  spec: SpecResult,
-  files: CodegenFile[]
-): Promise<ReviewResult> {
-  const startTime = Date.now();
-  log(projectId, "review", `开始审查 | files=${files.length}`);
-  await updateProjectStatus(projectId, "reviewing", "正在审查代码...");
-
-  const packageJson =
-    files.find((f) => f.path === "package.json")?.content ||
-    TEMPLATE_PACKAGE_JSON;
-
-  const messages = buildReviewMessages(spec, files, packageJson);
-  const response = await chatCompletion(messages, { label: `review:${projectId.slice(0, 8)}` });
-  const result = parseReviewResult(response);
-
-  for (const issue of result.issues) {
-    await publishEvent(projectId, {
-      type: "review_issue",
-      data: {
-        severity: issue.severity,
-        file: issue.file,
-        problem: issue.problem,
-      },
-    });
-  }
-
-  await publishEvent(projectId, {
-    type: "review_done",
-    data: { passed: result.passed, issueCount: result.issues.length },
-  });
-
-  await recordAgentRun(projectId, "review", `${files.length} files`, result);
-  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-  log(projectId, "review", `完成 | passed=${result.passed} | issues=${result.issues.length} | ${duration}s`);
-  return result;
 }
 
 // ─── 阶段 4：构建和自动修复 ──────────────────────────────────────────────────────
@@ -576,7 +494,7 @@ async function runBuildAndFix(
 // ─── 主编排流程 ──────────────────────────────────────────────────────────────────
 
 /**
- * 执行完整的生成流程：Spec → Codegen → Review → Build → Fix → Preview
+ * 执行完整的生成流程：Spec → 多轮会话 Codegen（含 Plan + Review）→ Build → Fix → Preview
  */
 export async function orchestrateGenerate(
   projectId: string,
@@ -590,55 +508,10 @@ export async function orchestrateGenerate(
     // 1. 生成 Spec
     const spec = await runSpec(projectId, prompt);
 
-    // 2. 生成代码
-    let files = await runCodegen(projectId, spec);
+    // 2. 多轮会话生成代码（Plan + 逐文件 + Review 在同一会话）
+    const files = await runConversationCodegen(projectId, spec);
 
-    // 3. Review 代码（只检查会导致构建失败的 P0 问题）
-    const reviewResult = await runReview(projectId, spec, files);
-
-    // 3.5 如果 Review 发现 error 级别问题，先修复再进入 build
-    const errors = reviewResult.issues.filter((i) => i.severity === "error");
-    if (errors.length > 0) {
-      log(projectId, "review-fix", `Review 发现 ${errors.length} 个 error，尝试 pre-build 修复`);
-      await updateProjectStatus(projectId, "fixing", "正在修复审查发现的问题...");
-
-      const errorSummary = errors
-        .map((e) => `[${e.file}] ${e.problem} → ${e.suggested_fix}`)
-        .join("\n");
-
-      const fixMessages = buildFixMessages({
-        spec,
-        command: "code review (pre-build)",
-        stdout: "",
-        stderr: errorSummary,
-        errorCategory: "import_error",
-        relatedFiles: files.filter((f) => errors.some((e) => e.file === f.path)),
-        packageJson: files.find((f) => f.path === "package.json")?.content || TEMPLATE_PACKAGE_JSON,
-        fileTree: files.map((f) => f.path),
-        previousAttempts: [],
-      });
-
-      const fixResponse = await chatCompletion(fixMessages, { maxTokens: 16384, label: `review-fix:${projectId.slice(0, 8)}` });
-      const fixResult = parseFixResult(fixResponse);
-
-      for (const fixed of fixResult.files) {
-        const idx = files.findIndex((f) => f.path === fixed.path);
-        if (idx >= 0) {
-          files[idx] = fixed;
-        } else {
-          files.push(fixed);
-        }
-        await prisma.projectFile.upsert({
-          where: { projectId_path: { projectId, path: fixed.path } },
-          create: { projectId, path: fixed.path, content: fixed.content },
-          update: { content: fixed.content, version: { increment: 1 } },
-        });
-      }
-
-      log(projectId, "review-fix", `修复完成 | fixedFiles=${fixResult.files.length}`);
-    }
-
-    // 4. 创建 Sandbox 并写入文件
+    // 3. 创建 Sandbox 并写入文件
     log(projectId, "sandbox", "正在创建 E2B 沙箱...");
     const sandboxStart = Date.now();
     const instance = await createSandbox();
@@ -659,7 +532,7 @@ export async function orchestrateGenerate(
     log(projectId, "sandbox", `写入文件 | total=${allFiles.length}`);
     await writeProjectFiles(sandbox, allFiles);
 
-    // 5. 构建和自动修复
+    // 4. 构建和自动修复
     const result = await runBuildAndFix(projectId, spec, sandbox);
     if (!result.success) {
       await stopSandbox(sandbox);

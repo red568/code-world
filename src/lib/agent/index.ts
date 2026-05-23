@@ -3,8 +3,10 @@ export { buildCodegenMessages, buildIterateCodegenMessages, parseCodegenResult, 
 export { buildPlanMessages, parsePlanResult } from "./plan-prompt";
 export { buildReviewMessages, parseReviewResult } from "./review-prompt";
 export { buildFixMessages, parseFixResult, classifyError, extractErrorFiles } from "./fix-prompt";
+export { CodegenConversation } from "./conversation";
 export type { SpecResult } from "./spec-prompt";
 export type { CodegenFile, CodegenResult, SingleFileContext } from "./codegen-prompt";
 export type { CodePlan, CodePlanFile } from "./plan-prompt";
 export type { ReviewResult, ReviewIssue } from "./review-prompt";
 export type { FixResult, FixContext, ErrorCategory } from "./fix-prompt";
+export type { ConversationReviewResult, ConversationReviewIssue, ConversationCallbacks } from "./conversation";
