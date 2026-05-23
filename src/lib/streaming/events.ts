@@ -11,6 +11,7 @@ export type SSEEvent =
   | { type: "status_change"; data: { status: ProjectStatus; message: string } }
   | { type: "spec_chunk"; data: { chunk: string } }
   | { type: "spec_done"; data: { specJson: Record<string, unknown> } }
+  | { type: "codegen_progress"; data: { chars: number } }
   | { type: "codegen_file_start"; data: { path: string } }
   | { type: "codegen_chunk"; data: { path: string; chunk: string } }
   | { type: "codegen_file_done"; data: { path: string } }

@@ -134,9 +134,14 @@ async function runCodegen(
 
   const messages = buildCodegenMessages(spec);
   let fullResponse = "";
+  let lastProgressPush = 0;
 
   for await (const chunk of chatCompletionStream(messages, { maxTokens: 16384, label: `codegen:${projectId.slice(0, 8)}` })) {
     fullResponse += chunk;
+    if (fullResponse.length - lastProgressPush > 500) {
+      lastProgressPush = fullResponse.length;
+      await publishEvent(projectId, { type: "codegen_progress", data: { chars: fullResponse.length } });
+    }
   }
 
   log(projectId, "codegen", `LLM 响应完成 | responseChars=${fullResponse.length}`);
@@ -197,9 +202,14 @@ async function runIterateCodegen(
 
   const messages = buildIterateCodegenMessages(spec, currentFiles, userRequest);
   let fullResponse = "";
+  let lastProgressPush = 0;
 
   for await (const chunk of chatCompletionStream(messages, { maxTokens: 16384, label: `iterate:${projectId.slice(0, 8)}` })) {
     fullResponse += chunk;
+    if (fullResponse.length - lastProgressPush > 500) {
+      lastProgressPush = fullResponse.length;
+      await publishEvent(projectId, { type: "codegen_progress", data: { chars: fullResponse.length } });
+    }
   }
 
   log(projectId, "iterate", `LLM 响应完成 | responseChars=${fullResponse.length}`);

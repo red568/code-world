@@ -31,6 +31,15 @@ export interface ReviewIssue {
   problem: string;
 }
 
+// Agent 行为轨迹条目
+export interface ActivityEntry {
+  id: number;
+  type: "thinking" | "file" | "command" | "review" | "error" | "success";
+  label: string;
+  detail?: string;
+  status: "active" | "done";
+}
+
 export interface StreamState {
   phase: ProjectPhase;
   message: string;
@@ -42,9 +51,13 @@ export interface StreamState {
   previewUrl: string | null;
   error: string | null;
   connected: boolean;
+  codegenChars: number;
+  activities: ActivityEntry[];
 }
 
 // ─── Reducer ─────────────────────────────────────────────────────────────────────
+
+let activityId = 0;
 
 type StreamAction =
   | { type: "CONNECTED" }
@@ -52,6 +65,7 @@ type StreamAction =
   | { type: "STATUS_CHANGE"; status: string; message: string }
   | { type: "SPEC_CHUNK"; chunk: string }
   | { type: "SPEC_DONE" }
+  | { type: "CODEGEN_PROGRESS"; chars: number }
   | { type: "FILE_START"; path: string }
   | { type: "FILE_DONE"; path: string }
   | { type: "CODEGEN_DONE"; fileCount: number }
@@ -75,7 +89,32 @@ const initialState: StreamState = {
   previewUrl: null,
   error: null,
   connected: false,
+  codegenChars: 0,
+  activities: [],
 };
+
+function addActivity(
+  activities: ActivityEntry[],
+  type: ActivityEntry["type"],
+  label: string,
+  detail?: string
+): ActivityEntry[] {
+  // Mark previous active entry of same type as done
+  const updated = activities.map((a) =>
+    a.status === "active" && a.type === type ? { ...a, status: "done" as const } : a
+  );
+  return [...updated, { id: ++activityId, type, label, detail, status: "active" }];
+}
+
+function finishActiveByType(activities: ActivityEntry[], type: ActivityEntry["type"]): ActivityEntry[] {
+  return activities.map((a) =>
+    a.status === "active" && a.type === type ? { ...a, status: "done" as const } : a
+  );
+}
+
+function finishAll(activities: ActivityEntry[]): ActivityEntry[] {
+  return activities.map((a) => ({ ...a, status: "done" as const }));
+}
 
 function streamReducer(state: StreamState, action: StreamAction): StreamState {
   switch (action.type) {
@@ -83,27 +122,66 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
       return { ...state, connected: true };
     case "DISCONNECTED":
       return { ...state, connected: false };
-    case "STATUS_CHANGE":
-      return { ...state, phase: action.status as ProjectPhase, message: action.message };
+    case "STATUS_CHANGE": {
+      let acts = state.activities;
+      if (action.status === "spec_generating") {
+        acts = addActivity(acts, "thinking", "分析需求");
+      } else if (action.status === "code_generating") {
+        acts = finishActiveByType(acts, "thinking");
+        acts = addActivity(acts, "thinking", "生成代码");
+      } else if (action.status === "reviewing") {
+        acts = finishActiveByType(acts, "thinking");
+        acts = addActivity(acts, "review", "审查代码");
+      } else if (action.status === "building") {
+        acts = finishActiveByType(acts, "review");
+        acts = addActivity(acts, "command", "构建项目", "npm run build");
+      } else if (action.status === "fixing") {
+        acts = finishActiveByType(acts, "command");
+        acts = addActivity(acts, "thinking", `自动修复（第 ${state.fixAttempt + 1} 轮）`);
+      } else if (action.status === "running") {
+        acts = finishAll(acts);
+        acts = addActivity(acts, "success", "预览就绪");
+        acts = finishAll(acts);
+      } else if (action.status === "failed") {
+        acts = finishAll(acts);
+        acts = addActivity(acts, "error", action.message);
+        acts = finishAll(acts);
+      }
+      return { ...state, phase: action.status as ProjectPhase, message: action.message, activities: acts };
+    }
     case "SPEC_CHUNK":
       return { ...state, phase: "spec_generating", specText: state.specText + action.chunk };
     case "SPEC_DONE":
-      return { ...state };
-    case "FILE_START":
+      return { ...state, activities: finishActiveByType(state.activities, "thinking") };
+    case "CODEGEN_PROGRESS":
+      return { ...state, codegenChars: action.chars };
+    case "FILE_START": {
+      const acts = addActivity(state.activities, "file", action.path);
       return {
         ...state,
         phase: "code_generating",
         files: [...state.files, { path: action.path, status: "generating" }],
+        activities: acts,
       };
-    case "FILE_DONE":
+    }
+    case "FILE_DONE": {
+      const acts = state.activities.map((a) =>
+        a.status === "active" && a.type === "file" && a.label === action.path
+          ? { ...a, status: "done" as const }
+          : a
+      );
       return {
         ...state,
         files: state.files.map((f) =>
           f.path === action.path ? { ...f, status: "done" as const } : f
         ),
+        activities: acts,
       };
-    case "CODEGEN_DONE":
-      return { ...state };
+    }
+    case "CODEGEN_DONE": {
+      const acts = finishActiveByType(state.activities, "thinking");
+      return { ...state, codegenChars: 0, activities: acts };
+    }
     case "REVIEW_ISSUE":
       return {
         ...state,
@@ -111,22 +189,27 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
         reviewIssues: [...state.reviewIssues, action.issue],
       };
     case "REVIEW_DONE":
-      return { ...state };
+      return { ...state, activities: finishActiveByType(state.activities, "review") };
     case "BUILD_LOG":
       return {
         ...state,
         phase: state.phase === "fixing" ? "fixing" : "building",
         buildLogs: [...state.buildLogs, action.line],
       };
-    case "FIX_START":
-      return { ...state, phase: "fixing", fixAttempt: action.attempt, message: action.diagnosis };
+    case "FIX_START": {
+      const acts = addActivity(state.activities, "thinking", `自动修复`, action.diagnosis);
+      return { ...state, phase: "fixing", fixAttempt: action.attempt, message: action.diagnosis, activities: acts };
+    }
     case "FIX_DONE":
-      return { ...state };
+      return { ...state, activities: finishActiveByType(state.activities, "thinking") };
     case "PREVIEW_READY":
       return { ...state, phase: "running", previewUrl: action.previewUrl };
-    case "ERROR":
-      return { ...state, phase: "failed", error: action.message };
+    case "ERROR": {
+      const acts = finishAll(state.activities);
+      return { ...state, phase: "failed", error: action.message, activities: [...acts, { id: ++activityId, type: "error", label: action.message, status: "done" }] };
+    }
     case "RESET":
+      activityId = 0;
       return { ...initialState };
     default:
       return state;
@@ -163,6 +246,11 @@ export function useProjectStream(projectId: string | null) {
 
     eventSource.addEventListener("spec_done", () => {
       dispatch({ type: "SPEC_DONE" });
+    });
+
+    eventSource.addEventListener("codegen_progress", (e) => {
+      const data = JSON.parse(e.data);
+      dispatch({ type: "CODEGEN_PROGRESS", chars: data.chars });
     });
 
     eventSource.addEventListener("codegen_file_start", (e) => {
