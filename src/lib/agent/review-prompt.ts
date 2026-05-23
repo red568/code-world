@@ -2,7 +2,7 @@
  * Review Prompt — 在真实构建前检查生成代码的明显问题
  */
 
-import { type LLMMessage } from "@/lib/llm";
+import { type LLMMessage, safeJsonParse } from "@/lib/llm";
 import { type SpecResult } from "./spec-prompt";
 import { type CodegenFile } from "./codegen-prompt";
 
@@ -93,9 +93,5 @@ export interface ReviewResult {
 }
 
 export function parseReviewResult(raw: string): ReviewResult {
-  const cleaned = raw
-    .replace(/```json\s*/g, "")
-    .replace(/```\s*/g, "")
-    .trim();
-  return JSON.parse(cleaned);
+  return safeJsonParse<ReviewResult>(raw, "review");
 }

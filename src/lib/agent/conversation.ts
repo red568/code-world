@@ -5,7 +5,7 @@
  * 让模型能看到之前所有生成的代码，从而保证跨文件一致性。
  */
 
-import { chatCompletion, type LLMMessage } from "@/lib/llm";
+import { chatCompletion, safeJsonParse, type LLMMessage } from "@/lib/llm";
 import { type SpecResult } from "./spec-prompt";
 import { type CodePlanFile, type CodePlan, parsePlanResult } from "./plan-prompt";
 import { type CodegenFile } from "./codegen-prompt";
@@ -108,7 +108,7 @@ ${EDITABLE_FILES_HINT}
     this.messages.push({ role: "user", content: userContent });
 
     const label = `conv-plan:${this.projectId.slice(0, 8)}`;
-    const response = await chatCompletion(this.messages, { maxTokens: 4096, label });
+    const response = await chatCompletion(this.messages, { maxTokens: 4096, jsonMode: true, label });
 
     if (!response || response.trim().length === 0) {
       throw new Error("Code Plan 生成失败：LLM 返回空响应");
@@ -177,7 +177,7 @@ ${EDITABLE_FILES_HINT}
     this.messages.push({ role: "user", content: userContent });
 
     const label = `conv-review:${this.projectId.slice(0, 8)}`;
-    const response = await chatCompletion(this.messages, { maxTokens: 8192, label });
+    const response = await chatCompletion(this.messages, { maxTokens: 8192, jsonMode: true, label });
 
     this.messages.push({ role: "assistant", content: response });
 
@@ -213,13 +213,8 @@ function parseSingleFileFromConversation(raw: string): string {
 }
 
 function parseConversationReviewResult(raw: string): ConversationReviewResult {
-  const cleaned = raw
-    .replace(/```json\s*/g, "")
-    .replace(/```\s*/g, "")
-    .trim();
-
   try {
-    return JSON.parse(cleaned);
+    return safeJsonParse<ConversationReviewResult>(raw, "conv-review");
   } catch {
     return { passed: true, issues: [] };
   }

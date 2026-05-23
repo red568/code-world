@@ -2,7 +2,7 @@
  * Spec Prompt — 将用户模糊需求转成结构化产品规格
  */
 
-import { type LLMMessage } from "@/lib/llm";
+import { type LLMMessage, safeJsonParse } from "@/lib/llm";
 
 const SPEC_SYSTEM_PROMPT = `你是一个专业的产品规格分析师。你的任务是将用户的网站需求转化为结构化的产品规格 JSON。
 
@@ -69,9 +69,5 @@ export interface SpecResult {
  * 兼容带或不带 markdown 代码块标记的情况
  */
 export function parseSpecResult(raw: string): SpecResult {
-  const cleaned = raw
-    .replace(/```json\s*/g, "")
-    .replace(/```\s*/g, "")
-    .trim();
-  return JSON.parse(cleaned);
+  return safeJsonParse<SpecResult>(raw, "spec");
 }

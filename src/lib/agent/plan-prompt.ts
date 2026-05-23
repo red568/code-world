@@ -5,6 +5,7 @@
  */
 
 import { type LLMMessage } from "@/lib/llm";
+import { safeJsonParse } from "@/lib/llm";
 import { type SpecResult } from "./spec-prompt";
 import { TEMPLATE_FILE_TREE, EDITABLE_FILES_HINT } from "@/lib/template/files";
 
@@ -103,12 +104,7 @@ ${EDITABLE_FILES_HINT}
 }
 
 export function parsePlanResult(raw: string): CodePlan {
-  const cleaned = raw
-    .replace(/```json\s*/g, "")
-    .replace(/```\s*/g, "")
-    .trim();
-
-  const plan: CodePlan = JSON.parse(cleaned);
+  const plan: CodePlan = safeJsonParse(raw, "plan");
 
   if (!plan.files || !Array.isArray(plan.files) || plan.files.length === 0) {
     throw new Error("Code Plan 格式错误：files 为空");

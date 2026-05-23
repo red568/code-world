@@ -7,6 +7,7 @@
  */
 
 import { type LLMMessage } from "@/lib/llm";
+import { safeJsonParse } from "@/lib/llm";
 import { type SpecResult } from "./spec-prompt";
 import { type CodePlanFile } from "./plan-prompt";
 import { TEMPLATE_FILE_TREE, EDITABLE_FILES_HINT } from "@/lib/template/files";
@@ -109,21 +110,20 @@ export interface CodegenResult {
 }
 
 export function parseCodegenResult(raw: string): CodegenResult {
-  const cleaned = raw
-    .replace(/```json\s*/g, "")
-    .replace(/```\s*/g, "")
-    .trim();
-
   try {
-    return JSON.parse(cleaned);
+    return safeJsonParse(raw, "codegen");
   } catch {
-    // LLM 输出被截断时尝试修复 JSON
+    // LLM 输出被截断时尝试正则提取已完成的文件条目
+    const cleaned = raw
+      .replace(/```json\s*/g, "")
+      .replace(/```\s*/g, "")
+      .trim();
+
     const filesMatch = cleaned.match(/"files"\s*:\s*\[/);
     if (!filesMatch) {
       throw new Error("LLM 返回格式错误：未找到 files 数组");
     }
 
-    // 尝试截取已完成的文件条目
     const files: CodegenFile[] = [];
     const filePattern = /\{\s*"path"\s*:\s*"([^"]+)"\s*,\s*"content"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}/g;
     let match;

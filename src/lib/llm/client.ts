@@ -15,6 +15,7 @@ export interface LLMCallOptions {
   temperature?: number;
   maxTokens?: number;
   stream?: boolean;
+  jsonMode?: boolean; // 启用 response_format: json_object
   label?: string; // 调用标识，用于日志
 }
 
@@ -60,6 +61,7 @@ export async function chatCompletion(
     messages,
     temperature: options?.temperature ?? 0.3,
     max_tokens: options?.maxTokens ?? 4096,
+    ...(options?.jsonMode && { response_format: { type: "json_object" as const } }),
   });
 
   const content = response.choices[0]?.message?.content || "";
@@ -94,6 +96,7 @@ export async function* chatCompletionStream(
     temperature: options?.temperature ?? 0.3,
     max_tokens: options?.maxTokens ?? 4096,
     stream: true,
+    ...(options?.jsonMode && { response_format: { type: "json_object" as const } }),
   });
 
   for await (const chunk of stream) {

@@ -3,6 +3,7 @@
  */
 
 import { type LLMMessage } from "@/lib/llm";
+import { safeJsonParse } from "@/lib/llm";
 import { type SpecResult } from "./spec-prompt";
 import { type CodegenFile } from "./codegen-prompt";
 
@@ -111,15 +112,15 @@ export interface FixResult {
 }
 
 export function parseFixResult(raw: string): FixResult {
-  const cleaned = raw
-    .replace(/```json\s*/g, "")
-    .replace(/```\s*/g, "")
-    .trim();
-
   try {
-    return JSON.parse(cleaned);
+    return safeJsonParse(raw, "fix");
   } catch {
     // LLM 输出被 maxTokens 截断时尝试恢复已完成的文件
+    const cleaned = raw
+      .replace(/```json\s*/g, "")
+      .replace(/```\s*/g, "")
+      .trim();
+
     const diagnosisMatch = cleaned.match(/"diagnosis"\s*:\s*"((?:[^"\\]|\\.)*)"/);
     const diagnosis = diagnosisMatch
       ? diagnosisMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"')
