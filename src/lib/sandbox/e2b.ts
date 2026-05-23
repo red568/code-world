@@ -153,13 +153,26 @@ export async function installDependency(
 
 /**
  * 执行项目构建
+ * 如果 SDK 异常导致 stderr 丢失，会单独跑 tsc 拿到真实错误
  */
 export async function buildProject(
   sandbox: Sandbox,
   onStdout?: (line: string) => void,
   onStderr?: (line: string) => void
 ): Promise<CommandResult> {
-  return runCommand(sandbox, "npm run build", onStdout, onStderr);
+  const result = await runCommand(sandbox, "npm run build", onStdout, onStderr);
+
+  // 如果 build 失败但 stderr 没有有用信息，单独跑 tsc 拿真实错误
+  if (result.exitCode !== 0 && !result.stderr.includes("src/")) {
+    console.log(`[Sandbox] [${sandbox.sandboxId.slice(0, 8)}] stderr 缺失，单独执行 tsc 获取错误详情`);
+    const tscResult = await runCommand(sandbox, "npx tsc --noEmit 2>&1 || true");
+    const tscOutput = tscResult.stdout || tscResult.stderr;
+    if (tscOutput.includes("error TS")) {
+      result.stderr = tscOutput;
+    }
+  }
+
+  return result;
 }
 
 /**
