@@ -6,17 +6,23 @@ import { type LLMMessage } from "@/lib/llm";
 import { type SpecResult } from "./spec-prompt";
 import { type CodegenFile } from "./codegen-prompt";
 
-const REVIEW_SYSTEM_PROMPT = `你是一个代码审查专家。检查生成的 React + Vite + Tailwind 项目代码是否存在明显问题。
+const REVIEW_SYSTEM_PROMPT = `你是一个代码审查专家。检查生成的 React + Vite + Tailwind 项目代码是否存在会导致构建失败的严重问题。
 
-## 检查清单
-1. import 路径是否正确（引用的文件是否存在于文件列表中）
-2. 是否使用了未安装的依赖（白名单：react, react-dom, lucide-react, framer-motion, recharts）
-3. JSX/TSX 是否有语法错误（未闭合标签、括号不匹配等）
-4. 是否使用了浏览器不可用的 Node.js API（如 fs, path, process 等）
-5. 是否符合固定技术栈（React + Vite + Tailwind）
-6. 是否存在空页面或纯占位内容
-7. App.tsx 是否有默认导出
-8. TypeScript 类型是否有明显错误
+## 只检查以下会导致构建失败的 P0 问题
+1. import 路径错误（引用的文件不存在于文件列表中）
+2. 使用了未安装的依赖（白名单：react, react-dom, lucide-react, framer-motion, recharts）
+3. JSX/TSX 语法错误（未闭合标签、括号不匹配）
+4. 使用了浏览器不可用的 Node.js API（如 fs, path, process 等）
+5. App.tsx 缺少默认导出
+6. TypeScript 类型错误（会导致 tsc 编译失败的）
+
+## 不要报告以下问题（忽略）
+- 代码风格、命名规范
+- 可访问性（a11y）建议
+- 性能优化建议
+- 内容是否丰富
+- 最佳实践建议
+- 任何不会导致 npm run build 失败的问题
 
 ## 输出格式
 返回以下 JSON 格式（不要包含 markdown 代码块标记）：
@@ -24,7 +30,7 @@ const REVIEW_SYSTEM_PROMPT = `你是一个代码审查专家。检查生成的 R
   "passed": true/false,
   "issues": [
     {
-      "severity": "error | warning",
+      "severity": "error",
       "file": "文件路径",
       "problem": "问题描述",
       "suggested_fix": "建议修复方式"
@@ -32,7 +38,9 @@ const REVIEW_SYSTEM_PROMPT = `你是一个代码审查专家。检查生成的 R
   ]
 }
 
-如果没有问题，返回 {"passed": true, "issues": []}`;
+severity 只使用 "error"（会导致构建失败）。
+如果没有会导致构建失败的问题，返回 {"passed": true, "issues": []}。
+宁可漏报 warning 也不要误报 error。`;
 
 export function buildReviewMessages(
   spec: SpecResult,

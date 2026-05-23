@@ -24,6 +24,7 @@ import {
   type SpecResult,
   type CodegenFile,
   type CodePlan,
+  type ReviewResult,
 } from "@/lib/agent";
 import {
   createSandbox,
@@ -342,7 +343,7 @@ async function runReview(
   projectId: string,
   spec: SpecResult,
   files: CodegenFile[]
-): Promise<boolean> {
+): Promise<ReviewResult> {
   const startTime = Date.now();
   log(projectId, "review", `开始审查 | files=${files.length}`);
   await updateProjectStatus(projectId, "reviewing", "正在审查代码...");
@@ -374,7 +375,7 @@ async function runReview(
   await recordAgentRun(projectId, "review", `${files.length} files`, result);
   const duration = ((Date.now() - startTime) / 1000).toFixed(1);
   log(projectId, "review", `完成 | passed=${result.passed} | issues=${result.issues.length} | ${duration}s`);
-  return result.passed;
+  return result;
 }
 
 // ─── 阶段 4：构建和自动修复 ──────────────────────────────────────────────────────
@@ -547,10 +548,52 @@ export async function orchestrateGenerate(
     const spec = await runSpec(projectId, prompt);
 
     // 2. 生成代码
-    const files = await runCodegen(projectId, spec);
+    let files = await runCodegen(projectId, spec);
 
-    // 3. Review 代码
-    await runReview(projectId, spec, files);
+    // 3. Review 代码（只检查会导致构建失败的 P0 问题）
+    const reviewResult = await runReview(projectId, spec, files);
+
+    // 3.5 如果 Review 发现 error 级别问题，先修复再进入 build
+    const errors = reviewResult.issues.filter((i) => i.severity === "error");
+    if (errors.length > 0) {
+      log(projectId, "review-fix", `Review 发现 ${errors.length} 个 error，尝试 pre-build 修复`);
+      await updateProjectStatus(projectId, "fixing", "正在修复审查发现的问题...");
+
+      const errorSummary = errors
+        .map((e) => `[${e.file}] ${e.problem} → ${e.suggested_fix}`)
+        .join("\n");
+
+      const fixMessages = buildFixMessages({
+        spec,
+        command: "code review (pre-build)",
+        stdout: "",
+        stderr: errorSummary,
+        errorCategory: "import_error",
+        relatedFiles: files.filter((f) => errors.some((e) => e.file === f.path)),
+        packageJson: files.find((f) => f.path === "package.json")?.content || TEMPLATE_PACKAGE_JSON,
+        fileTree: files.map((f) => f.path),
+        previousAttempts: [],
+      });
+
+      const fixResponse = await chatCompletion(fixMessages, { maxTokens: 8192, label: `review-fix:${projectId.slice(0, 8)}` });
+      const fixResult = parseFixResult(fixResponse);
+
+      for (const fixed of fixResult.files) {
+        const idx = files.findIndex((f) => f.path === fixed.path);
+        if (idx >= 0) {
+          files[idx] = fixed;
+        } else {
+          files.push(fixed);
+        }
+        await prisma.projectFile.upsert({
+          where: { projectId_path: { projectId, path: fixed.path } },
+          create: { projectId, path: fixed.path, content: fixed.content },
+          update: { content: fixed.content, version: { increment: 1 } },
+        });
+      }
+
+      log(projectId, "review-fix", `修复完成 | fixedFiles=${fixResult.files.length}`);
+    }
 
     // 4. 创建 Sandbox 并写入文件
     log(projectId, "sandbox", "正在创建 E2B 沙箱...");

@@ -30,5 +30,5 @@
     ".next/dev/types/**/*.ts",
     "**/*.mts"
   ],
-  "exclude": ["node_modules", "e2b-template"]
+  "exclude": ["node_modules", "e2b-template", "scripts/test-output"]
 }

@@ -97,20 +97,37 @@ export async function runCommand(
   const startTime = Date.now();
   console.log(`[Sandbox] [${sandbox.sandboxId.slice(0, 8)}] 执行命令: ${command}`);
 
-  const result = await sandbox.commands.run(command, {
-    timeoutMs: 120_000,
-    onStdout: onStdout ? (data: string) => onStdout(data) : undefined,
-    onStderr: onStderr ? (data: string) => onStderr(data) : undefined,
-  });
+  try {
+    const result = await sandbox.commands.run(command, {
+      timeoutMs: 120_000,
+      onStdout: onStdout ? (data: string) => onStdout(data) : undefined,
+      onStderr: onStderr ? (data: string) => onStderr(data) : undefined,
+    });
 
-  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-  console.log(`[Sandbox] [${sandbox.sandboxId.slice(0, 8)}] 命令完成 | exitCode=${result.exitCode} | ${duration}s`);
+    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`[Sandbox] [${sandbox.sandboxId.slice(0, 8)}] 命令完成 | exitCode=${result.exitCode} | ${duration}s`);
 
-  return {
-    stdout: result.stdout,
-    stderr: result.stderr,
-    exitCode: result.exitCode,
-  };
+    return {
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: result.exitCode,
+    };
+  } catch (error) {
+    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+    const message = error instanceof Error ? error.message : String(error);
+    console.log(`[Sandbox] [${sandbox.sandboxId.slice(0, 8)}] 命令异常 | ${duration}s | error=${message}`);
+
+    // E2B SDK CommandHandle.wait() throws on non-zero exit code in some versions
+    // Extract exit code from error message if possible (format: "exit status N")
+    const exitCodeMatch = message.match(/exit status (\d+)/);
+    const exitCode = exitCodeMatch ? parseInt(exitCodeMatch[1], 10) : 1;
+
+    return {
+      stdout: "",
+      stderr: message,
+      exitCode,
+    };
+  }
 }
 
 /**
