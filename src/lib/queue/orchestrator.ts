@@ -46,7 +46,7 @@ import {
 } from "@/lib/streaming";
 import type { Sandbox } from "@e2b/code-interpreter";
 
-const MAX_FIX_ATTEMPTS = 3;
+const MAX_FIX_ATTEMPTS = 5;
 
 function log(projectId: string, stage: string, message: string) {
   console.log(`[Orchestrator] [${projectId.slice(0, 8)}] [${stage}] ${message}`);
