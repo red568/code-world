@@ -35,7 +35,7 @@ app.get("/health", (_req, res) => {
   res.json({ status: "ok", uptime: process.uptime() });
 });
 
-const MONITOR_PORT = parseInt(process.env.MONITOR_PORT || "3001", 10);
+const MONITOR_PORT = parseInt(process.env.PORT || process.env.MONITOR_PORT || "3001", 10);
 app.listen(MONITOR_PORT, () => {
   console.log(`[Worker] Bull Board 监控面板: http://localhost:${MONITOR_PORT}/monitor`);
 });
