@@ -12,99 +12,50 @@ import {
   Search,
   CheckCircle2,
   XCircle,
-  Brain,
-  Sparkles,
   ChevronDown,
-  AlertTriangle,
   Wrench,
+  Sparkles,
+  Hammer,
 } from "lucide-react";
-import type { ActivityEntry, StreamState } from "@/hooks/use-project-stream";
-
-interface Message {
-  role: "user" | "assistant";
-  content: string;
-}
+import type { Round, AgentStep, StreamState } from "@/hooks/use-project-stream";
 
 interface ChatPanelProps {
-  messages: Message[];
-  streamState: StreamState;
+  rounds: Round[];
+  phase: StreamState["phase"];
   isGenerating: boolean;
   onSend: (message: string) => void;
 }
 
-const ACTIVITY_ICONS: Record<ActivityEntry["type"], React.ReactNode> = {
-  thinking: <Brain className="w-3.5 h-3.5" />,
-  file: <FileCode className="w-3.5 h-3.5" />,
-  command: <Terminal className="w-3.5 h-3.5" />,
+const STEP_ICONS: Record<AgentStep["type"], React.ReactNode> = {
+  spec: <Sparkles className="w-3.5 h-3.5" />,
+  plan: <FileCode className="w-3.5 h-3.5" />,
+  codegen: <FileCode className="w-3.5 h-3.5" />,
   review: <Search className="w-3.5 h-3.5" />,
+  build: <Hammer className="w-3.5 h-3.5" />,
+  fix: <Wrench className="w-3.5 h-3.5" />,
+  done: <CheckCircle2 className="w-3.5 h-3.5" />,
   error: <XCircle className="w-3.5 h-3.5" />,
-  success: <CheckCircle2 className="w-3.5 h-3.5" />,
 };
 
-const ACTIVITY_COLORS: Record<ActivityEntry["type"], string> = {
-  thinking: "text-blue-500",
-  file: "text-violet-500",
-  command: "text-amber-500",
+const STEP_COLORS: Record<AgentStep["type"], string> = {
+  spec: "text-blue-500",
+  plan: "text-violet-500",
+  codegen: "text-violet-500",
   review: "text-cyan-500",
+  build: "text-amber-500",
+  fix: "text-orange-500",
+  done: "text-green-500",
   error: "text-red-500",
-  success: "text-green-500",
 };
 
-function ActivityTrail({ activities, codegenChars }: { activities: ActivityEntry[]; codegenChars: number }) {
-  if (activities.length === 0) return null;
-
-  return (
-    <div className="ml-10 mt-2 space-y-1">
-      <AnimatePresence initial={false}>
-        {activities.map((act) => (
-          <motion.div
-            key={act.id}
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.2 }}
-            className="flex items-center gap-2 py-1"
-          >
-            <span className={`flex-shrink-0 ${ACTIVITY_COLORS[act.type]}`}>
-              {ACTIVITY_ICONS[act.type]}
-            </span>
-            <span className="text-xs text-gray-600">{act.label}</span>
-            {act.detail && (
-              <span className="text-xs text-gray-400 truncate max-w-[140px]">
-                {act.detail}
-              </span>
-            )}
-            {act.status === "active" && (
-              <Loader2 className="w-3 h-3 text-gray-400 animate-spin ml-auto" />
-            )}
-            {act.status === "done" && act.type !== "error" && (
-              <CheckCircle2 className="w-3 h-3 text-green-400 ml-auto" />
-            )}
-          </motion.div>
-        ))}
-      </AnimatePresence>
-      {codegenChars > 0 && (
-        <div className="flex items-center gap-2 py-1 text-xs text-gray-400">
-          <Loader2 className="w-3 h-3 animate-spin" />
-          <span>已生成 {(codegenChars / 1000).toFixed(1)}k 字符...</span>
-        </div>
-      )}
-    </div>
-  );
-}
-
-export function ChatPanel({
-  messages,
-  streamState,
-  isGenerating,
-  onSend,
-}: ChatPanelProps) {
+export function ChatPanel({ rounds, phase, isGenerating, onSend }: ChatPanelProps) {
   const [input, setInput] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages, streamState.activities, streamState.specText]);
+  }, [rounds]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -115,142 +66,18 @@ export function ChatPanel({
 
   return (
     <div className="flex flex-col h-full bg-white">
-      {/* Messages */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-5 py-4 space-y-5">
-        {messages.length === 0 && !streamState.specText && streamState.activities.length === 0 && (
+      {/* Timeline */}
+      <div ref={scrollRef} className="flex-1 overflow-y-auto px-5 py-4 space-y-6">
+        {rounds.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full text-gray-400">
             <Sparkles className="w-8 h-8 mb-3 text-gray-200" />
             <p className="text-sm">对话内容将显示在这里</p>
           </div>
         )}
 
-        {messages.map((msg, i) => (
-          <div key={i} className="flex gap-3">
-            <div
-              className={`w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5 ${
-                msg.role === "user"
-                  ? "bg-gray-100"
-                  : "bg-gradient-to-br from-blue-500 to-purple-600"
-              }`}
-            >
-              {msg.role === "user" ? (
-                <User className="w-3.5 h-3.5 text-gray-600" />
-              ) : (
-                <Bot className="w-3.5 h-3.5 text-white" />
-              )}
-            </div>
-            <div className="flex-1 min-w-0">
-              <p className="text-xs font-medium text-gray-400 mb-1">
-                {msg.role === "user" ? "你" : "AI"}
-              </p>
-              <p className="text-sm text-gray-700 whitespace-pre-wrap leading-relaxed">
-                {msg.content}
-              </p>
-            </div>
-          </div>
+        {rounds.map((round) => (
+          <RoundItem key={round.id} round={round} />
         ))}
-
-        {/* Spec streaming */}
-        {streamState.specText && (
-          <div className="flex gap-3">
-            <div className="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5 bg-gradient-to-br from-blue-500 to-purple-600">
-              <Bot className="w-3.5 h-3.5 text-white" />
-            </div>
-            <div className="flex-1 min-w-0">
-              <p className="text-xs font-medium text-blue-500 mb-1">正在分析需求...</p>
-              <div className="bg-gray-50 rounded-lg p-3 border border-gray-100">
-                <p className="text-xs text-gray-600 font-mono whitespace-pre-wrap leading-relaxed">
-                  {streamState.specText}
-                </p>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Activity trail — appears as AI doing things */}
-        {streamState.activities.length > 0 && (
-          <div className="flex gap-3">
-            <div className="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5 bg-gradient-to-br from-blue-500 to-purple-600">
-              <Bot className="w-3.5 h-3.5 text-white" />
-            </div>
-            <div className="flex-1 min-w-0">
-              <p className="text-xs font-medium text-gray-400 mb-1">Agent 行为轨迹</p>
-              <ActivityTrail
-                activities={streamState.activities}
-                codegenChars={streamState.codegenChars}
-              />
-
-              {/* Collapsible details */}
-              <div className="mt-3 space-y-2">
-                {streamState.files.length > 0 && (
-                  <CollapsibleSection title={`文件 (${streamState.files.length})`}>
-                    <ul className="space-y-1">
-                      {streamState.files.map((f) => (
-                        <li key={f.path} className="flex items-center gap-2">
-                          {f.status === "done" ? (
-                            <CheckCircle2 className="w-3 h-3 text-green-500" />
-                          ) : (
-                            <Loader2 className="w-3 h-3 text-blue-500 animate-spin" />
-                          )}
-                          <span className="text-xs font-mono text-gray-600 truncate">{f.path}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  </CollapsibleSection>
-                )}
-
-                {streamState.reviewIssues.length > 0 && (
-                  <CollapsibleSection title={`审查问题 (${streamState.reviewIssues.length})`}>
-                    <ul className="space-y-1.5">
-                      {streamState.reviewIssues.map((issue, i) => (
-                        <li key={i} className="flex items-start gap-2">
-                          {issue.severity === "error" ? (
-                            <XCircle className="w-3 h-3 text-red-500 mt-0.5 flex-shrink-0" />
-                          ) : (
-                            <AlertTriangle className="w-3 h-3 text-yellow-500 mt-0.5 flex-shrink-0" />
-                          )}
-                          <div className="min-w-0">
-                            <span className="text-xs font-mono text-gray-500">{issue.file}</span>
-                            <p className="text-xs text-gray-600">{issue.problem}</p>
-                          </div>
-                        </li>
-                      ))}
-                    </ul>
-                  </CollapsibleSection>
-                )}
-
-                {streamState.fixAttempt > 0 && (
-                  <div className="flex items-center gap-2 py-1">
-                    <Wrench className="w-3 h-3 text-orange-500" />
-                    <span className="text-xs text-gray-600">
-                      自动修复 第 {streamState.fixAttempt} 轮: {streamState.message}
-                    </span>
-                  </div>
-                )}
-
-                {streamState.buildLogs.length > 0 && (
-                  <CollapsibleSection title={`构建日志 (${streamState.buildLogs.length} 行)`}>
-                    <div className="bg-gray-900 rounded-lg p-2 max-h-40 overflow-y-auto">
-                      <pre className="text-[11px] text-green-400 font-mono whitespace-pre-wrap leading-4">
-                        {streamState.buildLogs.slice(-60).join("\n")}
-                      </pre>
-                    </div>
-                  </CollapsibleSection>
-                )}
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Error */}
-        {streamState.error && (
-          <div className="ml-10 bg-red-50 border border-red-100 rounded-lg p-3">
-            <div className="flex items-center gap-2">
-              <XCircle className="w-3.5 h-3.5 text-red-500" />
-              <span className="text-xs text-red-600">{streamState.error}</span>
-            </div>
-          </div>
-        )}
       </div>
 
       {/* Input */}
@@ -281,18 +108,146 @@ export function ChatPanel({
   );
 }
 
-function CollapsibleSection({ title, children }: { title: string; children: React.ReactNode }) {
-  const [open, setOpen] = useState(false);
+function RoundItem({ round }: { round: Round }) {
   return (
-    <div className="border border-gray-100 rounded-lg overflow-hidden">
-      <button
-        onClick={() => setOpen(!open)}
-        className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-gray-500 hover:bg-gray-50 transition-colors"
+    <div className="space-y-3">
+      {/* User message */}
+      <div className="flex gap-3">
+        <div className="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5 bg-gray-100">
+          <User className="w-3.5 h-3.5 text-gray-600" />
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="text-xs font-medium text-gray-400 mb-1">你</p>
+          <p className="text-sm text-gray-700 whitespace-pre-wrap leading-relaxed">
+            {round.userMessage}
+          </p>
+        </div>
+      </div>
+
+      {/* Agent response with steps */}
+      {round.steps.length > 0 && (
+        <div className="flex gap-3">
+          <div className="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5 bg-gradient-to-br from-blue-500 to-purple-600">
+            <Bot className="w-3.5 h-3.5 text-white" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <p className="text-xs font-medium text-gray-400 mb-2">AI</p>
+            <AgentSteps steps={round.steps} />
+            {round.error && (
+              <div className="mt-2 bg-red-50 border border-red-100 rounded-lg p-2.5">
+                <div className="flex items-center gap-2">
+                  <XCircle className="w-3.5 h-3.5 text-red-500 flex-shrink-0" />
+                  <span className="text-xs text-red-600">{round.error}</span>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AgentSteps({ steps }: { steps: AgentStep[] }) {
+  return (
+    <div className="space-y-1">
+      {steps.map((step, i) => {
+        const isLast = i === steps.length - 1;
+        const shouldExpand = isLast && step.status === "active";
+        return <StepItem key={step.id} step={step} expanded={shouldExpand} />;
+      })}
+    </div>
+  );
+}
+
+function StepItem({ step, expanded }: { step: AgentStep; expanded: boolean }) {
+  const [manualExpand, setManualExpand] = useState(false);
+  const isOpen = expanded || manualExpand;
+  const hasContent = (step.files && step.files.length > 0) ||
+    (step.buildLogs && step.buildLogs.length > 0) ||
+    (step.reviewIssues && step.reviewIssues.length > 0);
+
+  return (
+    <div className="group">
+      <div
+        className={`flex items-center gap-2 py-1.5 px-2 rounded-md transition-colors ${
+          step.status === "active" ? "bg-blue-50/50" : "hover:bg-gray-50"
+        } ${hasContent ? "cursor-pointer" : ""}`}
+        onClick={() => hasContent && setManualExpand(!manualExpand)}
+        role={hasContent ? "button" : undefined}
       >
-        <ChevronDown className={`w-3 h-3 transition-transform ${open ? "rotate-0" : "-rotate-90"}`} />
-        <span>{title}</span>
-      </button>
-      {open && <div className="px-3 pb-2">{children}</div>}
+        <span className={`flex-shrink-0 ${STEP_COLORS[step.type]}`}>
+          {step.status === "active" ? (
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+          ) : (
+            STEP_ICONS[step.type]
+          )}
+        </span>
+
+        <span className={`text-xs flex-1 ${
+          step.status === "active" ? "text-gray-700 font-medium" : "text-gray-500"
+        }`}>
+          {step.label}
+        </span>
+
+        {step.status === "done" && step.type !== "done" && step.type !== "error" && (
+          <CheckCircle2 className="w-3 h-3 text-green-400" />
+        )}
+
+        {hasContent && (
+          <ChevronDown className={`w-3 h-3 text-gray-300 transition-transform ${isOpen ? "rotate-0" : "-rotate-90"}`} />
+        )}
+      </div>
+
+      <AnimatePresence>
+        {isOpen && hasContent && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.15 }}
+            className="overflow-hidden"
+          >
+            <div className="ml-6 pl-2 border-l-2 border-gray-100 pb-1 space-y-1.5">
+              {step.files && step.files.length > 0 && (
+                <ul className="space-y-0.5">
+                  {step.files.map((f) => (
+                    <li key={f.path} className="flex items-center gap-2 py-0.5">
+                      {f.status === "done" ? (
+                        <CheckCircle2 className="w-3 h-3 text-green-500" />
+                      ) : (
+                        <Loader2 className="w-3 h-3 text-blue-500 animate-spin" />
+                      )}
+                      <span className="text-[11px] font-mono text-gray-500 truncate">{f.path}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              {step.reviewIssues && step.reviewIssues.length > 0 && (
+                <ul className="space-y-1">
+                  {step.reviewIssues.map((issue, i) => (
+                    <li key={i} className="flex items-start gap-1.5">
+                      <XCircle className="w-3 h-3 text-red-400 mt-0.5 flex-shrink-0" />
+                      <span className="text-[11px] text-gray-500">
+                        <span className="font-mono">{issue.file}</span>: {issue.problem}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              {step.buildLogs && step.buildLogs.length > 0 && (
+                <div className="bg-gray-900 rounded-md p-2 max-h-32 overflow-y-auto">
+                  <pre className="text-[10px] text-green-400 font-mono whitespace-pre-wrap leading-4">
+                    {step.buildLogs.slice(-40).join("\n")}
+                  </pre>
+                </div>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

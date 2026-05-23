@@ -1,7 +1,8 @@
 /**
  * useProjectStream — 订阅项目 SSE 事件流的 React Hook
  *
- * 连接 /api/projects/:id/stream 端点，实时接收生成和构建事件。
+ * 基于"轮次"模型：每个用户消息 + Agent 响应 = 一个 Round。
+ * Agent 响应内部的步骤（spec、plan、codegen、build）作为子节点。
  */
 
 "use client";
@@ -31,37 +32,44 @@ export interface ReviewIssue {
   problem: string;
 }
 
-// Agent 行为轨迹条目
-export interface ActivityEntry {
+export type StepStatus = "active" | "done" | "error";
+
+export interface AgentStep {
   id: number;
-  type: "thinking" | "file" | "command" | "review" | "error" | "success";
+  type: "spec" | "plan" | "codegen" | "review" | "build" | "fix" | "done" | "error";
   label: string;
   detail?: string;
-  status: "active" | "done";
+  status: StepStatus;
+  files?: StreamFile[];
+  buildLogs?: string[];
+  reviewIssues?: ReviewIssue[];
+}
+
+export interface Round {
+  id: number;
+  userMessage: string;
+  steps: AgentStep[];
+  phase: ProjectPhase;
+  previewUrl?: string | null;
+  error?: string | null;
 }
 
 export interface StreamState {
-  phase: ProjectPhase;
-  message: string;
-  specText: string;
-  files: StreamFile[];
-  buildLogs: string[];
-  reviewIssues: ReviewIssue[];
-  fixAttempt: number;
-  previewUrl: string | null;
-  error: string | null;
+  rounds: Round[];
   connected: boolean;
-  codegenChars: number;
-  activities: ActivityEntry[];
+  phase: ProjectPhase;
+  previewUrl: string | null;
 }
 
 // ─── Reducer ─────────────────────────────────────────────────────────────────────
 
-let activityId = 0;
+let stepId = 0;
+let roundId = 0;
 
 type StreamAction =
   | { type: "CONNECTED" }
   | { type: "DISCONNECTED" }
+  | { type: "ADD_USER_MESSAGE"; content: string }
   | { type: "STATUS_CHANGE"; status: string; message: string }
   | { type: "SPEC_CHUNK"; chunk: string }
   | { type: "SPEC_DONE" }
@@ -77,44 +85,69 @@ type StreamAction =
   | { type: "FIX_DONE"; attempt: number; success: boolean }
   | { type: "PREVIEW_READY"; previewUrl: string }
   | { type: "ERROR"; message: string }
-  | { type: "RESET" };
+  | { type: "RESET" }
+  | { type: "LOAD_HISTORY"; rounds: Round[] };
 
 const initialState: StreamState = {
-  phase: "idle",
-  message: "",
-  specText: "",
-  files: [],
-  buildLogs: [],
-  reviewIssues: [],
-  fixAttempt: 0,
-  previewUrl: null,
-  error: null,
+  rounds: [],
   connected: false,
-  codegenChars: 0,
-  activities: [],
+  phase: "idle",
+  previewUrl: null,
 };
 
-function addActivity(
-  activities: ActivityEntry[],
-  type: ActivityEntry["type"],
-  label: string,
-  detail?: string
-): ActivityEntry[] {
-  // Mark previous active entry of same type as done
-  const updated = activities.map((a) =>
-    a.status === "active" && a.type === type ? { ...a, status: "done" as const } : a
-  );
-  return [...updated, { id: ++activityId, type, label, detail, status: "active" }];
+function getCurrentRound(state: StreamState): Round | null {
+  return state.rounds.length > 0 ? state.rounds[state.rounds.length - 1] : null;
 }
 
-function finishActiveByType(activities: ActivityEntry[], type: ActivityEntry["type"]): ActivityEntry[] {
-  return activities.map((a) =>
-    a.status === "active" && a.type === type ? { ...a, status: "done" as const } : a
-  );
+function updateCurrentRound(state: StreamState, updater: (round: Round) => Round): StreamState {
+  if (state.rounds.length === 0) {
+    const placeholder: Round = {
+      id: ++roundId,
+      userMessage: "",
+      steps: [],
+      phase: "idle",
+    };
+    return { ...state, rounds: [updater(placeholder)] };
+  }
+  const rounds = [...state.rounds];
+  rounds[rounds.length - 1] = updater(rounds[rounds.length - 1]);
+  return { ...state, rounds };
 }
 
-function finishAll(activities: ActivityEntry[]): ActivityEntry[] {
-  return activities.map((a) => ({ ...a, status: "done" as const }));
+function addStep(round: Round, type: AgentStep["type"], label: string, detail?: string): Round {
+  return {
+    ...round,
+    steps: [...round.steps, { id: ++stepId, type, label, detail, status: "active" }],
+  };
+}
+
+function finishStepByType(round: Round, type: AgentStep["type"]): Round {
+  return {
+    ...round,
+    steps: round.steps.map((s) =>
+      s.status === "active" && s.type === type ? { ...s, status: "done" as const } : s
+    ),
+  };
+}
+
+function finishAllSteps(round: Round): Round {
+  return {
+    ...round,
+    steps: round.steps.map((s) => ({ ...s, status: s.status === "active" ? ("done" as const) : s.status })),
+  };
+}
+
+function getActiveStep(round: Round, type: AgentStep["type"]): AgentStep | undefined {
+  return round.steps.find((s) => s.type === type && s.status === "active");
+}
+
+function updateActiveStep(round: Round, type: AgentStep["type"], updater: (s: AgentStep) => AgentStep): Round {
+  return {
+    ...round,
+    steps: round.steps.map((s) =>
+      s.status === "active" && s.type === type ? updater(s) : s
+    ),
+  };
 }
 
 function streamReducer(state: StreamState, action: StreamAction): StreamState {
@@ -123,100 +156,171 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
       return { ...state, connected: true };
     case "DISCONNECTED":
       return { ...state, connected: false };
+
+    case "ADD_USER_MESSAGE": {
+      const newRound: Round = {
+        id: ++roundId,
+        userMessage: action.content,
+        steps: [],
+        phase: "idle",
+      };
+      return { ...state, rounds: [...state.rounds, newRound] };
+    }
+
     case "STATUS_CHANGE": {
-      let acts = state.activities;
-      if (action.status === "spec_generating") {
-        acts = addActivity(acts, "thinking", "分析需求");
-      } else if (action.status === "code_generating") {
-        acts = finishActiveByType(acts, "thinking");
-        acts = addActivity(acts, "thinking", "规划代码结构");
-      } else if (action.status === "reviewing") {
-        acts = finishActiveByType(acts, "thinking");
-        acts = addActivity(acts, "review", "审查代码");
-      } else if (action.status === "building") {
-        acts = finishActiveByType(acts, "review");
-        acts = addActivity(acts, "command", "构建项目", "npm run build");
-      } else if (action.status === "fixing") {
-        acts = finishActiveByType(acts, "command");
-        acts = addActivity(acts, "thinking", `自动修复（第 ${state.fixAttempt + 1} 轮）`);
-      } else if (action.status === "running") {
-        acts = finishAll(acts);
-        acts = addActivity(acts, "success", "预览就绪");
-        acts = finishAll(acts);
-      } else if (action.status === "failed") {
-        acts = finishAll(acts);
-        acts = addActivity(acts, "error", action.message);
-        acts = finishAll(acts);
-      }
-      return { ...state, phase: action.status as ProjectPhase, message: action.message, activities: acts };
+      const phase = action.status as ProjectPhase;
+      let newState = { ...state, phase };
+
+      newState = updateCurrentRound(newState, (round) => {
+        let r = { ...round, phase };
+        if (action.status === "spec_generating") {
+          r = addStep(r, "spec", "分析需求");
+        } else if (action.status === "code_generating") {
+          r = finishStepByType(r, "spec");
+          if (!getActiveStep(r, "codegen")) {
+            r = addStep(r, "codegen", "生成代码");
+          }
+        } else if (action.status === "reviewing") {
+          r = finishStepByType(r, "codegen");
+          r = addStep(r, "review", "审查代码");
+        } else if (action.status === "building") {
+          r = finishStepByType(r, "review");
+          r = addStep(r, "build", "构建项目");
+        } else if (action.status === "fixing") {
+          r = finishStepByType(r, "build");
+          r = addStep(r, "fix", "自动修复", action.message);
+        } else if (action.status === "running") {
+          r = finishAllSteps(r);
+          r = addStep(r, "done", "预览就绪");
+          r = finishAllSteps(r);
+        } else if (action.status === "failed") {
+          r = finishAllSteps(r);
+          r = { ...r, error: action.message };
+        }
+        return r;
+      });
+      return newState;
     }
+
     case "SPEC_CHUNK":
-      return { ...state, phase: "spec_generating", specText: state.specText + action.chunk };
-    case "SPEC_DONE":
-      return { ...state, activities: finishActiveByType(state.activities, "thinking") };
-    case "PLAN_READY": {
-      let acts = finishActiveByType(state.activities, "thinking");
-      acts = addActivity(acts, "thinking", `生成代码（${action.fileCount} 个文件）`);
-      return { ...state, activities: acts };
-    }
-    case "CODEGEN_PROGRESS":
-      return { ...state, codegenChars: action.chars };
-    case "FILE_START": {
-      const acts = addActivity(state.activities, "file", action.path);
-      return {
-        ...state,
-        phase: "code_generating",
-        files: [...state.files, { path: action.path, status: "generating" }],
-        activities: acts,
-      };
-    }
-    case "FILE_DONE": {
-      const acts = state.activities.map((a) =>
-        a.status === "active" && a.type === "file" && a.label === action.path
-          ? { ...a, status: "done" as const }
-          : a
+      return updateCurrentRound(state, (round) =>
+        updateActiveStep(round, "spec", (s) => ({
+          ...s,
+          detail: (s.detail || "") + action.chunk,
+        }))
       );
-      return {
-        ...state,
-        files: state.files.map((f) =>
-          f.path === action.path ? { ...f, status: "done" as const } : f
-        ),
-        activities: acts,
-      };
-    }
-    case "CODEGEN_DONE": {
-      const acts = finishActiveByType(state.activities, "thinking");
-      return { ...state, codegenChars: 0, activities: acts };
-    }
+
+    case "SPEC_DONE":
+      return updateCurrentRound(state, (round) => finishStepByType(round, "spec"));
+
+    case "PLAN_READY":
+      return updateCurrentRound(state, (round) => {
+        let r = finishStepByType(round, "spec");
+        r = addStep(r, "plan", `规划完成（${action.fileCount} 个文件）`);
+        r = finishStepByType(r, "plan");
+        if (!getActiveStep(r, "codegen")) {
+          r = addStep(r, "codegen", "生成代码", `${action.fileCount} 个文件`);
+        }
+        return r;
+      });
+
+    case "FILE_START":
+      return updateCurrentRound(state, (round) =>
+        updateActiveStep(round, "codegen", (s) => ({
+          ...s,
+          files: [...(s.files || []), { path: action.path, status: "generating" as const }],
+        }))
+      );
+
+    case "FILE_DONE":
+      return updateCurrentRound(state, (round) =>
+        updateActiveStep(round, "codegen", (s) => ({
+          ...s,
+          files: (s.files || []).map((f) =>
+            f.path === action.path ? { ...f, status: "done" as const } : f
+          ),
+        }))
+      );
+
+    case "CODEGEN_DONE":
+      return updateCurrentRound(state, (round) => finishStepByType(round, "codegen"));
+
+    case "CODEGEN_PROGRESS":
+      return state;
+
     case "REVIEW_ISSUE":
-      return {
-        ...state,
-        phase: "reviewing",
-        reviewIssues: [...state.reviewIssues, action.issue],
-      };
+      return updateCurrentRound(state, (round) =>
+        updateActiveStep(round, "review", (s) => ({
+          ...s,
+          reviewIssues: [...(s.reviewIssues || []), action.issue],
+        }))
+      );
+
     case "REVIEW_DONE":
-      return { ...state, activities: finishActiveByType(state.activities, "review") };
+      return updateCurrentRound(state, (round) => finishStepByType(round, "review"));
+
     case "BUILD_LOG":
-      return {
-        ...state,
-        phase: state.phase === "fixing" ? "fixing" : "building",
-        buildLogs: [...state.buildLogs, action.line],
-      };
-    case "FIX_START": {
-      const acts = addActivity(state.activities, "thinking", `自动修复`, action.diagnosis);
-      return { ...state, phase: "fixing", fixAttempt: action.attempt, message: action.diagnosis, activities: acts };
-    }
+      return updateCurrentRound(state, (round) => {
+        const buildStep = getActiveStep(round, "build") || getActiveStep(round, "fix");
+        if (!buildStep) return round;
+        return updateActiveStep(round, buildStep.type, (s) => ({
+          ...s,
+          buildLogs: [...(s.buildLogs || []), action.line],
+        }));
+      });
+
+    case "FIX_START":
+      return updateCurrentRound(state, (round) => {
+        let r = finishStepByType(round, "build");
+        r = finishStepByType(r, "fix");
+        r = addStep(r, "fix", `自动修复（第 ${action.attempt} 轮）`, action.diagnosis);
+        return r;
+      });
+
     case "FIX_DONE":
-      return { ...state, activities: finishActiveByType(state.activities, "thinking") };
+      return updateCurrentRound(state, (round) => {
+        let r = finishStepByType(round, "fix");
+        if (action.success) return r;
+        r = addStep(r, "build", "重新构建");
+        return r;
+      });
+
     case "PREVIEW_READY":
-      return { ...state, phase: "running", previewUrl: action.previewUrl };
-    case "ERROR": {
-      const acts = finishAll(state.activities);
-      return { ...state, phase: "failed", error: action.message, activities: [...acts, { id: ++activityId, type: "error", label: action.message, status: "done" }] };
+      return updateCurrentRound(
+        { ...state, phase: "running", previewUrl: action.previewUrl },
+        (round) => ({ ...round, phase: "running", previewUrl: action.previewUrl })
+      );
+
+    case "ERROR":
+      return updateCurrentRound(
+        { ...state, phase: "failed" },
+        (round) => {
+          let r = finishAllSteps(round);
+          r = addStep(r, "error", action.message);
+          r = finishAllSteps(r);
+          return { ...r, phase: "failed", error: action.message };
+        }
+      );
+
+    case "LOAD_HISTORY": {
+      if (state.rounds.length === 1 && state.rounds[0].userMessage === "" && action.rounds.length > 0) {
+        const merged = [...action.rounds];
+        const last = merged[merged.length - 1];
+        merged[merged.length - 1] = {
+          ...last,
+          steps: [...last.steps, ...state.rounds[0].steps],
+          phase: state.rounds[0].phase !== "idle" ? state.rounds[0].phase : last.phase,
+        };
+        return { ...state, rounds: merged };
+      }
+      return { ...state, rounds: action.rounds };
     }
+
     case "RESET":
-      activityId = 0;
+      stepId = 0;
+      roundId = 0;
       return { ...initialState };
+
     default:
       return state;
   }
@@ -228,6 +332,14 @@ export function useProjectStream(projectId: string | null) {
   const [state, dispatch] = useReducer(streamReducer, initialState);
 
   const reset = useCallback(() => dispatch({ type: "RESET" }), []);
+  const addUserMessage = useCallback(
+    (content: string) => dispatch({ type: "ADD_USER_MESSAGE", content }),
+    []
+  );
+  const loadHistory = useCallback(
+    (rounds: Round[]) => dispatch({ type: "LOAD_HISTORY", rounds }),
+    []
+  );
 
   useEffect(() => {
     if (!projectId) return;
@@ -323,5 +435,5 @@ export function useProjectStream(projectId: string | null) {
     };
   }, [projectId]);
 
-  return { state, reset };
+  return { state, reset, addUserMessage, loadHistory };
 }

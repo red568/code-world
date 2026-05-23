@@ -1,15 +1,10 @@
 "use client";
 
-import { useState, useCallback, useEffect, use } from "react";
+import { useCallback, useEffect, use } from "react";
 import { SessionSidebar } from "@/components/session-sidebar";
 import { ChatPanel } from "@/components/chat-panel";
 import { PreviewPanel } from "@/components/preview-panel";
-import { useProjectStream } from "@/hooks/use-project-stream";
-
-interface ChatMessage {
-  role: "user" | "assistant";
-  content: string;
-}
+import { useProjectStream, type Round } from "@/hooks/use-project-stream";
 
 export default function ProjectPage({
   params,
@@ -17,24 +12,19 @@ export default function ProjectPage({
   params: Promise<{ id: string }>;
 }) {
   const { id } = use(params);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const { state } = useProjectStream(id);
+  const { state, addUserMessage, loadHistory } = useProjectStream(id);
 
   useEffect(() => {
     fetch(`/api/projects/${id}`)
       .then((res) => res.json())
       .then((data) => {
-        if (data.project?.messages) {
-          setMessages(
-            data.project.messages.map((m: { role: string; content: string }) => ({
-              role: m.role as "user" | "assistant",
-              content: m.content,
-            }))
-          );
+        if (data.project?.messages && data.project.messages.length > 0) {
+          const rounds = messagesToRounds(data.project.messages);
+          loadHistory(rounds);
         }
       })
       .catch(() => {});
-  }, [id]);
+  }, [id, loadHistory]);
 
   const isGenerating =
     state.phase !== "idle" &&
@@ -43,24 +33,18 @@ export default function ProjectPage({
 
   const handleSend = useCallback(
     async (content: string) => {
-      setMessages((prev) => [...prev, { role: "user", content }]);
+      addUserMessage(content);
       try {
         await fetch(`/api/projects/${id}/messages`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ content }),
         });
-      } catch (err) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: "assistant",
-            content: `发送失败: ${err instanceof Error ? err.message : "未知错误"}`,
-          },
-        ]);
+      } catch {
+        // Error will come through SSE
       }
     },
-    [id]
+    [id, addUserMessage]
   );
 
   return (
@@ -70,11 +54,11 @@ export default function ProjectPage({
         <SessionSidebar />
       </div>
 
-      {/* Middle: Chat + Activity trail */}
+      {/* Middle: Chat timeline */}
       <div className="w-[420px] flex-shrink-0 border-r border-gray-200">
         <ChatPanel
-          messages={messages}
-          streamState={state}
+          rounds={state.rounds}
+          phase={state.phase}
           isGenerating={isGenerating}
           onSend={handleSend}
         />
@@ -90,4 +74,30 @@ export default function ProjectPage({
       </div>
     </div>
   );
+}
+
+function messagesToRounds(messages: { role: string; content: string }[]): Round[] {
+  const rounds: Round[] = [];
+  let roundId = 0;
+
+  for (const msg of messages) {
+    if (msg.role === "user") {
+      rounds.push({
+        id: ++roundId,
+        userMessage: msg.content,
+        steps: [],
+        phase: "running",
+      });
+    } else if (msg.role === "assistant" && rounds.length > 0) {
+      const current = rounds[rounds.length - 1];
+      current.steps.push({
+        id: roundId * 100,
+        type: "done",
+        label: msg.content,
+        status: "done",
+      });
+    }
+  }
+
+  return rounds;
 }
