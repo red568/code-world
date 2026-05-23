@@ -97,11 +97,21 @@ export async function runCommand(
   const startTime = Date.now();
   console.log(`[Sandbox] [${sandbox.sandboxId.slice(0, 8)}] 执行命令: ${command}`);
 
+  // 收集流式输出，以防 SDK 抛异常时 result 对象不可用
+  const stdoutChunks: string[] = [];
+  const stderrChunks: string[] = [];
+
   try {
     const result = await sandbox.commands.run(command, {
       timeoutMs: 120_000,
-      onStdout: onStdout ? (data: string) => onStdout(data) : undefined,
-      onStderr: onStderr ? (data: string) => onStderr(data) : undefined,
+      onStdout: (data: string) => {
+        stdoutChunks.push(data);
+        onStdout?.(data);
+      },
+      onStderr: (data: string) => {
+        stderrChunks.push(data);
+        onStderr?.(data);
+      },
     });
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -122,11 +132,11 @@ export async function runCommand(
     const exitCodeMatch = message.match(/exit status (\d+)/);
     const exitCode = exitCodeMatch ? parseInt(exitCodeMatch[1], 10) : 1;
 
-    return {
-      stdout: "",
-      stderr: message,
-      exitCode,
-    };
+    // 用流式回调收集到的真实输出，而非仅返回异常消息
+    const stdout = stdoutChunks.join("");
+    const stderr = stderrChunks.join("") || message;
+
+    return { stdout, stderr, exitCode };
   }
 }
 

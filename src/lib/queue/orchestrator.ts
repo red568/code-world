@@ -496,7 +496,7 @@ async function runBuildAndFix(
       previousAttempts: fixSummaries,
     });
 
-    const fixResponse = await chatCompletion(fixMessages, { maxTokens: 8192, label: `fix#${attempt}:${projectId.slice(0, 8)}` });
+    const fixResponse = await chatCompletion(fixMessages, { maxTokens: 16384, label: `fix#${attempt}:${projectId.slice(0, 8)}` });
     const fixResult = parseFixResult(fixResponse);
 
     await writeProjectFiles(sandbox, fixResult.files);
@@ -575,7 +575,7 @@ export async function orchestrateGenerate(
         previousAttempts: [],
       });
 
-      const fixResponse = await chatCompletion(fixMessages, { maxTokens: 8192, label: `review-fix:${projectId.slice(0, 8)}` });
+      const fixResponse = await chatCompletion(fixMessages, { maxTokens: 16384, label: `review-fix:${projectId.slice(0, 8)}` });
       const fixResult = parseFixResult(fixResponse);
 
       for (const fixed of fixResult.files) {

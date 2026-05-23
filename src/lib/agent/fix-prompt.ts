@@ -110,7 +110,32 @@ export function parseFixResult(raw: string): FixResult {
     .replace(/```json\s*/g, "")
     .replace(/```\s*/g, "")
     .trim();
-  return JSON.parse(cleaned);
+
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    // LLM 输出被 maxTokens 截断时尝试恢复已完成的文件
+    const diagnosisMatch = cleaned.match(/"diagnosis"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+    const diagnosis = diagnosisMatch
+      ? diagnosisMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"')
+      : "LLM 输出被截断";
+
+    const files: CodegenFile[] = [];
+    const filePattern = /\{\s*"path"\s*:\s*"([^"]+)"\s*,\s*"content"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}/g;
+    let match;
+    while ((match = filePattern.exec(cleaned)) !== null) {
+      files.push({
+        path: match[1],
+        content: match[2].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\"),
+      });
+    }
+
+    if (files.length === 0) {
+      throw new Error("Fix LLM 返回被截断且无法恢复任何文件");
+    }
+
+    return { diagnosis, files };
+  }
 }
 
 /**
