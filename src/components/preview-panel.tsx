@@ -14,27 +14,27 @@ export function PreviewPanel({ previewUrl, isBuilding, phase }: PreviewPanelProp
   const [iframeKey, setIframeKey] = useState(0);
 
   return (
-    <div className="flex flex-col h-full bg-gray-900">
+    <div className="flex flex-col h-full bg-white">
       {/* Browser chrome */}
-      <div className="px-4 py-2 bg-gray-800 border-b border-gray-700 flex items-center gap-3">
+      <div className="px-4 py-2 bg-gray-50 border-b border-gray-200 flex items-center gap-3">
         <div className="flex items-center gap-1.5">
-          <div className="w-3 h-3 rounded-full bg-red-500/80" />
-          <div className="w-3 h-3 rounded-full bg-yellow-500/80" />
-          <div className="w-3 h-3 rounded-full bg-green-500/80" />
+          <div className="w-3 h-3 rounded-full bg-red-400" />
+          <div className="w-3 h-3 rounded-full bg-yellow-400" />
+          <div className="w-3 h-3 rounded-full bg-green-400" />
         </div>
-        <div className="flex-1 flex items-center gap-2 bg-gray-700 rounded-lg px-3 py-1.5">
+        <div className="flex-1 flex items-center gap-2 bg-white rounded-lg px-3 py-1.5 border border-gray-200">
           <Monitor className="w-3.5 h-3.5 text-gray-400" />
           {previewUrl ? (
-            <span className="text-xs text-gray-300 truncate">{previewUrl}</span>
+            <span className="text-xs text-gray-600 truncate">{previewUrl}</span>
           ) : (
-            <span className="text-xs text-gray-500">预览地址</span>
+            <span className="text-xs text-gray-400">预览地址</span>
           )}
         </div>
         {previewUrl && (
           <div className="flex items-center gap-1">
             <button
               onClick={() => setIframeKey((k) => k + 1)}
-              className="p-1.5 text-gray-400 hover:text-gray-200 transition-colors"
+              className="p-1.5 text-gray-400 hover:text-gray-600 transition-colors"
               title="刷新预览"
             >
               <RefreshCw className="w-3.5 h-3.5" />
@@ -43,7 +43,7 @@ export function PreviewPanel({ previewUrl, isBuilding, phase }: PreviewPanelProp
               href={previewUrl}
               target="_blank"
               rel="noopener noreferrer"
-              className="p-1.5 text-gray-400 hover:text-gray-200 transition-colors"
+              className="p-1.5 text-gray-400 hover:text-gray-600 transition-colors"
               title="在新窗口打开"
             >
               <ExternalLink className="w-3.5 h-3.5" />
@@ -53,7 +53,7 @@ export function PreviewPanel({ previewUrl, isBuilding, phase }: PreviewPanelProp
       </div>
 
       {/* Preview area */}
-      <div className="flex-1 relative">
+      <div className="flex-1 relative bg-gray-50">
         <AnimatePresence mode="wait">
           {previewUrl ? (
             <motion.div
@@ -129,11 +129,11 @@ function BuildingAnimation({ phase }: { phase: string }) {
           key={label}
           initial={{ opacity: 0, y: 4 }}
           animate={{ opacity: 1, y: 0 }}
-          className="text-sm text-gray-300 font-medium"
+          className="text-sm text-gray-600 font-medium"
         >
           {label}
         </motion.p>
-        <p className="text-xs text-gray-500 mt-1">完成后将自动显示预览</p>
+        <p className="text-xs text-gray-400 mt-1">完成后将自动显示预览</p>
       </div>
 
       {/* Progress dots */}
@@ -154,10 +154,10 @@ function BuildingAnimation({ phase }: { phase: string }) {
 function IdlePlaceholder() {
   return (
     <div className="text-center">
-      <div className="w-12 h-12 bg-gray-800 rounded-xl flex items-center justify-center mx-auto mb-4">
-        <Monitor className="w-6 h-6 text-gray-600" />
+      <div className="w-12 h-12 bg-gray-100 rounded-xl flex items-center justify-center mx-auto mb-4">
+        <Monitor className="w-6 h-6 text-gray-300" />
       </div>
-      <p className="text-sm text-gray-500">预览将在构建完成后显示</p>
+      <p className="text-sm text-gray-400">预览将在构建完成后显示</p>
     </div>
   );
 }

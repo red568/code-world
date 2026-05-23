@@ -51,20 +51,20 @@ export function SessionSidebar() {
   }, []);
 
   return (
-    <div className="flex flex-col h-full bg-gray-950 text-gray-300">
+    <div className="flex flex-col h-full bg-gray-50 border-r border-gray-200">
       {/* Logo */}
       <div className="px-4 py-4 flex items-center gap-2.5">
         <div className="w-7 h-7 bg-gradient-to-br from-blue-500 to-purple-600 rounded-lg flex items-center justify-center">
           <Sparkles className="w-3.5 h-3.5 text-white" />
         </div>
-        <span className="font-semibold text-sm text-white">AI Builder</span>
+        <span className="font-semibold text-sm text-gray-900">AI Builder</span>
       </div>
 
       {/* New chat */}
       <div className="px-3 mb-2">
         <button
           onClick={() => router.push("/")}
-          className="w-full flex items-center gap-2 px-3 py-2 text-sm text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-lg transition-colors"
+          className="w-full flex items-center gap-2 px-3 py-2 text-sm text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors"
         >
           <Plus className="w-4 h-4" />
           <span>新建项目</span>
@@ -81,11 +81,11 @@ export function SessionSidebar() {
               onClick={() => router.push(`/project/${p.id}`)}
               className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-left transition-colors group ${
                 isActive
-                  ? "bg-gray-800 text-white"
-                  : "text-gray-400 hover:bg-gray-800/40 hover:text-gray-200"
+                  ? "bg-white text-gray-900 shadow-sm border border-gray-200"
+                  : "text-gray-600 hover:bg-gray-100 hover:text-gray-900"
               }`}
             >
-              <MessageSquare className="w-3.5 h-3.5 flex-shrink-0 opacity-60" />
+              <MessageSquare className="w-3.5 h-3.5 flex-shrink-0 text-gray-400" />
               <span className="flex-1 text-sm truncate">
                 {p.title || p.originalPrompt.slice(0, 30)}
               </span>

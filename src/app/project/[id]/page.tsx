@@ -64,9 +64,9 @@ export default function ProjectPage({
   );
 
   return (
-    <div className="h-screen flex bg-gray-950">
+    <div className="h-screen flex bg-white">
       {/* Left: Session sidebar */}
-      <div className="w-[220px] flex-shrink-0 border-r border-gray-800">
+      <div className="w-[220px] flex-shrink-0">
         <SessionSidebar />
       </div>
 
@@ -81,7 +81,7 @@ export default function ProjectPage({
       </div>
 
       {/* Right: Preview */}
-      <div className="flex-1 min-w-0">
+      <div className="flex-1 min-w-0 border-l border-gray-200">
         <PreviewPanel
           previewUrl={state.previewUrl}
           isBuilding={isGenerating}
