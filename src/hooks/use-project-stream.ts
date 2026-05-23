@@ -65,6 +65,7 @@ type StreamAction =
   | { type: "STATUS_CHANGE"; status: string; message: string }
   | { type: "SPEC_CHUNK"; chunk: string }
   | { type: "SPEC_DONE" }
+  | { type: "PLAN_READY"; fileCount: number; files: { path: string; role: string }[] }
   | { type: "CODEGEN_PROGRESS"; chars: number }
   | { type: "FILE_START"; path: string }
   | { type: "FILE_DONE"; path: string }
@@ -128,7 +129,7 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
         acts = addActivity(acts, "thinking", "分析需求");
       } else if (action.status === "code_generating") {
         acts = finishActiveByType(acts, "thinking");
-        acts = addActivity(acts, "thinking", "生成代码");
+        acts = addActivity(acts, "thinking", "规划代码结构");
       } else if (action.status === "reviewing") {
         acts = finishActiveByType(acts, "thinking");
         acts = addActivity(acts, "review", "审查代码");
@@ -153,6 +154,11 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
       return { ...state, phase: "spec_generating", specText: state.specText + action.chunk };
     case "SPEC_DONE":
       return { ...state, activities: finishActiveByType(state.activities, "thinking") };
+    case "PLAN_READY": {
+      let acts = finishActiveByType(state.activities, "thinking");
+      acts = addActivity(acts, "thinking", `生成代码（${action.fileCount} 个文件）`);
+      return { ...state, activities: acts };
+    }
     case "CODEGEN_PROGRESS":
       return { ...state, codegenChars: action.chars };
     case "FILE_START": {
@@ -246,6 +252,11 @@ export function useProjectStream(projectId: string | null) {
 
     eventSource.addEventListener("spec_done", () => {
       dispatch({ type: "SPEC_DONE" });
+    });
+
+    eventSource.addEventListener("plan_ready", (e) => {
+      const data = JSON.parse(e.data);
+      dispatch({ type: "PLAN_READY", fileCount: data.fileCount, files: data.files });
     });
 
     eventSource.addEventListener("codegen_progress", (e) => {

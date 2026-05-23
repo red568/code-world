@@ -1,9 +1,14 @@
 /**
  * Codegen Prompt — 根据规格和固定模板生成项目文件
+ *
+ * 支持两种模式：
+ * 1. 整体生成：buildCodegenMessages（保留兼容，用于 iterate）
+ * 2. 单文件生成：buildSingleFileMessages（Plan-based，新主流程）
  */
 
 import { type LLMMessage } from "@/lib/llm";
 import { type SpecResult } from "./spec-prompt";
+import { type CodePlanFile } from "./plan-prompt";
 import { TEMPLATE_FILE_TREE, EDITABLE_FILES_HINT } from "@/lib/template/files";
 
 const CODEGEN_SYSTEM_PROMPT = `你是一个高级前端工程师。根据产品规格生成完整的 React + Vite + Tailwind 项目代码。
@@ -135,4 +140,73 @@ export function parseCodegenResult(raw: string): CodegenResult {
 
     return { files };
   }
+}
+
+// ─── 单文件生成（Plan-based）─────────────────────────────────────────────────
+
+const SINGLE_FILE_SYSTEM_PROMPT = `你是一个高级前端工程师。根据产品规格和代码蓝图，生成指定文件的完整代码。
+
+## 技术约束
+- 使用 React 18 + TypeScript + Tailwind CSS
+- 只能使用白名单依赖：react, react-dom, lucide-react, framer-motion, recharts
+- 使用函数组件和 hooks
+- CSS 全部通过 Tailwind 类名实现
+- 图片使用 placeholder URL（如 https://placehold.co/600x400）或 SVG 内联
+
+## 代码质量要求
+- 变量命名清晰，使用 PascalCase 组件名、camelCase 变量名
+- 页面内容丰富真实，不使用大量 Lorem ipsum
+- 确保 TypeScript 类型正确，避免使用 any
+- 单个文件不超过 200 行
+
+## 输出格式
+直接输出文件的完整代码内容，不要包含 markdown 代码块标记，不要包含 JSON 包装，不要包含文件路径注释。
+只输出纯代码。`;
+
+export interface SingleFileContext {
+  spec: SpecResult;
+  target: CodePlanFile;
+  generatedFiles: { path: string; exports: string[] }[];
+}
+
+export function buildSingleFileMessages(ctx: SingleFileContext): LLMMessage[] {
+  const depsInfo = ctx.target.imports_from.length > 0
+    ? ctx.target.imports_from
+        .map((depPath) => {
+          const dep = ctx.generatedFiles.find((f) => f.path === depPath);
+          if (dep) {
+            return `- ${depPath} 导出: ${dep.exports.join(", ")}`;
+          }
+          return `- ${depPath}`;
+        })
+        .join("\n")
+    : "无（独立文件）";
+
+  const userContent = `## 产品规格
+${JSON.stringify(ctx.spec, null, 2)}
+
+## 当前任务
+生成文件: ${ctx.target.path}
+文件职责: ${ctx.target.role}
+需要导出: ${ctx.target.exports.join(", ")}
+
+## 依赖的已生成文件
+${depsInfo}
+
+## 注意事项
+- import 路径使用相对路径（如 "./components/Header" 或 "../lib/utils"）
+- 确保导出的名称与计划一致: ${ctx.target.exports.join(", ")}
+- 直接输出完整代码，不要任何包装`;
+
+  return [
+    { role: "system", content: SINGLE_FILE_SYSTEM_PROMPT },
+    { role: "user", content: userContent },
+  ];
+}
+
+export function parseSingleFileResult(raw: string): string {
+  return raw
+    .replace(/^```(?:tsx?|jsx?|css)?\s*/m, "")
+    .replace(/```\s*$/m, "")
+    .trim();
 }

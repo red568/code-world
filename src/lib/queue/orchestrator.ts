@@ -10,9 +10,12 @@ import { chatCompletion, chatCompletionStream } from "@/lib/llm";
 import {
   buildSpecMessages,
   parseSpecResult,
-  buildCodegenMessages,
   buildIterateCodegenMessages,
   parseCodegenResult,
+  buildPlanMessages,
+  parsePlanResult,
+  buildSingleFileMessages,
+  parseSingleFileResult,
   buildReviewMessages,
   parseReviewResult,
   buildFixMessages,
@@ -20,6 +23,7 @@ import {
   classifyError,
   type SpecResult,
   type CodegenFile,
+  type CodePlan,
 } from "@/lib/agent";
 import {
   createSandbox,
@@ -122,65 +126,153 @@ async function runSpec(projectId: string, prompt: string): Promise<SpecResult> {
   return spec;
 }
 
-// ─── 阶段 2：Codegen 代码生成 ───────────────────────────────────────────────────
+// ─── 阶段 2a：Code Plan 生成 ────────────────────────────────────────────────────
+
+async function runPlan(
+  projectId: string,
+  spec: SpecResult
+): Promise<CodePlan> {
+  const startTime = Date.now();
+  log(projectId, "plan", "开始生成 Code Plan");
+  await updateProjectStatus(projectId, "code_generating", "正在规划代码结构...");
+
+  const messages = buildPlanMessages(spec);
+  const response = await chatCompletion(messages, { maxTokens: 8192, label: `plan:${projectId.slice(0, 8)}` });
+
+  if (!response || response.trim().length === 0) {
+    throw new Error("Code Plan 生成失败：LLM 返回空响应");
+  }
+
+  const plan = parsePlanResult(response);
+
+  await publishEvent(projectId, {
+    type: "plan_ready",
+    data: {
+      fileCount: plan.files.length,
+      files: plan.files.map((f) => ({ path: f.path, role: f.role })),
+    },
+  });
+
+  await recordAgentRun(projectId, "codegen", `plan: ${plan.files.length} files`, {
+    plan: plan.files.map((f) => f.path),
+    notes: plan.notes,
+  });
+
+  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+  log(projectId, "plan", `完成 | files=${plan.files.length} | ${duration}s | notes="${plan.notes?.slice(0, 60)}"`);
+  return plan;
+}
+
+// ─── 阶段 2b：按 Plan 逐文件生成代码 ────────────────────────────────────────────
+
+const MAX_SINGLE_FILE_RETRIES = 2;
 
 async function runCodegen(
   projectId: string,
   spec: SpecResult
 ): Promise<CodegenFile[]> {
   const startTime = Date.now();
-  log(projectId, "codegen", "开始生成代码");
+
+  // Step 1: 生成 Code Plan
+  const plan = await runPlan(projectId, spec);
+
+  // Step 2: 按 generation_order 逐文件生成
+  log(projectId, "codegen", `开始逐文件生成 | order=${plan.generation_order.length} files`);
   await updateProjectStatus(projectId, "code_generating", "正在生成代码...");
 
-  const messages = buildCodegenMessages(spec);
-  let fullResponse = "";
-  let lastProgressPush = 0;
+  const planFileMap = new Map(plan.files.map((f) => [f.path, f]));
+  const generatedFiles: CodegenFile[] = [];
+  const generatedExports: { path: string; exports: string[] }[] = [];
 
-  for await (const chunk of chatCompletionStream(messages, { maxTokens: 16384, label: `codegen:${projectId.slice(0, 8)}` })) {
-    fullResponse += chunk;
-    if (fullResponse.length - lastProgressPush > 500) {
-      lastProgressPush = fullResponse.length;
-      await publishEvent(projectId, { type: "codegen_progress", data: { chars: fullResponse.length } });
+  for (const filePath of plan.generation_order) {
+    const planFile = planFileMap.get(filePath);
+    if (!planFile) {
+      log(projectId, "codegen", `跳过未知文件: ${filePath}`);
+      continue;
     }
-  }
 
-  log(projectId, "codegen", `LLM 响应完成 | responseChars=${fullResponse.length}`);
-
-  const result = parseCodegenResult(fullResponse);
-
-  for (const file of result.files) {
     await publishEvent(projectId, {
       type: "codegen_file_start",
-      data: { path: file.path },
+      data: { path: filePath },
     });
 
+    let content: string | null = null;
+    for (let retry = 0; retry <= MAX_SINGLE_FILE_RETRIES; retry++) {
+      const fileStart = Date.now();
+      const label = retry === 0
+        ? `file:${filePath}:${projectId.slice(0, 8)}`
+        : `file:${filePath}:retry${retry}:${projectId.slice(0, 8)}`;
+
+      try {
+        const messages = buildSingleFileMessages({
+          spec,
+          target: planFile,
+          generatedFiles: generatedExports,
+        });
+
+        let fullResponse = "";
+        for await (const chunk of chatCompletionStream(messages, { maxTokens: 4096, label })) {
+          fullResponse += chunk;
+        }
+
+        if (!fullResponse || fullResponse.trim().length === 0) {
+          throw new Error("LLM 返回空响应");
+        }
+
+        content = parseSingleFileResult(fullResponse);
+        const fileDuration = ((Date.now() - fileStart) / 1000).toFixed(1);
+        log(projectId, "codegen", `✓ ${filePath} | ${content.length} chars | ${fileDuration}s${retry > 0 ? ` (retry ${retry})` : ""}`);
+        break;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log(projectId, "codegen", `✗ ${filePath} 生成失败 (attempt ${retry + 1}): ${msg}`);
+        if (retry === MAX_SINGLE_FILE_RETRIES) {
+          throw new Error(`文件 ${filePath} 生成失败，已重试 ${MAX_SINGLE_FILE_RETRIES} 次: ${msg}`);
+        }
+      }
+    }
+
+    if (!content) continue;
+
+    // 保存到数据库
     await prisma.projectFile.upsert({
-      where: { projectId_path: { projectId, path: file.path } },
-      create: { projectId, path: file.path, content: file.content },
-      update: { content: file.content, version: { increment: 1 } },
+      where: { projectId_path: { projectId, path: filePath } },
+      create: { projectId, path: filePath, content },
+      update: { content, version: { increment: 1 } },
     });
+
+    generatedFiles.push({ path: filePath, content });
+    generatedExports.push({ path: filePath, exports: planFile.exports });
 
     await publishEvent(projectId, {
       type: "codegen_file_done",
-      data: { path: file.path },
+      data: { path: filePath },
     });
+  }
+
+  // Step 3: 验证所有 Plan 中的文件都已生成
+  const generatedPaths = new Set(generatedFiles.map((f) => f.path));
+  const missingFiles = plan.files.filter((f) => !generatedPaths.has(f.path));
+  if (missingFiles.length > 0) {
+    const missing = missingFiles.map((f) => f.path).join(", ");
+    throw new Error(`Code Plan 验证失败：以下文件未生成: ${missing}`);
   }
 
   await publishEvent(projectId, {
     type: "codegen_done",
-    data: { fileCount: result.files.length },
+    data: { fileCount: generatedFiles.length },
   });
 
   await recordAgentRun(
     projectId,
     "codegen",
-    `${result.files.length} files`,
-    { filePaths: result.files.map((f) => f.path) }
+    `${generatedFiles.length} files (plan-based)`,
+    { filePaths: generatedFiles.map((f) => f.path) }
   );
 
   const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-  log(projectId, "codegen", `完成 | files=${result.files.length} | ${duration}s`);
-  return result.files;
+  log(projectId, "codegen", `完成 | files=${generatedFiles.length} | ${duration}s`);
+  return generatedFiles;
 }
 
 /**
