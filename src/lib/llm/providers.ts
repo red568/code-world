@@ -35,8 +35,8 @@ export const LLM_PROVIDERS: Record<string, LLMProviderConfig> = {
   deepseek: {
     name: "DeepSeek",
     baseURL: "https://api.deepseek.com/v1",
-    defaultModel: "deepseek-chat",
-    models: ["deepseek-chat", "deepseek-coder"],
+    defaultModel: "deepseek-v4-flash",
+    models: ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-coder"],
   },
 };
 

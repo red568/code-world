@@ -58,7 +58,7 @@ export async function chatCompletion(
   const response = await client.chat.completions.create({
     model,
     messages,
-    temperature: options?.temperature ?? 1,
+    temperature: options?.temperature ?? 0.3,
     max_tokens: options?.maxTokens ?? 4096,
   });
 
@@ -91,7 +91,7 @@ export async function* chatCompletionStream(
   const stream = await client.chat.completions.create({
     model,
     messages,
-    temperature: options?.temperature ?? 1,
+    temperature: options?.temperature ?? 0.3,
     max_tokens: options?.maxTokens ?? 4096,
     stream: true,
   });
