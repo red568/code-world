@@ -22,6 +22,7 @@ import {
   parsePlanResult,
   buildSingleFileMessages,
   parseSingleFileResult,
+  extractFileSignature,
   type SpecResult,
   type CodePlan,
   type CodePlanFile,
@@ -127,7 +128,7 @@ async function stepCodegen(
   hr("Step 3: 逐文件生成代码");
 
   const generatedFiles: CodegenFile[] = [];
-  const generatedExports: { path: string; exports: string[] }[] = [];
+  const generatedExports: { path: string; exports: string[]; signature?: string }[] = [];
   const results: { path: string; chars: number; time: string; retries: number }[] = [];
 
   for (let i = 0; i < plan.generation_order.length; i++) {
@@ -191,7 +192,7 @@ async function stepCodegen(
 
     if (content) {
       generatedFiles.push({ path: filePath, content });
-      generatedExports.push({ path: filePath, exports: planFile.exports });
+      generatedExports.push({ path: filePath, exports: planFile.exports, signature: extractFileSignature(content) });
       writeOutputFile(filePath, content);
       results.push({ path: filePath, chars: content.length, time: elapsed(Date.now()), retries });
     }

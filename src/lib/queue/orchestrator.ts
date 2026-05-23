@@ -16,6 +16,7 @@ import {
   parsePlanResult,
   buildSingleFileMessages,
   parseSingleFileResult,
+  extractFileSignature,
   buildReviewMessages,
   parseReviewResult,
   buildFixMessages,
@@ -184,7 +185,7 @@ async function runCodegen(
 
   const planFileMap = new Map(plan.files.map((f) => [f.path, f]));
   const generatedFiles: CodegenFile[] = [];
-  const generatedExports: { path: string; exports: string[] }[] = [];
+  const generatedExports: { path: string; exports: string[]; signature?: string }[] = [];
 
   for (const filePath of plan.generation_order) {
     const planFile = planFileMap.get(filePath);
@@ -244,7 +245,7 @@ async function runCodegen(
     });
 
     generatedFiles.push({ path: filePath, content });
-    generatedExports.push({ path: filePath, exports: planFile.exports });
+    generatedExports.push({ path: filePath, exports: planFile.exports, signature: extractFileSignature(content) });
 
     await publishEvent(projectId, {
       type: "codegen_file_done",

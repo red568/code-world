@@ -166,7 +166,7 @@ const SINGLE_FILE_SYSTEM_PROMPT = `你是一个高级前端工程师。根据产
 export interface SingleFileContext {
   spec: SpecResult;
   target: CodePlanFile;
-  generatedFiles: { path: string; exports: string[] }[];
+  generatedFiles: { path: string; exports: string[]; signature?: string }[];
 }
 
 export function buildSingleFileMessages(ctx: SingleFileContext): LLMMessage[] {
@@ -174,13 +174,19 @@ export function buildSingleFileMessages(ctx: SingleFileContext): LLMMessage[] {
     ? ctx.target.imports_from
         .map((depPath) => {
           const dep = ctx.generatedFiles.find((f) => f.path === depPath);
+          if (dep && dep.signature) {
+            return `- ${depPath}:\n${dep.signature}`;
+          }
           if (dep) {
             return `- ${depPath} 导出: ${dep.exports.join(", ")}`;
           }
           return `- ${depPath}`;
         })
-        .join("\n")
+        .join("\n\n")
     : "无（独立文件）";
+
+  // 构建完整文件清单，让 LLM 知道只能 import 这些文件
+  const allPlannedFiles = ctx.generatedFiles.map((f) => f.path).join("\n  ");
 
   const userContent = `## 产品规格
 ${JSON.stringify(ctx.spec, null, 2)}
@@ -190,10 +196,17 @@ ${JSON.stringify(ctx.spec, null, 2)}
 文件职责: ${ctx.target.role}
 需要导出: ${ctx.target.exports.join(", ")}
 
-## 依赖的已生成文件
+## 依赖的已生成文件（包含签名）
 ${depsInfo}
 
-## 注意事项
+## 项目文件清单（只能 import 以下文件，不要 import 不存在的文件）
+  ${allPlannedFiles}
+
+## 重要规则
+- 只能 import 上面文件清单中存在的文件，不要自行创建新的 import
+- 如果依赖文件是 default export，使用 import Xxx from './path'
+- 如果依赖文件是 named export，使用 import { Xxx } from './path'
+- 传递 props 时必须与依赖文件的 interface 定义完全匹配
 - import 路径使用相对路径（如 "./components/Header" 或 "../lib/utils"）
 - 确保导出的名称与计划一致: ${ctx.target.exports.join(", ")}
 - 直接输出完整代码，不要任何包装`;
@@ -209,4 +222,39 @@ export function parseSingleFileResult(raw: string): string {
     .replace(/^```(?:tsx?|jsx?|css)?\s*/m, "")
     .replace(/```\s*$/m, "")
     .trim();
+}
+
+/**
+ * 从生成的文件代码中提取签名摘要（export 语句 + interface/type 定义）
+ * 用于传递给后续文件，让它们知道如何正确 import 和使用
+ */
+export function extractFileSignature(content: string): string {
+  const lines = content.split("\n");
+  const signatureLines: string[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    // 匹配 export 语句
+    if (/^export\s+(default\s+)?(function|const|class|interface|type)\s/.test(line)) {
+      signatureLines.push(line.replace(/\{[\s\S]*$/, "{...}").trim());
+    }
+    // 匹配 Props interface（含非 export 的）
+    if (/^(export\s+)?interface\s+\w+Props/.test(line)) {
+      // 收集整个 interface
+      let block = line;
+      let braces = (line.match(/\{/g) || []).length - (line.match(/\}/g) || []).length;
+      let j = i + 1;
+      while (braces > 0 && j < lines.length) {
+        block += "\n" + lines[j];
+        braces += (lines[j].match(/\{/g) || []).length - (lines[j].match(/\}/g) || []).length;
+        j++;
+      }
+      signatureLines.push(block);
+      i = j - 1;
+    }
+  }
+
+  return signatureLines.length > 0
+    ? signatureLines.join("\n")
+    : content.split("\n").filter((l) => l.startsWith("export ")).join("\n");
 }

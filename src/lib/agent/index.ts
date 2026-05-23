@@ -1,5 +1,5 @@
 export { buildSpecMessages, parseSpecResult } from "./spec-prompt";
-export { buildCodegenMessages, buildIterateCodegenMessages, parseCodegenResult, buildSingleFileMessages, parseSingleFileResult } from "./codegen-prompt";
+export { buildCodegenMessages, buildIterateCodegenMessages, parseCodegenResult, buildSingleFileMessages, parseSingleFileResult, extractFileSignature } from "./codegen-prompt";
 export { buildPlanMessages, parsePlanResult } from "./plan-prompt";
 export { buildReviewMessages, parseReviewResult } from "./review-prompt";
 export { buildFixMessages, parseFixResult, classifyError, extractErrorFiles } from "./fix-prompt";
