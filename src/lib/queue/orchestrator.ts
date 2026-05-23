@@ -481,15 +481,42 @@ async function runBuildAndFix(
     const errorFilePaths = extractErrorFiles(buildResult.stderr);
     let relatedFiles: CodegenFile[] = [];
     if (errorFilePaths.length > 0) {
-      relatedFiles = dbFiles
+      const errorFiles = dbFiles
         .filter((f) => errorFilePaths.some((ep) => f.path.includes(ep) || ep.includes(f.path)))
         .map((f) => ({ path: f.path, content: f.content }));
-      // 始终包含 App.tsx（通常是 import 错误的源头）
+
+      // 解析报错文件的 import，把依赖文件也加入
+      const importedPaths = new Set<string>();
+      for (const ef of errorFiles) {
+        const importMatches = ef.content.matchAll(/from\s+["']([^"']+)["']/g);
+        for (const m of importMatches) {
+          if (m[1].startsWith(".")) {
+            const dir = ef.path.split("/").slice(0, -1).join("/");
+            let resolved = dir + "/" + m[1].replace(/^\.\//, "");
+            resolved = resolved.replace(/\/\.\//g, "/");
+            importedPaths.add(resolved);
+          }
+        }
+      }
+
+      // 合并：报错文件 + 其 import 的文件
+      relatedFiles = [...errorFiles];
+      for (const dbFile of dbFiles) {
+        if (relatedFiles.some((f) => f.path === dbFile.path)) continue;
+        const match = Array.from(importedPaths).some((ip) =>
+          dbFile.path.startsWith(ip) || dbFile.path === ip + ".tsx" || dbFile.path === ip + ".ts"
+        );
+        if (match) {
+          relatedFiles.push({ path: dbFile.path, content: dbFile.content });
+        }
+      }
+
+      // 始终包含 App.tsx
       const appFile = dbFiles.find((f) => f.path === "src/App.tsx");
       if (appFile && !relatedFiles.some((f) => f.path === "src/App.tsx")) {
         relatedFiles.push({ path: appFile.path, content: appFile.content });
       }
-      log(projectId, "fix", `从 stderr 提取到 ${errorFilePaths.length} 个报错文件: ${errorFilePaths.join(", ")}`);
+      log(projectId, "fix", `报错文件: ${errorFilePaths.join(", ")} | 含依赖共 ${relatedFiles.length} 个文件`);
     } else {
       // stderr 中无法提取文件名时，回退传全部文件
       relatedFiles = dbFiles.map((f) => ({ path: f.path, content: f.content }));
