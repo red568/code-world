@@ -42,6 +42,10 @@ import type { Sandbox } from "@e2b/code-interpreter";
 
 const MAX_FIX_ATTEMPTS = 3;
 
+function log(projectId: string, stage: string, message: string) {
+  console.log(`[Orchestrator] [${projectId.slice(0, 8)}] [${stage}] ${message}`);
+}
+
 /**
  * 更新项目状态并推送事件
  */
@@ -82,13 +86,14 @@ async function recordAgentRun(
 // ─── 阶段 1：Spec 生成 ──────────────────────────────────────────────────────────
 
 async function runSpec(projectId: string, prompt: string): Promise<SpecResult> {
+  const startTime = Date.now();
+  log(projectId, "spec", "开始生成规格");
   await updateProjectStatus(projectId, "spec_generating", "正在分析需求...");
 
   const messages = buildSpecMessages(prompt);
   let fullResponse = "";
 
-  // 流式输出 Spec 生成过程
-  for await (const chunk of chatCompletionStream(messages)) {
+  for await (const chunk of chatCompletionStream(messages, { label: `spec:${projectId.slice(0, 8)}` })) {
     fullResponse += chunk;
     await publishEvent(projectId, {
       type: "spec_chunk",
@@ -98,7 +103,6 @@ async function runSpec(projectId: string, prompt: string): Promise<SpecResult> {
 
   const spec = parseSpecResult(fullResponse);
 
-  // 保存 Spec 到项目
   await prisma.project.update({
     where: { id: projectId },
     data: {
@@ -113,6 +117,8 @@ async function runSpec(projectId: string, prompt: string): Promise<SpecResult> {
   });
 
   await recordAgentRun(projectId, "spec", prompt.slice(0, 200), spec);
+  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+  log(projectId, "spec", `完成 | title="${spec.title}" | ${duration}s`);
   return spec;
 }
 
@@ -122,18 +128,21 @@ async function runCodegen(
   projectId: string,
   spec: SpecResult
 ): Promise<CodegenFile[]> {
+  const startTime = Date.now();
+  log(projectId, "codegen", "开始生成代码");
   await updateProjectStatus(projectId, "code_generating", "正在生成代码...");
 
   const messages = buildCodegenMessages(spec);
   let fullResponse = "";
 
-  for await (const chunk of chatCompletionStream(messages, { maxTokens: 8192 })) {
+  for await (const chunk of chatCompletionStream(messages, { maxTokens: 16384, label: `codegen:${projectId.slice(0, 8)}` })) {
     fullResponse += chunk;
   }
 
+  log(projectId, "codegen", `LLM 响应完成 | responseChars=${fullResponse.length}`);
+
   const result = parseCodegenResult(fullResponse);
 
-  // 逐文件推送事件并保存到数据库
   for (const file of result.files) {
     await publishEvent(projectId, {
       type: "codegen_file_start",
@@ -164,6 +173,8 @@ async function runCodegen(
     { filePaths: result.files.map((f) => f.path) }
   );
 
+  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+  log(projectId, "codegen", `完成 | files=${result.files.length} | ${duration}s`);
   return result.files;
 }
 
@@ -175,18 +186,23 @@ async function runIterateCodegen(
   spec: SpecResult,
   userRequest: string
 ): Promise<CodegenFile[]> {
+  const startTime = Date.now();
+  log(projectId, "iterate", "开始迭代修改");
   await updateProjectStatus(projectId, "code_generating", "正在修改代码...");
 
-  // 读取当前文件
   const dbFiles = await prisma.projectFile.findMany({ where: { projectId } });
   const currentFiles = dbFiles.map((f) => ({ path: f.path, content: f.content }));
+
+  log(projectId, "iterate", `现有文件数=${currentFiles.length} | 用户需求="${userRequest.slice(0, 50)}"`);
 
   const messages = buildIterateCodegenMessages(spec, currentFiles, userRequest);
   let fullResponse = "";
 
-  for await (const chunk of chatCompletionStream(messages, { maxTokens: 8192 })) {
+  for await (const chunk of chatCompletionStream(messages, { maxTokens: 16384, label: `iterate:${projectId.slice(0, 8)}` })) {
     fullResponse += chunk;
   }
+
+  log(projectId, "iterate", `LLM 响应完成 | responseChars=${fullResponse.length}`);
 
   const result = parseCodegenResult(fullResponse);
 
@@ -213,6 +229,8 @@ async function runIterateCodegen(
     data: { fileCount: result.files.length },
   });
 
+  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+  log(projectId, "iterate", `完成 | files=${result.files.length} | ${duration}s`);
   return result.files;
 }
 
@@ -223,6 +241,8 @@ async function runReview(
   spec: SpecResult,
   files: CodegenFile[]
 ): Promise<boolean> {
+  const startTime = Date.now();
+  log(projectId, "review", `开始审查 | files=${files.length}`);
   await updateProjectStatus(projectId, "reviewing", "正在审查代码...");
 
   const packageJson =
@@ -230,10 +250,9 @@ async function runReview(
     TEMPLATE_PACKAGE_JSON;
 
   const messages = buildReviewMessages(spec, files, packageJson);
-  const response = await chatCompletion(messages);
+  const response = await chatCompletion(messages, { label: `review:${projectId.slice(0, 8)}` });
   const result = parseReviewResult(response);
 
-  // 推送每个审查问题
   for (const issue of result.issues) {
     await publishEvent(projectId, {
       type: "review_issue",
@@ -251,6 +270,8 @@ async function runReview(
   });
 
   await recordAgentRun(projectId, "review", `${files.length} files`, result);
+  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+  log(projectId, "review", `完成 | passed=${result.passed} | issues=${result.issues.length} | ${duration}s`);
   return result.passed;
 }
 
@@ -264,20 +285,21 @@ async function runBuildAndFix(
   const fixSummaries: string[] = [];
 
   for (let attempt = 1; attempt <= MAX_FIX_ATTEMPTS; attempt++) {
+    const attemptStart = Date.now();
+    log(projectId, "build", `构建尝试 #${attempt}`);
+
     await updateProjectStatus(
       projectId,
       attempt === 1 ? "building" : "fixing",
       attempt === 1 ? "正在构建项目..." : `正在修复（第 ${attempt - 1} 轮）...`
     );
 
-    // 执行构建，实时推送日志
     const buildResult = await buildProject(
       sandbox,
       (line) => publishBuildLog(projectId, "stdout", line),
       (line) => publishBuildLog(projectId, "stderr", line)
     );
 
-    // 记录构建日志
     await prisma.buildLog.create({
       data: {
         projectId,
@@ -289,8 +311,16 @@ async function runBuildAndFix(
       },
     });
 
+    const buildDuration = ((Date.now() - attemptStart) / 1000).toFixed(1);
+    log(projectId, "build", `构建 #${attempt} | exitCode=${buildResult.exitCode} | ${buildDuration}s`);
+
+    if (buildResult.exitCode !== 0) {
+      log(projectId, "build", `stderr 摘要: ${buildResult.stderr.slice(-200)}`);
+    }
+
     // 构建成功 → 启动 dev server
     if (buildResult.exitCode === 0) {
+      log(projectId, "preview", "构建成功，启动 dev server");
       await updateProjectStatus(projectId, "running", "构建成功，正在启动预览...");
       const previewUrl = await startDevServer(sandbox);
 
@@ -321,6 +351,7 @@ async function runBuildAndFix(
         data: { previewUrl },
       });
 
+      log(projectId, "preview", `预览就绪 | url=${previewUrl}`);
       return { success: true, previewUrl };
     }
 
@@ -331,12 +362,13 @@ async function runBuildAndFix(
 
     // 构建失败 → 尝试自动修复
     const errorCategory = classifyError(buildResult.stderr);
+    log(projectId, "fix", `开始修复 #${attempt} | errorCategory=${errorCategory}`);
+
     await publishEvent(projectId, {
       type: "fix_start",
       data: { attempt, diagnosis: `错误类型: ${errorCategory}` },
     });
 
-    // 收集修复所需的上下文
     const fileTree = await listProjectFiles(sandbox);
     const relatedFiles: CodegenFile[] = [];
     const dbFiles = await prisma.projectFile.findMany({ where: { projectId } });
@@ -361,10 +393,9 @@ async function runBuildAndFix(
       previousAttempts: fixSummaries,
     });
 
-    const fixResponse = await chatCompletion(fixMessages, { maxTokens: 8192 });
+    const fixResponse = await chatCompletion(fixMessages, { maxTokens: 8192, label: `fix#${attempt}:${projectId.slice(0, 8)}` });
     const fixResult = parseFixResult(fixResponse);
 
-    // 应用修复的文件
     await writeProjectFiles(sandbox, fixResult.files);
     for (const file of fixResult.files) {
       await prisma.projectFile.upsert({
@@ -374,7 +405,6 @@ async function runBuildAndFix(
       });
     }
 
-    // 更新构建日志的诊断
     await prisma.buildLog.updateMany({
       where: { projectId, attempt },
       data: { diagnosis: fixResult.diagnosis },
@@ -388,9 +418,11 @@ async function runBuildAndFix(
     });
 
     await recordAgentRun(projectId, "fix", fixResult.diagnosis, fixResult);
+    log(projectId, "fix", `修复 #${attempt} 完成 | 修改文件=${fixResult.files.length} | diagnosis="${fixResult.diagnosis.slice(0, 80)}"`);
   }
 
   // 所有修复尝试都失败
+  log(projectId, "build", `全部 ${MAX_FIX_ATTEMPTS} 次构建尝试失败`);
   await updateProjectStatus(projectId, "failed", "构建失败，已尝试自动修复但未成功");
   return { success: false };
 }
@@ -405,6 +437,8 @@ export async function orchestrateGenerate(
   prompt: string
 ): Promise<void> {
   let sandbox: Sandbox | null = null;
+  const totalStart = Date.now();
+  log(projectId, "start", `开始生成流程 | prompt="${prompt.slice(0, 60)}"`);
 
   try {
     // 1. 生成 Spec
@@ -417,19 +451,24 @@ export async function orchestrateGenerate(
     await runReview(projectId, spec, files);
 
     // 4. 创建 Sandbox 并写入文件
+    log(projectId, "sandbox", "正在创建 E2B 沙箱...");
+    const sandboxStart = Date.now();
     const instance = await createSandbox();
     sandbox = instance.sandbox;
+    const sandboxDuration = ((Date.now() - sandboxStart) / 1000).toFixed(1);
+    log(projectId, "sandbox", `沙箱已创建 | id=${instance.sandboxId} | ${sandboxDuration}s`);
 
-    // 写入模板文件（如果 E2B Template 未预装）
+    // 写入模板文件
     await writeTemplateFiles(sandbox);
 
     // 合并模板文件和生成文件
     const templateFiles = getTemplateFiles();
     const allFiles: CodegenFile[] = [
       ...Object.entries(templateFiles).map(([path, content]) => ({ path, content })),
-      ...files, // 生成文件覆盖模板文件
+      ...files,
     ];
 
+    log(projectId, "sandbox", `写入文件 | total=${allFiles.length}`);
     await writeProjectFiles(sandbox, allFiles);
 
     // 5. 构建和自动修复
@@ -437,8 +476,15 @@ export async function orchestrateGenerate(
     if (!result.success) {
       await stopSandbox(sandbox);
     }
+
+    const totalDuration = ((Date.now() - totalStart) / 1000).toFixed(1);
+    log(projectId, "end", `流程结束 | success=${result.success} | totalTime=${totalDuration}s`);
   } catch (error) {
     const message = error instanceof Error ? error.message : "未知错误";
+    const stack = error instanceof Error ? error.stack?.split("\n").slice(1, 3).join("\n") : "";
+    log(projectId, "error", `流程异常: ${message}`);
+    if (stack) console.error(`[Orchestrator] [${projectId.slice(0, 8)}] stack:\n${stack}`);
+
     await publishError(projectId, message, "ORCHESTRATION_ERROR");
     await updateProjectStatus(projectId, "failed", `生成失败: ${message}`);
 
@@ -460,6 +506,8 @@ export async function orchestrateIterate(
   prompt: string
 ): Promise<void> {
   let sandbox: Sandbox | null = null;
+  const totalStart = Date.now();
+  log(projectId, "start", `开始迭代流程 | prompt="${prompt.slice(0, 60)}"`);
 
   try {
     const project = await prisma.project.findUniqueOrThrow({
@@ -472,8 +520,12 @@ export async function orchestrateIterate(
     const files = await runIterateCodegen(projectId, spec, prompt);
 
     // 2. 创建新 Sandbox
+    log(projectId, "sandbox", "正在创建 E2B 沙箱...");
+    const sandboxStart = Date.now();
     const instance = await createSandbox();
     sandbox = instance.sandbox;
+    const sandboxDuration = ((Date.now() - sandboxStart) / 1000).toFixed(1);
+    log(projectId, "sandbox", `沙箱已创建 | id=${instance.sandboxId} | ${sandboxDuration}s`);
 
     // 写入模板文件
     await writeTemplateFiles(sandbox);
@@ -489,15 +541,24 @@ export async function orchestrateIterate(
       content,
     }));
 
-    await writeProjectFiles(sandbox, [...templateFileList, ...allFiles]);
+    const mergedFiles = [...templateFileList, ...allFiles];
+    log(projectId, "sandbox", `写入文件 | total=${mergedFiles.length}`);
+    await writeProjectFiles(sandbox, mergedFiles);
 
     // 3. 构建和修复
     const result = await runBuildAndFix(projectId, spec, sandbox);
     if (!result.success) {
       await stopSandbox(sandbox);
     }
+
+    const totalDuration = ((Date.now() - totalStart) / 1000).toFixed(1);
+    log(projectId, "end", `迭代结束 | success=${result.success} | totalTime=${totalDuration}s`);
   } catch (error) {
     const message = error instanceof Error ? error.message : "未知错误";
+    const stack = error instanceof Error ? error.stack?.split("\n").slice(1, 3).join("\n") : "";
+    log(projectId, "error", `迭代异常: ${message}`);
+    if (stack) console.error(`[Orchestrator] [${projectId.slice(0, 8)}] stack:\n${stack}`);
+
     await publishError(projectId, message, "ITERATE_ERROR");
     await updateProjectStatus(projectId, "failed", `修改失败: ${message}`);
 

@@ -2,31 +2,70 @@
  * BullMQ Worker 入口
  *
  * 独立进程运行，消费 agent-tasks 队列中的任务。
- * 部署时作为 Railway 的 Worker 服务运行。
+ * 内置 Bull Board 监控面板（端口 3001）。
  *
  * 启动命令: npx tsx src/worker.ts
  */
 
 import "dotenv/config";
 import { Worker } from "bullmq";
+import express from "express";
+import { createBullBoard } from "@bull-board/api";
+import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
+import { ExpressAdapter } from "@bull-board/express";
+import { Queue } from "bullmq";
 import { redis } from "@/lib/redis";
 import { QUEUE_NAME, type JobData } from "@/lib/queue";
 import { orchestrateGenerate, orchestrateIterate } from "@/lib/queue/orchestrator";
 
+// ─── Bull Board 监控面板 ────────────────────────────────────────────────────────
+
+const monitorQueue = new Queue<JobData>(QUEUE_NAME, { connection: redis });
+const serverAdapter = new ExpressAdapter();
+serverAdapter.setBasePath("/monitor");
+
+createBullBoard({
+  queues: [new BullMQAdapter(monitorQueue)],
+  serverAdapter,
+});
+
+const app = express();
+app.use("/monitor", serverAdapter.getRouter());
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", uptime: process.uptime() });
+});
+
+const MONITOR_PORT = parseInt(process.env.MONITOR_PORT || "3001", 10);
+app.listen(MONITOR_PORT, () => {
+  console.log(`[Worker] Bull Board 监控面板: http://localhost:${MONITOR_PORT}/monitor`);
+});
+
+// ─── Worker 逻辑 ────────────────────────────────────────────────────────────────
+
 const worker = new Worker<JobData>(
   QUEUE_NAME,
   async (job) => {
-    console.log(`[Worker] Processing job ${job.id}: ${job.data.type} for project ${job.data.projectId}`);
+    const startTime = Date.now();
+    console.log(`[Worker] ▶ Job ${job.id} started: ${job.data.type} | project: ${job.data.projectId}`);
 
-    switch (job.data.type) {
-      case "generate":
-        await orchestrateGenerate(job.data.projectId, job.data.prompt);
-        break;
-      case "iterate":
-        await orchestrateIterate(job.data.projectId, job.data.prompt);
-        break;
-      default:
-        console.error(`[Worker] Unknown job type: ${(job.data as JobData).type}`);
+    try {
+      switch (job.data.type) {
+        case "generate":
+          await orchestrateGenerate(job.data.projectId, job.data.prompt);
+          break;
+        case "iterate":
+          await orchestrateIterate(job.data.projectId, job.data.prompt);
+          break;
+        default:
+          console.error(`[Worker] Unknown job type: ${(job.data as JobData).type}`);
+      }
+      const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`[Worker] ✓ Job ${job.id} finished in ${duration}s`);
+    } catch (error) {
+      const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[Worker] ✗ Job ${job.id} threw after ${duration}s: ${message}`);
+      throw error;
     }
   },
   {
@@ -36,11 +75,14 @@ const worker = new Worker<JobData>(
 );
 
 worker.on("completed", (job) => {
-  console.log(`[Worker] Job ${job.id} completed`);
+  console.log(`[Worker] Job ${job.id} completed (${job.data.type})`);
 });
 
 worker.on("failed", (job, err) => {
-  console.error(`[Worker] Job ${job?.id} failed:`, err.message);
+  console.error(`[Worker] Job ${job?.id} failed: ${err.message}`);
+  if (err.stack) {
+    console.error(`[Worker] Stack: ${err.stack.split("\n").slice(1, 4).join("\n")}`);
+  }
 });
 
 worker.on("ready", () => {

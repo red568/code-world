@@ -15,6 +15,7 @@ export interface LLMCallOptions {
   temperature?: number;
   maxTokens?: number;
   stream?: boolean;
+  label?: string; // 调用标识，用于日志
 }
 
 export interface LLMMessage {
@@ -46,14 +47,28 @@ export async function chatCompletion(
   messages: LLMMessage[],
   options?: LLMCallOptions
 ): Promise<string> {
+  const model = getModel(options);
+  const label = options?.label || "chat";
+  const inputChars = messages.reduce((sum, m) => sum + m.content.length, 0);
+  const startTime = Date.now();
+
+  console.log(`[LLM] ${label} | model=${model} | inputChars=${inputChars} | maxTokens=${options?.maxTokens ?? 4096}`);
+
   const client = createClient(options);
   const response = await client.chat.completions.create({
-    model: getModel(options),
+    model,
     messages,
     temperature: options?.temperature ?? 1,
     max_tokens: options?.maxTokens ?? 4096,
   });
-  return response.choices[0]?.message?.content || "";
+
+  const content = response.choices[0]?.message?.content || "";
+  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+  const usage = response.usage;
+
+  console.log(`[LLM] ${label} | done in ${duration}s | outputChars=${content.length} | tokens=${usage?.total_tokens ?? "N/A"} (prompt=${usage?.prompt_tokens ?? "?"} completion=${usage?.completion_tokens ?? "?"})`);
+
+  return content;
 }
 
 /**
@@ -63,9 +78,18 @@ export async function* chatCompletionStream(
   messages: LLMMessage[],
   options?: LLMCallOptions
 ): AsyncGenerator<string> {
+  const model = getModel(options);
+  const label = options?.label || "stream";
+  const inputChars = messages.reduce((sum, m) => sum + m.content.length, 0);
+  const startTime = Date.now();
+  let outputChars = 0;
+  let chunkCount = 0;
+
+  console.log(`[LLM] ${label} | model=${model} | inputChars=${inputChars} | maxTokens=${options?.maxTokens ?? 4096} | stream=true`);
+
   const client = createClient(options);
   const stream = await client.chat.completions.create({
-    model: getModel(options),
+    model,
     messages,
     temperature: options?.temperature ?? 1,
     max_tokens: options?.maxTokens ?? 4096,
@@ -75,7 +99,12 @@ export async function* chatCompletionStream(
   for await (const chunk of stream) {
     const content = chunk.choices[0]?.delta?.content;
     if (content) {
+      outputChars += content.length;
+      chunkCount++;
       yield content;
     }
   }
+
+  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+  console.log(`[LLM] ${label} | done in ${duration}s | outputChars=${outputChars} | chunks=${chunkCount}`);
 }

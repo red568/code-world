@@ -14,6 +14,7 @@ export async function POST(
   const { content } = body;
 
   if (!content || typeof content !== "string" || content.trim().length === 0) {
+    console.log(`[API] POST /api/projects/${id.slice(0, 8)}/messages | 400 | missing content`);
     return Response.json(
       { error: "content is required" },
       { status: 400 }
@@ -22,6 +23,7 @@ export async function POST(
 
   const project = await prisma.project.findUnique({ where: { id } });
   if (!project) {
+    console.log(`[API] POST /api/projects/${id.slice(0, 8)}/messages | 404`);
     return Response.json({ error: "Project not found" }, { status: 404 });
   }
 
@@ -37,5 +39,6 @@ export async function POST(
   // 入队迭代任务
   await enqueueIterate(id, content.trim());
 
+  console.log(`[API] POST /api/projects/${id.slice(0, 8)}/messages | 201 | content="${content.trim().slice(0, 40)}"`);
   return Response.json({ message }, { status: 201 });
 }

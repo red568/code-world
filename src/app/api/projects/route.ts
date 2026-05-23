@@ -11,10 +11,12 @@ import { enqueueGenerate } from "@/lib/queue";
 const DEMO_USER_ID = "demo-user-001";
 
 export async function POST(request: NextRequest) {
+  const startTime = Date.now();
   const body = await request.json();
   const { prompt } = body;
 
   if (!prompt || typeof prompt !== "string" || prompt.trim().length === 0) {
+    console.log(`[API] POST /api/projects | 400 | missing prompt`);
     return Response.json(
       { error: "prompt is required" },
       { status: 400 }
@@ -49,10 +51,15 @@ export async function POST(request: NextRequest) {
   // 入队生成任务
   await enqueueGenerate(project.id, prompt.trim());
 
+  const duration = Date.now() - startTime;
+  console.log(`[API] POST /api/projects | 201 | projectId=${project.id} | prompt="${prompt.trim().slice(0, 40)}" | ${duration}ms`);
+
   return Response.json({ projectId: project.id }, { status: 201 });
 }
 
 export async function GET() {
+  const startTime = Date.now();
+
   const projects = await prisma.project.findMany({
     where: { userId: DEMO_USER_ID },
     orderBy: { createdAt: "desc" },
@@ -65,6 +72,9 @@ export async function GET() {
       createdAt: true,
     },
   });
+
+  const duration = Date.now() - startTime;
+  console.log(`[API] GET /api/projects | 200 | count=${projects.length} | ${duration}ms`);
 
   return Response.json({ projects });
 }

@@ -25,25 +25,39 @@ export interface SandboxInstance {
 
 /**
  * 创建预构建 Template 的 E2B Sandbox
- * 如果使用了自定义 Template，sandbox 内已包含 node_modules
  */
 export async function createSandbox(): Promise<SandboxInstance> {
-  const sandbox = await Sandbox.create(E2B_TEMPLATE_ID, {
-    timeoutMs: SANDBOX_TIMEOUT_MS,
-  });
+  const startTime = Date.now();
+  console.log(`[Sandbox] 创建沙箱 | template=${E2B_TEMPLATE_ID} | timeout=${SANDBOX_TIMEOUT_MS}ms`);
 
-  return {
-    sandbox,
-    sandboxId: sandbox.sandboxId,
-  };
+  try {
+    const sandbox = await Sandbox.create(E2B_TEMPLATE_ID, {
+      timeoutMs: SANDBOX_TIMEOUT_MS,
+    });
+
+    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`[Sandbox] 沙箱就绪 | id=${sandbox.sandboxId} | ${duration}s`);
+
+    return {
+      sandbox,
+      sandboxId: sandbox.sandboxId,
+    };
+  } catch (error) {
+    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[Sandbox] 创建失败 | ${duration}s | error=${message}`);
+    throw error;
+  }
 }
 
 /**
  * 将模板配置文件写入 sandbox
- * 当 E2B Template 未预装模板文件时使用（fallback 方案）
  */
 export async function writeTemplateFiles(sandbox: Sandbox): Promise<void> {
   const files = getTemplateFiles();
+  const count = Object.keys(files).length;
+  console.log(`[Sandbox] [${sandbox.sandboxId.slice(0, 8)}] 写入模板文件 | count=${count}`);
+
   for (const [path, content] of Object.entries(files)) {
     await sandbox.files.write(path, content);
   }
@@ -56,14 +70,19 @@ export async function writeProjectFiles(
   sandbox: Sandbox,
   files: { path: string; content: string }[]
 ): Promise<void> {
+  const startTime = Date.now();
+  console.log(`[Sandbox] [${sandbox.sandboxId.slice(0, 8)}] 写入项目文件 | count=${files.length}`);
+
   for (const file of files) {
-    // 确保目录存在
     const dir = file.path.split("/").slice(0, -1).join("/");
     if (dir) {
       await sandbox.commands.run(`mkdir -p ${dir}`);
     }
     await sandbox.files.write(file.path, file.content);
   }
+
+  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+  console.log(`[Sandbox] [${sandbox.sandboxId.slice(0, 8)}] 文件写入完成 | ${duration}s`);
 }
 
 /**
@@ -75,11 +94,17 @@ export async function runCommand(
   onStdout?: (line: string) => void,
   onStderr?: (line: string) => void
 ): Promise<CommandResult> {
+  const startTime = Date.now();
+  console.log(`[Sandbox] [${sandbox.sandboxId.slice(0, 8)}] 执行命令: ${command}`);
+
   const result = await sandbox.commands.run(command, {
     timeoutMs: 120_000,
     onStdout: onStdout ? (data: string) => onStdout(data) : undefined,
     onStderr: onStderr ? (data: string) => onStderr(data) : undefined,
   });
+
+  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+  console.log(`[Sandbox] [${sandbox.sandboxId.slice(0, 8)}] 命令完成 | exitCode=${result.exitCode} | ${duration}s`);
 
   return {
     stdout: result.stdout,
@@ -89,12 +114,13 @@ export async function runCommand(
 }
 
 /**
- * 安装额外依赖（仅用于白名单外但修复时需要的依赖）
+ * 安装额外依赖
  */
 export async function installDependency(
   sandbox: Sandbox,
   packageName: string
 ): Promise<CommandResult> {
+  console.log(`[Sandbox] [${sandbox.sandboxId.slice(0, 8)}] 安装依赖: ${packageName}`);
   return runCommand(sandbox, `npm install ${packageName}`);
 }
 
@@ -111,20 +137,21 @@ export async function buildProject(
 
 /**
  * 启动 Vite 开发服务器
- * 返回公网可访问的预览 URL
  */
 export async function startDevServer(sandbox: Sandbox): Promise<string> {
-  // 后台启动 dev server，不等待完成
+  console.log(`[Sandbox] [${sandbox.sandboxId.slice(0, 8)}] 启动 dev server | port=${DEV_SERVER_PORT}`);
+
   sandbox.commands.run(
     `npm run dev -- --host 0.0.0.0 --port ${DEV_SERVER_PORT}`,
     { timeoutMs: SANDBOX_TIMEOUT_MS }
   );
 
-  // 等待 dev server 启动
   await new Promise((resolve) => setTimeout(resolve, 3000));
 
   const host = sandbox.getHost(DEV_SERVER_PORT);
-  return `https://${host}`;
+  const url = `https://${host}`;
+  console.log(`[Sandbox] [${sandbox.sandboxId.slice(0, 8)}] dev server 就绪 | url=${url}`);
+  return url;
 }
 
 /**
@@ -163,5 +190,6 @@ export async function keepAlive(
  * 停止 sandbox
  */
 export async function stopSandbox(sandbox: Sandbox): Promise<void> {
+  console.log(`[Sandbox] [${sandbox.sandboxId.slice(0, 8)}] 停止沙箱`);
   await sandbox.kill();
 }

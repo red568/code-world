@@ -108,5 +108,31 @@ export function parseCodegenResult(raw: string): CodegenResult {
     .replace(/```json\s*/g, "")
     .replace(/```\s*/g, "")
     .trim();
-  return JSON.parse(cleaned);
+
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    // LLM 输出被截断时尝试修复 JSON
+    const filesMatch = cleaned.match(/"files"\s*:\s*\[/);
+    if (!filesMatch) {
+      throw new Error("LLM 返回格式错误：未找到 files 数组");
+    }
+
+    // 尝试截取已完成的文件条目
+    const files: CodegenFile[] = [];
+    const filePattern = /\{\s*"path"\s*:\s*"([^"]+)"\s*,\s*"content"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}/g;
+    let match;
+    while ((match = filePattern.exec(cleaned)) !== null) {
+      files.push({
+        path: match[1],
+        content: match[2].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\"),
+      });
+    }
+
+    if (files.length === 0) {
+      throw new Error("LLM 返回被截断且无法恢复任何文件");
+    }
+
+    return { files };
+  }
 }
