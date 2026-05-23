@@ -40,6 +40,11 @@ export interface ActivityEntry {
   status: "active" | "done";
 }
 
+export interface PhaseTimestamp {
+  startedAt: number;
+  finishedAt?: number;
+}
+
 export interface StreamState {
   phase: ProjectPhase;
   message: string;
@@ -53,6 +58,7 @@ export interface StreamState {
   connected: boolean;
   codegenChars: number;
   activities: ActivityEntry[];
+  timestamps: Partial<Record<ProjectPhase, PhaseTimestamp>>;
 }
 
 // ─── Reducer ─────────────────────────────────────────────────────────────────────
@@ -92,6 +98,7 @@ const initialState: StreamState = {
   connected: false,
   codegenChars: 0,
   activities: [],
+  timestamps: {},
 };
 
 function addActivity(
@@ -124,6 +131,7 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
     case "DISCONNECTED":
       return { ...state, connected: false };
     case "STATUS_CHANGE": {
+      const now = Date.now();
       let acts = state.activities;
       if (action.status === "spec_generating") {
         acts = addActivity(acts, "thinking", "分析需求");
@@ -148,7 +156,15 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
         acts = addActivity(acts, "error", action.message);
         acts = finishAll(acts);
       }
-      return { ...state, phase: action.status as ProjectPhase, message: action.message, activities: acts };
+      const newTimestamps = { ...state.timestamps };
+      if (state.phase !== "idle" && !newTimestamps[state.phase]?.finishedAt) {
+        newTimestamps[state.phase] = { ...newTimestamps[state.phase]!, finishedAt: now };
+      }
+      const nextPhase = action.status as ProjectPhase;
+      if (!newTimestamps[nextPhase]) {
+        newTimestamps[nextPhase] = { startedAt: now };
+      }
+      return { ...state, phase: nextPhase, message: action.message, activities: acts, timestamps: newTimestamps };
     }
     case "SPEC_CHUNK":
       return { ...state, phase: "spec_generating", specText: state.specText + action.chunk };

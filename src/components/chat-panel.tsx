@@ -23,151 +23,158 @@ interface ChatPanelProps {
   onSend: (message: string) => void;
 }
 
-function deriveStepStatus(phase: string, stepPhase: string, order: string[]): StepStatus {
-  const currentIdx = order.indexOf(phase);
-  const stepIdx = order.indexOf(stepPhase);
-  if (currentIdx < 0) return "pending";
-  if (stepIdx < currentIdx) return "done";
-  if (stepIdx === currentIdx) return "active";
+const PHASE_ORDER = [
+  "spec_generating",
+  "code_generating",
+  "reviewing",
+  "building",
+  "running",
+] as const;
+
+function phaseIndex(phase: string): number {
+  const idx = PHASE_ORDER.indexOf(phase as typeof PHASE_ORDER[number]);
+  return idx >= 0 ? idx : -1;
+}
+
+function stepStatusFromPhase(currentPhase: string, stepPhase: string): StepStatus {
+  if (currentPhase === "failed") return "error";
+  const cur = phaseIndex(currentPhase);
+  const step = phaseIndex(stepPhase);
+  if (cur < 0) return "pending";
+  if (step < cur) return "done";
+  if (step === cur) return "active";
   return "pending";
+}
+
+function buildCurrentRoundSteps(streamState: StreamState): TimelineStep[] {
+  const { phase, timestamps, files, reviewIssues, fixAttempt, message, error } = streamState;
+  const steps: TimelineStep[] = [];
+
+  const specTs = timestamps.spec_generating;
+  steps.push({
+    id: "spec",
+    type: "spec",
+    label: "分析需求",
+    status: stepStatusFromPhase(phase, "spec_generating"),
+    startedAt: specTs?.startedAt,
+    finishedAt: specTs?.finishedAt,
+    detail: phase === "spec_generating" && streamState.specText
+      ? streamState.specText.slice(0, 80) + "..."
+      : undefined,
+  });
+
+  const codeTs = timestamps.code_generating;
+  const fileItems: TimelineFileItem[] = files.map((f) => ({
+    path: f.path,
+    status: f.status === "done" ? "done" as const : "generating" as const,
+  }));
+  const codegenStatus = stepStatusFromPhase(phase, "code_generating");
+
+  steps.push({
+    id: "plan",
+    type: "plan",
+    label: files.length > 0 ? `规划文件（${files.length} 个）` : "规划文件",
+    status: codegenStatus === "pending" ? "pending" : "done",
+    startedAt: codeTs?.startedAt,
+    finishedAt: codeTs?.startedAt ? (codeTs.startedAt + 500) : undefined,
+  });
+
+  const doneCount = fileItems.filter((f) => f.status === "done").length;
+  steps.push({
+    id: "codegen",
+    type: "codegen",
+    label: codegenStatus === "done"
+      ? `生成代码（${fileItems.length} 个文件）`
+      : fileItems.length > 0
+        ? `生成代码（${doneCount}/${fileItems.length}）`
+        : "生成代码",
+    status: codegenStatus,
+    startedAt: codeTs?.startedAt,
+    finishedAt: codeTs?.finishedAt,
+    children: fileItems.length > 0 ? fileItems : undefined,
+  });
+
+  const reviewTs = timestamps.reviewing;
+  steps.push({
+    id: "review",
+    type: "review",
+    label: "审查代码",
+    status: stepStatusFromPhase(phase, "reviewing"),
+    startedAt: reviewTs?.startedAt,
+    finishedAt: reviewTs?.finishedAt,
+    detail: reviewIssues.length > 0
+      ? `发现 ${reviewIssues.length} 个问题`
+      : reviewTs?.finishedAt ? "通过" : undefined,
+  });
+
+  if (fixAttempt > 0) {
+    const fixTs = timestamps.fixing;
+    steps.push({
+      id: `fix-${fixAttempt}`,
+      type: "fix",
+      label: `自动修复（第 ${fixAttempt} 轮）`,
+      status: phase === "fixing" ? "active" : "done",
+      startedAt: fixTs?.startedAt,
+      finishedAt: fixTs?.finishedAt,
+      detail: message || undefined,
+    });
+  }
+
+  const buildTs = timestamps.building;
+  steps.push({
+    id: "build",
+    type: "build",
+    label: "构建项目",
+    status: phase === "fixing"
+      ? "active"
+      : stepStatusFromPhase(phase, "building"),
+    startedAt: buildTs?.startedAt,
+    finishedAt: buildTs?.finishedAt,
+  });
+
+  const runTs = timestamps.running;
+  steps.push({
+    id: "preview",
+    type: "preview",
+    label: "预览就绪",
+    status: phase === "running" ? "done" : "pending",
+    startedAt: runTs?.startedAt,
+    finishedAt: runTs?.finishedAt,
+    detail: phase === "running" ? "点击右侧面板查看" : undefined,
+  });
+
+  if (error) {
+    const activeStep = steps.find((s) => s.status === "active");
+    if (activeStep) activeStep.status = "error";
+  }
+
+  return steps;
+}
+
+function buildHistoryRoundSteps(): TimelineStep[] {
+  return [
+    { id: "spec", type: "spec", label: "分析需求", status: "done" },
+    { id: "plan", type: "plan", label: "规划文件", status: "done" },
+    { id: "codegen", type: "codegen", label: "生成代码", status: "done" },
+    { id: "review", type: "review", label: "审查代码", status: "done" },
+    { id: "build", type: "build", label: "构建项目", status: "done" },
+    { id: "preview", type: "preview", label: "预览就绪", status: "done" },
+  ];
 }
 
 function buildRounds(messages: Message[], streamState: StreamState): TRound[] {
   const rounds: TRound[] = [];
-  const phaseOrder = ["spec_generating", "code_generating", "reviewing", "building", "running"];
-
   const userMessages = messages.filter((m) => m.role === "user");
 
   userMessages.forEach((msg, idx) => {
     const isCurrentRound = idx === userMessages.length - 1;
-
-    if (!isCurrentRound) {
-      rounds.push({
-        id: idx,
-        userMessage: msg.content,
-        steps: [
-          { id: `${idx}-done`, type: "preview", label: "已完成", status: "done" },
-        ],
-      });
-      return;
-    }
-
-    const steps: TimelineStep[] = [];
-    const phase = streamState.phase;
-    const now = Date.now();
-
-    const specStatus = phase === "idle" ? "pending" :
-      phase === "spec_generating" ? "active" : "done";
-    steps.push({
-      id: `${idx}-spec`,
-      type: "spec",
-      label: "分析需求",
-      status: specStatus,
-      startedAt: specStatus !== "pending" ? now - 3000 : undefined,
-      finishedAt: specStatus === "done" ? now - 2000 : undefined,
-      detail: specStatus === "active" && streamState.specText
-        ? streamState.specText.slice(0, 60) + "..."
-        : undefined,
+    rounds.push({
+      id: idx,
+      userMessage: msg.content,
+      steps: isCurrentRound
+        ? buildCurrentRoundSteps(streamState)
+        : buildHistoryRoundSteps(),
     });
-
-    const planStatus = deriveStepStatus(phase, "code_generating", phaseOrder);
-    const planActive = phase === "code_generating" && streamState.files.length === 0;
-    steps.push({
-      id: `${idx}-plan`,
-      type: "plan",
-      label: streamState.files.length > 0
-        ? `规划文件（${streamState.files.length} 个）`
-        : "规划文件",
-      status: planActive ? "active" : (planStatus === "active" ? "done" : planStatus),
-      startedAt: planStatus !== "pending" ? now - 1500 : undefined,
-      finishedAt: planStatus === "done" || streamState.files.length > 0 ? now - 1000 : undefined,
-    });
-
-    if (streamState.files.length > 0 || phase === "code_generating") {
-      const codegenDone = phaseOrder.indexOf(phase) > phaseOrder.indexOf("code_generating");
-      const fileItems: TimelineFileItem[] = streamState.files.map((f) => ({
-        path: f.path,
-        status: f.status === "done" ? "done" as const : "generating" as const,
-      }));
-      const doneCount = fileItems.filter((f) => f.status === "done").length;
-      steps.push({
-        id: `${idx}-codegen`,
-        type: "codegen",
-        label: codegenDone
-          ? `生成代码（${fileItems.length} 个文件）`
-          : `生成代码（${doneCount}/${fileItems.length}）`,
-        status: codegenDone ? "done" : phase === "code_generating" ? "active" : "pending",
-        startedAt: phase === "code_generating" || codegenDone ? now - 5000 : undefined,
-        finishedAt: codegenDone ? now - 500 : undefined,
-        children: fileItems,
-      });
-    }
-
-    const reviewStatus = deriveStepStatus(phase, "reviewing", phaseOrder);
-    if (reviewStatus !== "pending" || phase === "reviewing") {
-      steps.push({
-        id: `${idx}-review`,
-        type: "review",
-        label: "审查代码",
-        status: phase === "reviewing" ? "active" : reviewStatus,
-        startedAt: reviewStatus !== "pending" ? now - 400 : undefined,
-        finishedAt: reviewStatus === "done" ? now - 200 : undefined,
-        detail: streamState.reviewIssues.length > 0
-          ? `发现 ${streamState.reviewIssues.length} 个问题`
-          : reviewStatus === "done" ? "通过，无问题" : undefined,
-      });
-    }
-
-    if (streamState.fixAttempt > 0) {
-      steps.push({
-        id: `${idx}-fix-${streamState.fixAttempt}`,
-        type: "fix",
-        label: `自动修复（第 ${streamState.fixAttempt} 轮）`,
-        status: phase === "fixing" ? "active" : "done",
-        startedAt: now - 300,
-        finishedAt: phase !== "fixing" ? now - 100 : undefined,
-        detail: streamState.message || undefined,
-      });
-    }
-
-    const buildStatus = deriveStepStatus(phase, "building", phaseOrder);
-    if (buildStatus !== "pending" || phase === "building") {
-      steps.push({
-        id: `${idx}-build`,
-        type: "build",
-        label: "构建项目",
-        status: phase === "building" || phase === "fixing" ? "active" : buildStatus,
-        startedAt: buildStatus !== "pending" ? now - 200 : undefined,
-        finishedAt: buildStatus === "done" && phase !== "fixing" ? now - 50 : undefined,
-      });
-    }
-
-    if (phase === "running" || streamState.previewUrl) {
-      steps.push({
-        id: `${idx}-preview`,
-        type: "preview",
-        label: "预览就绪",
-        status: "done",
-        startedAt: now - 50,
-        finishedAt: now,
-        detail: "点击右侧面板查看",
-      });
-    }
-
-    if (streamState.error) {
-      const lastStep = steps[steps.length - 1];
-      if (lastStep) lastStep.status = "error";
-      steps.push({
-        id: `${idx}-error`,
-        type: "build",
-        label: streamState.error,
-        status: "error",
-        startedAt: now,
-        finishedAt: now,
-      });
-    }
-
-    rounds.push({ id: idx, userMessage: msg.content, steps });
   });
 
   return rounds;
@@ -190,7 +197,7 @@ export function ChatPanel({
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [rounds, streamState.phase]);
+  }, [rounds, streamState.phase, streamState.files]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
