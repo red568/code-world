@@ -143,6 +143,8 @@ export const TEMPLATE_INDEX_CSS = `@tailwind base;
 @tailwind components;
 @tailwind utilities;`;
 
+export const TEMPLATE_VITE_ENV_DTS = `/// <reference types="vite/client" />`;
+
 export const TEMPLATE_APP_TSX = `export default function App() {
   return (
     <div className="min-h-screen flex items-center justify-center bg-gray-50">
@@ -164,6 +166,7 @@ export function getTemplateFiles(): Record<string, string> {
     "tailwind.config.js": TEMPLATE_TAILWIND_CONFIG,
     "postcss.config.js": TEMPLATE_POSTCSS_CONFIG,
     "src/main.tsx": TEMPLATE_MAIN_TSX,
+    "src/vite-env.d.ts": TEMPLATE_VITE_ENV_DTS,
     "src/index.css": TEMPLATE_INDEX_CSS,
     "src/App.tsx": TEMPLATE_APP_TSX,
   };
