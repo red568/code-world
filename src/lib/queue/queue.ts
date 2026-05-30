@@ -3,6 +3,7 @@
  *
  * 所有后台任务通过此队列调度。
  * Web 端入队，Worker 端消费。
+ * jobId = runId，防止重复入队。
  */
 
 import { Queue } from "bullmq";
@@ -10,61 +11,34 @@ import { redis } from "@/lib/redis";
 
 export const QUEUE_NAME = "agent-tasks";
 
-// 任务数据类型
-export interface GenerateJobData {
-  type: "generate";
+export interface AgentJobData {
+  runId: string;
   projectId: string;
-  prompt: string;
+  userId: string;
 }
-
-export interface IterateJobData {
-  type: "iterate";
-  projectId: string;
-  prompt: string;
-}
-
-export type JobData = GenerateJobData | IterateJobData;
 
 // 队列实例（Web 端用于入队）
-const globalForQueue = globalThis as unknown as { agentQueue: Queue<JobData> | undefined };
+const globalForQueue = globalThis as unknown as { agentQueue: Queue<AgentJobData> | undefined };
 
 export const agentQueue =
   globalForQueue.agentQueue ??
-  new Queue<JobData>(QUEUE_NAME, { connection: redis });
+  new Queue<AgentJobData>(QUEUE_NAME, { connection: redis });
 
 if (process.env.NODE_ENV !== "production") {
   globalForQueue.agentQueue = agentQueue;
 }
 
-/**
- * 添加生成任务到队列
- */
-export async function enqueueGenerate(
+export async function enqueueRun(
+  runId: string,
   projectId: string,
-  prompt: string
+  userId: string
 ): Promise<void> {
-  await agentQueue.add("generate", {
-    type: "generate",
+  await agentQueue.add("agent-run", {
+    runId,
     projectId,
-    prompt,
+    userId,
   }, {
-    attempts: 3,
-    backoff: { type: "fixed", delay: 5000 },
-  });
-}
-
-/**
- * 添加迭代修改任务到队列
- */
-export async function enqueueIterate(
-  projectId: string,
-  prompt: string
-): Promise<void> {
-  await agentQueue.add("iterate", {
-    type: "iterate",
-    projectId,
-    prompt,
-  }, {
+    jobId: runId,
     attempts: 3,
     backoff: { type: "fixed", delay: 5000 },
   });

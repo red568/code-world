@@ -5,17 +5,9 @@
 
 import { prisma } from "@/lib/prisma";
 import { Sandbox } from "@e2b/code-interpreter";
-import { acquireProjectLock, releaseProjectLock, agentQueue, clearCancelled } from "@/lib/queue";
+import { acquireProjectLock, releaseProjectLock, agentQueue } from "@/lib/queue";
 
 const DEMO_USER_ID = "demo-user-001";
-
-const ACTIVE_STATUSES = [
-  "spec_generating",
-  "code_generating",
-  "reviewing",
-  "building",
-  "fixing",
-];
 
 export async function GET(
   _request: Request,
@@ -53,14 +45,22 @@ export async function DELETE(
     return Response.json({ error: "Project not found" }, { status: 404 });
   }
 
-  if (ACTIVE_STATUSES.includes(project.status)) {
+  // 基于 active run 判断，而非 project.status
+  const activeRun = await prisma.projectRun.findFirst({
+    where: {
+      projectId: id,
+      status: { in: ["queued", "running", "cancelling"] },
+    },
+  });
+
+  if (activeRun) {
     return Response.json(
-      { error: "项目正在运行中，请先停止项目" },
+      { error: "项目有正在执行的任务，请先停止并等待完成" },
       { status: 409 }
     );
   }
 
-  // 尝试获取项目锁，防止与 Worker 竞态
+  // 获取项目锁，防止与 Worker 竞态
   const { acquired, token } = await acquireProjectLock(id);
   if (!acquired) {
     return Response.json(
@@ -70,6 +70,21 @@ export async function DELETE(
   }
 
   try {
+    // 锁内 double-check：防止获取锁期间有新 run 创建
+    const activeRunInLock = await prisma.projectRun.findFirst({
+      where: {
+        projectId: id,
+        status: { in: ["queued", "running", "cancelling"] },
+      },
+    });
+
+    if (activeRunInLock) {
+      return Response.json(
+        { error: "项目有正在执行的任务，请先停止并等待完成" },
+        { status: 409 }
+      );
+    }
+
     // 移除队列中同 projectId 的待执行任务
     const waitingJobs = await agentQueue.getJobs(["waiting", "delayed"]);
     for (const job of waitingJobs) {
@@ -78,21 +93,16 @@ export async function DELETE(
       }
     }
 
-    // 关闭沙箱
+    // best-effort 关闭沙箱
     if (project.sandboxSession?.sandboxId) {
       try {
         const sandbox = await Sandbox.connect(project.sandboxSession.sandboxId);
         await sandbox.kill();
-      } catch {
-        // 沙箱可能已过期或已停止
-      }
+      } catch { /* ignore */ }
     }
 
-    // 级联删除项目及所有关联记录
+    // 级联删除项目及所有关联记录（包括 ProjectRun）
     await prisma.project.delete({ where: { id } });
-
-    // 清理 cancel flag
-    await clearCancelled(id);
   } finally {
     await releaseProjectLock(id, token);
   }

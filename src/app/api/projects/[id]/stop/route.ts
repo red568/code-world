@@ -1,10 +1,10 @@
 /**
- * POST /api/projects/:id/stop — 停止项目（取消 Agent + 关闭 sandbox）
+ * POST /api/projects/:id/stop — Soft Stop：让当前 run 失去写权限
+ *
+ * 不强制中断 Worker/LLM/tool。Worker 在下一个 assertRunWritable 检查点感知并退出。
  */
 
 import { prisma } from "@/lib/prisma";
-import { Sandbox } from "@e2b/code-interpreter";
-import { setCancelled } from "@/lib/queue/cancel";
 import { agentQueue } from "@/lib/queue";
 import { publishStatusChange } from "@/lib/streaming";
 
@@ -14,52 +14,76 @@ export async function POST(
 ) {
   const { id } = await params;
 
-  const project = await prisma.project.findUnique({
-    where: { id },
-    include: { sandboxSession: true },
-  });
-
+  const project = await prisma.project.findUnique({ where: { id } });
   if (!project) {
     return Response.json({ error: "Project not found" }, { status: 404 });
   }
 
-  // 设置取消信号，agent loop 会在下一个检查点退出
-  await setCancelled(id);
-
-  // 立即更新 DB 状态，防止后续操作（删除、新任务）被 ACTIVE_STATUSES 检查拦住
-  await prisma.project.update({
-    where: { id },
-    data: { status: "stopped" },
+  // 查找当前 active run
+  const activeRun = await prisma.projectRun.findFirst({
+    where: {
+      projectId: id,
+      status: { in: ["queued", "running"] },
+    },
+    orderBy: { createdAt: "desc" },
   });
 
-  // 立即推送 SSE 事件，前端无需等待 Agent Loop 退出
-  await publishStatusChange(id, "stopped", "已取消");
-
-  // 移除队列中同 projectId 的待执行任务
-  const waitingJobs = await agentQueue.getJobs(["waiting", "delayed"]);
-  for (const job of waitingJobs) {
-    if (job.data.projectId === id) {
-      await job.remove();
-    }
+  if (!activeRun) {
+    // 没有活跃 run，直接返回成功（幂等）
+    return Response.json({ success: true, message: "No active run to stop" });
   }
 
-  // 关闭沙箱
-  if (project.sandboxSession?.sandboxId) {
-    try {
-      const sandbox = await Sandbox.connect(project.sandboxSession.sandboxId);
-      await sandbox.kill();
-    } catch {
-      // 沙箱可能已过期或已停止
-    }
-  }
-
-  // 更新沙箱会话状态
-  if (project.sandboxSession) {
-    await prisma.sandboxSession.update({
-      where: { projectId: id },
-      data: { status: "stopped", stoppedAt: new Date() },
+  // 事务内条件更新 run 状态
+  await prisma.$transaction(async (tx) => {
+    const run = await tx.projectRun.findFirst({
+      where: {
+        id: activeRun.id,
+        projectId: id,
+        status: { in: ["queued", "running"] },
+      },
     });
+
+    if (!run) return;
+
+    if (run.status === "queued") {
+      // queued run 直接取消，不需要等 Worker
+      await tx.projectRun.update({
+        where: { id: run.id },
+        data: { status: "cancelled", finishedAt: new Date() },
+      });
+      await tx.project.update({
+        where: { id },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        data: { status: "stopped" as any },
+      });
+    } else {
+      // running → cancelling，Worker 在检查点自行退出
+      await tx.projectRun.update({
+        where: { id: run.id },
+        data: { status: "cancelling" },
+      });
+      await tx.project.update({
+        where: { id },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        data: { status: "stopped" as any },
+      });
+    }
+  });
+
+  // 尝试移除 queued job（best-effort）
+  if (activeRun.status === "queued") {
+    try {
+      const waitingJobs = await agentQueue.getJobs(["waiting", "delayed"]);
+      for (const job of waitingJobs) {
+        if (job.data.runId === activeRun.id) {
+          await job.remove();
+        }
+      }
+    } catch { /* ignore */ }
   }
 
-  return Response.json({ success: true });
+  await publishStatusChange(id, "stopped", "已停止");
+
+  console.log(`[API] POST /api/projects/${id.slice(0, 8)}/stop | run=${activeRun.id.slice(0, 8)} | ${activeRun.status} → stop`);
+  return Response.json({ success: true }, { status: 202 });
 }
