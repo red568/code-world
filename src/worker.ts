@@ -17,6 +17,7 @@ import { Queue } from "bullmq";
 import { redis } from "@/lib/redis";
 import { QUEUE_NAME, type JobData } from "@/lib/queue";
 import { orchestrateGenerate, orchestrateIterate } from "@/lib/queue/orchestrator";
+import { withProjectLock } from "@/lib/queue/lock";
 
 // ─── Bull Board 监控面板 ────────────────────────────────────────────────────────
 
@@ -51,10 +52,14 @@ const worker = new Worker<JobData>(
     try {
       switch (job.data.type) {
         case "generate":
-          await orchestrateGenerate(job.data.projectId, job.data.prompt);
+          await withProjectLock(job.data.projectId, () =>
+            orchestrateGenerate(job.data.projectId, job.data.prompt)
+          );
           break;
         case "iterate":
-          await orchestrateIterate(job.data.projectId, job.data.prompt);
+          await withProjectLock(job.data.projectId, () =>
+            orchestrateIterate(job.data.projectId, job.data.prompt)
+          );
           break;
         default:
           console.error(`[Worker] Unknown job type: ${(job.data as JobData).type}`);

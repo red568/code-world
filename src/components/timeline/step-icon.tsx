@@ -2,13 +2,12 @@
 
 import { motion } from "framer-motion";
 import {
+  Brain,
+  FileCode,
+  Terminal,
   FileSearch,
-  ListTree,
-  Code,
-  SearchCheck,
-  Hammer,
   Eye,
-  Wrench,
+  AlertCircle,
   Check,
   X,
   Loader2,
@@ -16,13 +15,12 @@ import {
 import type { StepStatus } from "./types";
 
 const STEP_ICONS: Record<string, React.ComponentType<{ className?: string }>> = {
-  spec: FileSearch,
-  plan: ListTree,
-  codegen: Code,
-  review: SearchCheck,
-  build: Hammer,
-  fix: Wrench,
+  thinking: Brain,
+  file: FileCode,
+  command: Terminal,
+  read: FileSearch,
   preview: Eye,
+  error: AlertCircle,
 };
 
 const STATUS_RING: Record<StepStatus, string> = {

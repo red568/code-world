@@ -16,6 +16,7 @@ export const template = Template()
   .copy("src/main.tsx", "src/main.tsx")
   .copy("src/App.tsx", "src/App.tsx")
   .copy("src/index.css", "src/index.css")
+  .copy("src/vite-env.d.ts", "src/vite-env.d.ts")
 
   // 预装依赖
   .runCmd("npm install")

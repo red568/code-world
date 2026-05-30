@@ -94,14 +94,7 @@ export function PreviewPanel({ previewUrl, isBuilding, phase }: PreviewPanelProp
 }
 
 function BuildingAnimation({ phase }: { phase: string }) {
-  const labels: Record<string, string> = {
-    spec_generating: "分析需求中...",
-    code_generating: "生成代码中...",
-    reviewing: "审查代码中...",
-    building: "构建项目中...",
-    fixing: "自动修复中...",
-  };
-  const label = labels[phase] || "处理中...";
+  const label = phase === "code_generating" ? "Agent 工作中..." : "处理中...";
 
   return (
     <div className="flex flex-col items-center gap-6">

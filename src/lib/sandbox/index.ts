@@ -1,5 +1,6 @@
 export {
   createSandbox,
+  connectSandbox,
   writeTemplateFiles,
   writeProjectFiles,
   runCommand,
