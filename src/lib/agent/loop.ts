@@ -2,7 +2,6 @@
  * Agent Loop 引擎
  *
  * 核心 ReAct 循环：LLM 思考 → 选择工具 → 执行 → 观察结果 → 继续
- * 参考 Claude Code 的设计：一个 Agent 在一个连续对话里自主完成所有事情。
  */
 
 import OpenAI from "openai";
