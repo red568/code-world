@@ -39,9 +39,7 @@ export default function ProjectPage({
 
   const isGenerating =
     sending ||
-    (state.phase !== "idle" &&
-    state.phase !== "running" &&
-    state.phase !== "failed");
+    state.phase === "code_generating";
 
   useEffect(() => {
     if (state.phase !== "idle") setSending(false);
