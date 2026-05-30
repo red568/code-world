@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "NODE_OPTIONS='--max-old-space-size=1024' next build",
+    "build": "prisma generate && next build",
+    "db:deploy": "prisma db push",
     "start": "next start",
     "lint": "eslint",
     "worker": "npx tsx src/worker.ts",

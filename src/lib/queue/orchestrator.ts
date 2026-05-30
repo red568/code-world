@@ -1,8 +1,5 @@
 /**
- * Agent 编排器（重构版）
- *
- * 从 635 行的线性 workflow 简化为 Agent Loop 启动器。
- * 所有流程决策交给 Agent 自主完成。
+ * Agent Loop 启动器。所有流程决策交给 Agent 自主完成。
  */
 
 import { prisma } from "@/lib/prisma";
@@ -18,8 +15,19 @@ import {
   publishError,
 } from "@/lib/streaming";
 import { agentLoop, type AgentLoopResult } from "@/lib/agent/loop";
-import { BUILDER_SYSTEM_PROMPT, buildIteratePrompt, buildIteratePromptReused } from "@/lib/agent/prompt";
+import {
+  BUILDER_SYSTEM_PROMPT,
+  buildIteratePromptReused,
+  buildIteratePromptWithContext,
+} from "@/lib/agent/prompt";
+import {
+  estimateTokens,
+  generateConversationSummary,
+  compressMessagesIfNeeded,
+} from "@/lib/agent/conversation";
 import type { Sandbox } from "@e2b/code-interpreter";
+import type OpenAI from "openai";
+import type { Prisma } from "@/generated/prisma/client";
 
 function log(projectId: string, stage: string, message: string) {
   console.log(
@@ -80,6 +88,9 @@ export async function orchestrateGenerate(
       } catch {
         // 保活失败不阻塞主流程
       }
+
+      // 持久化对话历史
+      await saveConversation(projectId, result.finalMessages, instance.sandboxId);
 
       await prisma.project.update({
         where: { id: projectId },
@@ -152,6 +163,7 @@ export async function orchestrateIterate(
 ): Promise<void> {
   let sandbox: Sandbox | null = null;
   let isReused = false;
+  let newSandboxId: string | undefined;
   const totalStart = Date.now();
   log(projectId, "start", `开始迭代 | prompt="${prompt.slice(0, 60)}"`);
 
@@ -167,6 +179,9 @@ export async function orchestrateIterate(
       "code_generating",
       "Agent 开始修改..."
     );
+
+    // ─── 加载对话历史 ──────────────────────────────────────────────────────
+    const conversation = await loadConversation(projectId);
 
     // ─── 尝试复用已有沙箱 ──────────────────────────────────────────────────
     const session = await prisma.sandboxSession.findUnique({
@@ -190,6 +205,7 @@ export async function orchestrateIterate(
       log(projectId, "sandbox", "创建 E2B 沙箱...");
       const instance = await createSandbox();
       sandbox = instance.sandbox;
+      newSandboxId = instance.sandboxId;
       log(projectId, "sandbox", `就绪 | id=${instance.sandboxId}`);
 
       await writeTemplateFiles(sandbox);
@@ -204,6 +220,28 @@ export async function orchestrateIterate(
         await sandbox.files.write(fullPath, file.content);
       }
       log(projectId, "sandbox", `恢复文件 | count=${dbFiles.length}`);
+
+      // 沙箱过期 → 生成摘要，清空旧 messages
+      if (conversation?.messages && conversation.messages.length > 0) {
+        await handleSandboxExpiredConversation(projectId, conversation.messages);
+      }
+    }
+
+    // ─── 构建 Agent Loop 参数 ──────────────────────────────────────────────
+    let existingMessages: Messages | undefined;
+    let userMessage: string;
+
+    if (isReused && conversation?.messages && conversation.messages.length > 0) {
+      // 沙箱复用 + 有历史 → 传入完整 messages，Agent 继续对话
+      existingMessages = conversation.messages;
+      userMessage = buildIteratePromptReused(prompt);
+      log(projectId, "conversation", `复用对话 | msgs=${existingMessages.length}`);
+    } else if (!isReused) {
+      // 新沙箱 → 可能有摘要作为上下文
+      const conv = await loadConversation(projectId);
+      userMessage = buildIteratePromptWithContext(prompt, conv?.summary ?? null);
+    } else {
+      userMessage = buildIteratePromptReused(prompt);
     }
 
     // ─── 启动 Agent Loop ────────────────────────────────────────────────────
@@ -212,9 +250,8 @@ export async function orchestrateIterate(
       projectId,
       sandbox,
       systemPrompt: BUILDER_SYSTEM_PROMPT,
-      userMessage: isReused
-        ? buildIteratePromptReused(prompt)
-        : buildIteratePrompt(prompt),
+      userMessage,
+      existingMessages,
       maxSteps: 50,
     });
 
@@ -229,6 +266,10 @@ export async function orchestrateIterate(
         // 续命失败不阻塞
       }
 
+      // 持久化对话历史
+      const sandboxIdToSave = isReused ? session?.sandboxId : newSandboxId;
+      await saveConversation(projectId, result.finalMessages, sandboxIdToSave ?? undefined);
+
       await prisma.project.update({
         where: { id: projectId },
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -241,6 +282,10 @@ export async function orchestrateIterate(
         `迭代成功 | steps=${result.steps} | total=${totalDuration}s | reused=${isReused}`
       );
     } else {
+      // 即使失败也保存对话，方便下次继续
+      const sandboxIdToSave = isReused ? session?.sandboxId : newSandboxId;
+      await saveConversation(projectId, result.finalMessages, sandboxIdToSave ?? undefined);
+
       await prisma.project.update({
         where: { id: projectId },
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -285,4 +330,76 @@ export async function orchestrateIterate(
       }
     }
   }
+}
+
+// ─── 对话持久化辅助 ────────────────────────────────────────────────────────────────
+
+type Messages = OpenAI.ChatCompletionMessageParam[];
+
+async function saveConversation(
+  projectId: string,
+  messages: Messages,
+  sandboxId?: string
+): Promise<void> {
+  const project = await prisma.project.findUniqueOrThrow({
+    where: { id: projectId },
+    select: { userId: true },
+  });
+
+  const compressed = compressMessagesIfNeeded(messages);
+  const tokenEstimate = estimateTokens(compressed);
+
+  await prisma.agentConversation.upsert({
+    where: { projectId },
+    create: {
+      projectId,
+      userId: project.userId,
+      sandboxId: sandboxId ?? null,
+      messages: compressed as unknown as Prisma.InputJsonValue,
+      tokenEstimate,
+    },
+    update: {
+      sandboxId: sandboxId ?? undefined,
+      messages: compressed as unknown as Prisma.InputJsonValue,
+      tokenEstimate,
+      updatedAt: new Date(),
+    },
+  });
+
+  log(projectId, "conversation", `已保存 | tokens≈${tokenEstimate} | msgs=${compressed.length}`);
+}
+
+async function loadConversation(
+  projectId: string
+): Promise<{ messages: Messages; summary: string | null; sandboxId: string | null } | null> {
+  const conv = await prisma.agentConversation.findUnique({
+    where: { projectId },
+  });
+  if (!conv) return null;
+
+  return {
+    messages: conv.messages as unknown as Messages,
+    summary: conv.summary,
+    sandboxId: conv.sandboxId,
+  };
+}
+
+async function handleSandboxExpiredConversation(
+  projectId: string,
+  oldMessages: Messages
+): Promise<string | null> {
+  const summary = await generateConversationSummary(oldMessages);
+
+  await prisma.agentConversation.update({
+    where: { projectId },
+    data: {
+      summary,
+      messages: [] as unknown as Prisma.InputJsonValue,
+      sandboxId: null,
+      tokenEstimate: 0,
+    },
+  });
+
+  log(projectId, "conversation", `沙箱过期，已生成摘要 | summary=${summary?.slice(0, 80)}`);
+  return summary;
 }

@@ -145,3 +145,31 @@ ${userRequest}
 - 不需要 npm run build，Vite HMR 会自动更新
 - 不需要启动 dev server，它已经在运行`;
 }
+
+export function buildIteratePromptWithContext(
+  userRequest: string,
+  summary: string | null
+): string {
+  const contextBlock = summary
+    ? `## 项目背景\n${summary}\n\n`
+    : "";
+
+  return `用户要求对现有项目进行修改。
+
+${contextBlock}## 用户需求
+${userRequest}
+
+## 工作方式
+1. 先用 list_files() 查看当前项目结构
+2. 用 read_file() 查看需要修改的文件
+3. 理解现有代码结构后，进行针对性修改
+4. 只修改必要的文件，保持其他文件不变
+5. 修改完成后 run_shell("npm run build") 验证
+6. 构建成功后启动预览并获取 URL
+7. 获取到预览 URL 后任务完成，不再调用任何工具
+
+## 注意
+- 保持现有代码风格和结构
+- 只返回需要修改的文件
+- 不要重写未变动的文件`;
+}

@@ -23,6 +23,7 @@ export interface AgentLoopConfig {
   sandbox: Sandbox;
   systemPrompt: string;
   userMessage: string;
+  existingMessages?: OpenAI.ChatCompletionMessageParam[];
   maxSteps?: number;
   maxTokensPerTurn?: number;
 }
@@ -32,12 +33,7 @@ export interface AgentLoopResult {
   summary: string;
   steps: number;
   previewUrl: string | null;
-}
-
-interface ToolCallInfo {
-  id: string;
-  type: "function";
-  function: { name: string; arguments: string };
+  finalMessages: OpenAI.ChatCompletionMessageParam[];
 }
 
 // ─── Agent Loop 主函数 ───────────────────────────────────────────────────────────
@@ -70,10 +66,12 @@ export async function agentLoop(
   };
 
   // 初始化消息
-  const messages: OpenAI.ChatCompletionMessageParam[] = [
-    { role: "system", content: systemPrompt },
-    { role: "user", content: userMessage },
-  ];
+  const messages: OpenAI.ChatCompletionMessageParam[] = config.existingMessages
+    ? [...config.existingMessages, { role: "user" as const, content: userMessage }]
+    : [
+        { role: "system" as const, content: systemPrompt },
+        { role: "user" as const, content: userMessage },
+      ];
 
   let previewUrl: string | null = null;
   let step = 0;
@@ -126,6 +124,7 @@ export async function agentLoop(
           summary: `LLM 调用失败: ${retryMsg}`,
           steps: step,
           previewUrl,
+          finalMessages: messages,
         };
       }
     }
@@ -140,6 +139,7 @@ export async function agentLoop(
         summary: "LLM 返回空响应",
         steps: step,
         previewUrl,
+        finalMessages: messages,
       };
     }
 
@@ -177,6 +177,7 @@ export async function agentLoop(
         summary: assistantMessage.content || "Agent 结束",
         steps: step,
         previewUrl,
+        finalMessages: messages,
       };
     }
 
@@ -280,6 +281,7 @@ export async function agentLoop(
     summary: `达到最大步数限制 (${maxSteps})`,
     steps: maxSteps,
     previewUrl,
+    finalMessages: messages,
   };
 }
 
