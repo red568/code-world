@@ -123,3 +123,25 @@ ${userRequest}
 - 只返回需要修改的文件
 - 不要重写未变动的文件`;
 }
+
+export function buildIteratePromptReused(userRequest: string): string {
+  return `用户要求对现有项目进行修改。
+
+## 用户需求
+${userRequest}
+
+## 当前环境
+- 项目文件已在沙箱中，dev server 已在运行（端口 5173）
+- 修改文件后 Vite 会自动热更新，无需重新 build 或启动 server
+
+## 工作方式
+1. 如果需要了解现有代码，用 read_file() 查看相关文件
+2. 用 write_file() 修改需要改的文件
+3. 修改完成后直接 get_preview_url(5173) 获取预览地址
+4. 获取到预览 URL 后任务完成，不再调用任何工具
+
+## 注意
+- 只修改必要的文件，保持其他文件不变
+- 不需要 npm run build，Vite HMR 会自动更新
+- 不需要启动 dev server，它已经在运行`;
+}

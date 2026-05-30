@@ -231,6 +231,21 @@ export async function keepAlive(
 }
 
 /**
+ * 重连已有沙箱（如果 paused 会自动 resume）
+ * 连接失败时抛出异常，调用方负责降级
+ */
+export async function connectSandbox(sandboxId: string): Promise<SandboxInstance> {
+  const startTime = Date.now();
+  console.log(`[Sandbox] 尝试重连沙箱 | id=${sandboxId}`);
+
+  const sandbox = await Sandbox.connect(sandboxId);
+  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+  console.log(`[Sandbox] 重连成功 | id=${sandboxId} | ${duration}s`);
+
+  return { sandbox, sandboxId };
+}
+
+/**
  * 停止 sandbox
  */
 export async function stopSandbox(sandbox: Sandbox): Promise<void> {

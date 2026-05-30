@@ -8,7 +8,9 @@
 import { prisma } from "@/lib/prisma";
 import {
   createSandbox,
+  connectSandbox,
   writeTemplateFiles,
+  keepAlive,
   stopSandbox,
 } from "@/lib/sandbox";
 import {
@@ -16,7 +18,7 @@ import {
   publishError,
 } from "@/lib/streaming";
 import { agentLoop, type AgentLoopResult } from "@/lib/agent/loop";
-import { BUILDER_SYSTEM_PROMPT, buildIteratePrompt } from "@/lib/agent/prompt";
+import { BUILDER_SYSTEM_PROMPT, buildIteratePrompt, buildIteratePromptReused } from "@/lib/agent/prompt";
 import type { Sandbox } from "@e2b/code-interpreter";
 
 function log(projectId: string, stage: string, message: string) {
@@ -72,6 +74,13 @@ export async function orchestrateGenerate(
     const totalDuration = ((Date.now() - totalStart) / 1000).toFixed(1);
 
     if (result.success) {
+      // 保活沙箱 15 分钟，供后续迭代复用
+      try {
+        await keepAlive(sandbox!, 15 * 60 * 1000);
+      } catch {
+        // 保活失败不阻塞主流程
+      }
+
       await prisma.project.update({
         where: { id: projectId },
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -135,13 +144,14 @@ export async function orchestrateGenerate(
 }
 
 /**
- * 执行迭代修改流程：基于现有项目和新需求修改代码
+ * 执行迭代修改流程：优先复用已有沙箱，失败则降级创建新沙箱
  */
 export async function orchestrateIterate(
   projectId: string,
   prompt: string
 ): Promise<void> {
   let sandbox: Sandbox | null = null;
+  let isReused = false;
   const totalStart = Date.now();
   log(projectId, "start", `开始迭代 | prompt="${prompt.slice(0, 60)}"`);
 
@@ -158,41 +168,67 @@ export async function orchestrateIterate(
       "Agent 开始修改..."
     );
 
-    // 创建新 Sandbox
-    log(projectId, "sandbox", "创建 E2B 沙箱...");
-    const instance = await createSandbox();
-    sandbox = instance.sandbox;
-    log(projectId, "sandbox", `就绪 | id=${instance.sandboxId}`);
-
-    // 写入模板文件
-    await writeTemplateFiles(sandbox);
-
-    // 从 DB 恢复所有现有文件到 sandbox
-    const dbFiles = await prisma.projectFile.findMany({
+    // ─── 尝试复用已有沙箱 ──────────────────────────────────────────────────
+    const session = await prisma.sandboxSession.findUnique({
       where: { projectId },
     });
-    for (const file of dbFiles) {
-      const fullPath = `/home/user/app/${file.path}`;
-      const dir = fullPath.split("/").slice(0, -1).join("/");
-      await sandbox.commands.run(`mkdir -p ${dir}`);
-      await sandbox.files.write(fullPath, file.content);
-    }
-    log(projectId, "sandbox", `恢复文件 | count=${dbFiles.length}`);
 
-    // 启动 Agent Loop（用迭代 prompt）
-    log(projectId, "agent", "启动 Agent Loop（迭代模式）");
+    if (session?.sandboxId) {
+      try {
+        const instance = await connectSandbox(session.sandboxId);
+        sandbox = instance.sandbox;
+        isReused = true;
+        log(projectId, "sandbox", `复用沙箱 | id=${session.sandboxId}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log(projectId, "sandbox", `复用失败: ${msg}，创建新沙箱`);
+      }
+    }
+
+    // ─── 降级：创建新沙箱 + 恢复文件 ───────────────────────────────────────
+    if (!sandbox) {
+      log(projectId, "sandbox", "创建 E2B 沙箱...");
+      const instance = await createSandbox();
+      sandbox = instance.sandbox;
+      log(projectId, "sandbox", `就绪 | id=${instance.sandboxId}`);
+
+      await writeTemplateFiles(sandbox);
+
+      const dbFiles = await prisma.projectFile.findMany({
+        where: { projectId },
+      });
+      for (const file of dbFiles) {
+        const fullPath = `/home/user/app/${file.path}`;
+        const dir = fullPath.split("/").slice(0, -1).join("/");
+        await sandbox.commands.run(`mkdir -p ${dir}`);
+        await sandbox.files.write(fullPath, file.content);
+      }
+      log(projectId, "sandbox", `恢复文件 | count=${dbFiles.length}`);
+    }
+
+    // ─── 启动 Agent Loop ────────────────────────────────────────────────────
+    log(projectId, "agent", `启动 Agent Loop（${isReused ? "复用" : "新建"}模式）`);
     const result: AgentLoopResult = await agentLoop({
       projectId,
       sandbox,
       systemPrompt: BUILDER_SYSTEM_PROMPT,
-      userMessage: buildIteratePrompt(prompt),
+      userMessage: isReused
+        ? buildIteratePromptReused(prompt)
+        : buildIteratePrompt(prompt),
       maxSteps: 50,
     });
 
-    // 处理结果
+    // ─── 处理结果 ───────────────────────────────────────────────────────────
     const totalDuration = ((Date.now() - totalStart) / 1000).toFixed(1);
 
     if (result.success) {
+      // 续命沙箱 15 分钟，供下次迭代复用
+      try {
+        await keepAlive(sandbox, 15 * 60 * 1000);
+      } catch {
+        // 续命失败不阻塞
+      }
+
       await prisma.project.update({
         where: { id: projectId },
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -202,7 +238,7 @@ export async function orchestrateIterate(
       log(
         projectId,
         "end",
-        `迭代成功 | steps=${result.steps} | total=${totalDuration}s`
+        `迭代成功 | steps=${result.steps} | total=${totalDuration}s | reused=${isReused}`
       );
     } else {
       await prisma.project.update({
@@ -221,7 +257,7 @@ export async function orchestrateIterate(
         `迭代失败 | steps=${result.steps} | total=${totalDuration}s`
       );
 
-      if (sandbox) {
+      if (sandbox && !isReused) {
         try {
           await stopSandbox(sandbox);
         } catch {
@@ -241,7 +277,7 @@ export async function orchestrateIterate(
     });
     await publishStatusChange(projectId, "failed", `修改失败: ${message}`);
 
-    if (sandbox) {
+    if (sandbox && !isReused) {
       try {
         await stopSandbox(sandbox);
       } catch {
