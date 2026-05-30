@@ -10,6 +10,7 @@
 # import { Sandbox } from 'e2b'
 # const sandbox = await Sandbox.create('vite-react-tailwind')
 
+team_id = "d913e6ec-2ea3-4bd5-a3cc-f9e60d363dc8"
 dockerfile = "e2b.Dockerfile"
 template_name = "vite-react-tailwind"
 template_id = "i1lhqox6ktdfdcf996lq"

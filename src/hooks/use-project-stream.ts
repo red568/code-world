@@ -83,7 +83,11 @@ type StreamAction =
   | { type: "FIX_DONE"; attempt: number; success: boolean }
   | { type: "PREVIEW_READY"; previewUrl: string }
   | { type: "ERROR"; message: string }
-  | { type: "RESET" };
+  | { type: "RESET" }
+  // Agent Loop 新增
+  | { type: "AGENT_THINKING"; content: string }
+  | { type: "TOOL_CALL"; tool: string; args: Record<string, unknown> }
+  | { type: "TOOL_RESULT"; tool: string; success: boolean; summary: string };
 
 const initialState: StreamState = {
   phase: "idle",
@@ -260,6 +264,30 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
     case "RESET":
       activityId = 0;
       return { ...initialState };
+    // ─── Agent Loop 新增 ──────────────────────────────────────────────────
+    case "AGENT_THINKING": {
+      const acts = addActivity(state.activities, "thinking", action.content.slice(0, 80));
+      return { ...state, activities: acts };
+    }
+    case "TOOL_CALL": {
+      const label = action.tool === "write_file"
+        ? `写入 ${(action.args.path as string) || "file"}`
+        : action.tool === "run_shell"
+        ? `执行 ${(action.args.command as string)?.slice(0, 40) || "command"}`
+        : action.tool === "read_file"
+        ? `读取 ${(action.args.path as string) || "file"}`
+        : action.tool;
+      const acts2 = addActivity(state.activities, action.tool === "run_shell" ? "command" : "file", label);
+      return { ...state, activities: acts2 };
+    }
+    case "TOOL_RESULT": {
+      const actType = action.tool === "run_shell" ? "command" : "file";
+      const acts3 = finishActiveByType(state.activities, actType);
+      if (!action.success) {
+        return { ...state, activities: addActivity(acts3, "error", action.summary.slice(0, 80)) };
+      }
+      return { ...state, activities: acts3 };
+    }
     default:
       return state;
   }
@@ -350,6 +378,22 @@ export function useProjectStream(projectId: string | null) {
     eventSource.addEventListener("preview_ready", (e) => {
       const data = JSON.parse(e.data);
       dispatch({ type: "PREVIEW_READY", previewUrl: data.previewUrl });
+    });
+
+    // Agent Loop 新增事件
+    eventSource.addEventListener("agent_thinking", (e) => {
+      const data = JSON.parse(e.data);
+      dispatch({ type: "AGENT_THINKING", content: data.content });
+    });
+
+    eventSource.addEventListener("tool_call", (e) => {
+      const data = JSON.parse(e.data);
+      dispatch({ type: "TOOL_CALL", tool: data.tool, args: data.args || {} });
+    });
+
+    eventSource.addEventListener("tool_result", (e) => {
+      const data = JSON.parse(e.data);
+      dispatch({ type: "TOOL_RESULT", tool: data.tool, success: data.success, summary: data.summary || "" });
     });
 
     eventSource.addEventListener("error", (e) => {
