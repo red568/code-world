@@ -14,6 +14,7 @@ import {
 } from "./tools";
 import { publishEvent } from "@/lib/streaming";
 import { prisma } from "@/lib/prisma";
+import { isCancelled } from "@/lib/queue/cancel";
 import type { Sandbox } from "@e2b/code-interpreter";
 
 // ─── 类型定义 ────────────────────────────────────────────────────────────────────
@@ -83,6 +84,19 @@ export async function agentLoop(
 
   for (step = 1; step <= maxSteps; step++) {
     const stepStart = Date.now();
+
+    // ─── 取消检查 ──────────────────────────────────────────────────────────
+
+    if (await isCancelled(projectId)) {
+      console.log(`[AgentLoop] [${projectId.slice(0, 8)}] step=${step} 项目已取消，退出`);
+      return {
+        success: false,
+        summary: "已取消",
+        steps: step,
+        previewUrl,
+        finalMessages: messages,
+      };
+    }
 
     // ─── 调用 LLM ──────────────────────────────────────────────────────────
 
@@ -185,6 +199,19 @@ export async function agentLoop(
 
     for (const toolCall of assistantMessage.tool_calls) {
       if (toolCall.type !== "function") continue;
+
+      // 每个 tool 执行前检查取消
+      if (await isCancelled(projectId)) {
+        console.log(`[AgentLoop] [${projectId.slice(0, 8)}] step=${step} 项目已取消（tool 执行前），退出`);
+        return {
+          success: false,
+          summary: "已取消",
+          steps: step,
+          previewUrl,
+          finalMessages: messages,
+        };
+      }
+
       const fn = toolCall.function;
       const fnName = fn.name;
       let args: Record<string, unknown> = {};

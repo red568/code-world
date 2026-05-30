@@ -18,6 +18,7 @@ import { redis } from "@/lib/redis";
 import { QUEUE_NAME, type JobData } from "@/lib/queue";
 import { orchestrateGenerate, orchestrateIterate } from "@/lib/queue/orchestrator";
 import { withProjectLock } from "@/lib/queue/lock";
+import { prisma } from "@/lib/prisma";
 
 // ─── Bull Board 监控面板 ────────────────────────────────────────────────────────
 
@@ -47,18 +48,26 @@ const worker = new Worker<JobData>(
   QUEUE_NAME,
   async (job) => {
     const startTime = Date.now();
-    console.log(`[Worker] ▶ Job ${job.id} started: ${job.data.type} | project: ${job.data.projectId}`);
+    const { projectId } = job.data;
+    console.log(`[Worker] ▶ Job ${job.id} started: ${job.data.type} | project: ${projectId}`);
+
+    // 防御性检查：项目可能已被删除
+    const project = await prisma.project.findUnique({ where: { id: projectId } });
+    if (!project) {
+      console.log(`[Worker] 项目 ${projectId.slice(0, 8)} 已删除，跳过`);
+      return;
+    }
 
     try {
       switch (job.data.type) {
         case "generate":
-          await withProjectLock(job.data.projectId, () =>
-            orchestrateGenerate(job.data.projectId, job.data.prompt)
+          await withProjectLock(projectId, () =>
+            orchestrateGenerate(projectId, job.data.prompt)
           );
           break;
         case "iterate":
-          await withProjectLock(job.data.projectId, () =>
-            orchestrateIterate(job.data.projectId, job.data.prompt)
+          await withProjectLock(projectId, () =>
+            orchestrateIterate(projectId, job.data.prompt)
           );
           break;
         default:

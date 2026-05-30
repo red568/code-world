@@ -25,6 +25,7 @@ import {
   generateConversationSummary,
   compressMessagesIfNeeded,
 } from "@/lib/agent/conversation";
+import { clearCancelled } from "@/lib/queue/cancel";
 import type { Sandbox } from "@e2b/code-interpreter";
 import type OpenAI from "openai";
 import type { Prisma } from "@/generated/prisma/client";
@@ -45,6 +46,9 @@ export async function orchestrateGenerate(
   let sandbox: Sandbox | null = null;
   const totalStart = Date.now();
   log(projectId, "start", `开始生成 | prompt="${prompt.slice(0, 60)}"`);
+
+  // 清理旧的取消信号，确保新任务不会被误取消
+  await clearCancelled(projectId);
 
   try {
     // 更新状态
@@ -80,6 +84,14 @@ export async function orchestrateGenerate(
 
     // 处理结果
     const totalDuration = ((Date.now() - totalStart) / 1000).toFixed(1);
+
+    if (result.summary === "已取消") {
+      log(projectId, "end", `已取消 | steps=${result.steps} | total=${totalDuration}s`);
+      if (sandbox) {
+        try { await stopSandbox(sandbox); } catch { /* 清理失败不阻塞 */ }
+      }
+      return;
+    }
 
     if (result.success) {
       // 保活沙箱 15 分钟，供后续迭代复用
@@ -166,6 +178,9 @@ export async function orchestrateIterate(
   let newSandboxId: string | undefined;
   const totalStart = Date.now();
   log(projectId, "start", `开始迭代 | prompt="${prompt.slice(0, 60)}"`);
+
+  // 清理旧的取消信号，确保新任务不会被误取消
+  await clearCancelled(projectId);
 
   try {
     // 更新状态
@@ -257,6 +272,14 @@ export async function orchestrateIterate(
 
     // ─── 处理结果 ───────────────────────────────────────────────────────────
     const totalDuration = ((Date.now() - totalStart) / 1000).toFixed(1);
+
+    if (result.summary === "已取消") {
+      log(projectId, "end", `迭代已取消 | steps=${result.steps} | total=${totalDuration}s`);
+      if (sandbox && !isReused) {
+        try { await stopSandbox(sandbox); } catch { /* 清理失败不阻塞 */ }
+      }
+      return;
+    }
 
     if (result.success) {
       // 续命沙箱 15 分钟，供下次迭代复用

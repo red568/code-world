@@ -80,6 +80,7 @@ export default function ProjectPage({
       {/* Middle: Chat + Activity trail */}
       <div className="w-[420px] flex-shrink-0 border-r border-gray-200">
         <ChatPanel
+          projectId={id}
           messages={messages}
           streamState={state}
           isGenerating={isGenerating}
