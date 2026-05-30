@@ -47,6 +47,9 @@ export async function enqueueGenerate(
     type: "generate",
     projectId,
     prompt,
+  }, {
+    attempts: 3,
+    backoff: { type: "fixed", delay: 5000 },
   });
 }
 
@@ -61,5 +64,8 @@ export async function enqueueIterate(
     type: "iterate",
     projectId,
     prompt,
+  }, {
+    attempts: 3,
+    backoff: { type: "fixed", delay: 5000 },
   });
 }

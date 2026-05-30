@@ -6,6 +6,7 @@ import { prisma } from "@/lib/prisma";
 import { Sandbox } from "@e2b/code-interpreter";
 import { setCancelled } from "@/lib/queue/cancel";
 import { agentQueue } from "@/lib/queue";
+import { publishStatusChange } from "@/lib/streaming";
 
 export async function POST(
   _request: Request,
@@ -24,6 +25,15 @@ export async function POST(
 
   // 设置取消信号，agent loop 会在下一个检查点退出
   await setCancelled(id);
+
+  // 立即更新 DB 状态，防止后续操作（删除、新任务）被 ACTIVE_STATUSES 检查拦住
+  await prisma.project.update({
+    where: { id },
+    data: { status: "stopped" },
+  });
+
+  // 立即推送 SSE 事件，前端无需等待 Agent Loop 退出
+  await publishStatusChange(id, "stopped", "已取消");
 
   // 移除队列中同 projectId 的待执行任务
   const waitingJobs = await agentQueue.getJobs(["waiting", "delayed"]);
@@ -50,11 +60,6 @@ export async function POST(
       data: { status: "stopped", stoppedAt: new Date() },
     });
   }
-
-  await prisma.project.update({
-    where: { id },
-    data: { status: "stopped" },
-  });
 
   return Response.json({ success: true });
 }

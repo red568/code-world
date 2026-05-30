@@ -112,7 +112,13 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
       return { ...state, connected: false };
 
     case "STATUS_CHANGE": {
-      const phase = action.status as ProjectPhase;
+      const rawStatus = action.status;
+      // stopped 映射为 idle（前端不需要 stopped 状态）
+      const phase = (rawStatus === "stopped" ? "idle" : rawStatus) as ProjectPhase;
+      if (phase === "idle") {
+        const steps = finishLastActive(state.steps);
+        return { ...state, phase, message: action.message, steps };
+      }
       if (phase === "code_generating") {
         return {
           ...state,

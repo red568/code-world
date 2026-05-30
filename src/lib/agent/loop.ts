@@ -89,6 +89,10 @@ export async function agentLoop(
 
     if (await isCancelled(projectId)) {
       console.log(`[AgentLoop] [${projectId.slice(0, 8)}] step=${step} 项目已取消，退出`);
+      await publishEvent(projectId, {
+        type: "status_change",
+        data: { status: "stopped", message: "已取消" },
+      });
       return {
         success: false,
         summary: "已取消",
@@ -203,6 +207,10 @@ export async function agentLoop(
       // 每个 tool 执行前检查取消
       if (await isCancelled(projectId)) {
         console.log(`[AgentLoop] [${projectId.slice(0, 8)}] step=${step} 项目已取消（tool 执行前），退出`);
+        await publishEvent(projectId, {
+          type: "status_change",
+          data: { status: "stopped", message: "已取消" },
+        });
         return {
           success: false,
           summary: "已取消",
