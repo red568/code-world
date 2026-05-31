@@ -111,6 +111,7 @@ export default function ProjectPage({
           previewUrl={state.previewUrl}
           isBuilding={isGenerating}
           phase={state.phase}
+          stopped={state.phase === "idle" && state.message === "已停止"}
         />
       </div>
     </div>

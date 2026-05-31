@@ -25,6 +25,7 @@ export function TimelineStepRow({ step, isLast }: { step: TStep; isLast: boolean
             step.status === "active" ? "text-gray-800 font-medium" :
             step.status === "done" ? "text-gray-600" :
             step.status === "error" ? "text-red-600" :
+            step.status === "stopped" ? "text-gray-400" :
             "text-gray-400"
           }`}>
             {step.label}

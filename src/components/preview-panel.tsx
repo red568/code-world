@@ -2,15 +2,16 @@
 
 import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { ExternalLink, Monitor, RefreshCw, Code2 } from "lucide-react";
+import { ExternalLink, Monitor, RefreshCw, Code2, Square } from "lucide-react";
 
 interface PreviewPanelProps {
   previewUrl: string | null;
   isBuilding: boolean;
   phase: string;
+  stopped?: boolean;
 }
 
-export function PreviewPanel({ previewUrl, isBuilding, phase }: PreviewPanelProps) {
+export function PreviewPanel({ previewUrl, isBuilding, phase, stopped }: PreviewPanelProps) {
   const [iframeKey, setIframeKey] = useState(0);
 
   return (
@@ -82,6 +83,8 @@ export function PreviewPanel({ previewUrl, isBuilding, phase }: PreviewPanelProp
             >
               {isBuilding ? (
                 <BuildingAnimation phase={phase} />
+              ) : stopped ? (
+                <StoppedPlaceholder />
               ) : (
                 <IdlePlaceholder />
               )}
@@ -140,6 +143,18 @@ function BuildingAnimation({ phase }: { phase: string }) {
           />
         ))}
       </div>
+    </div>
+  );
+}
+
+function StoppedPlaceholder() {
+  return (
+    <div className="text-center">
+      <div className="w-12 h-12 bg-gray-100 rounded-xl flex items-center justify-center mx-auto mb-4">
+        <Square className="w-5 h-5 text-gray-400 fill-current" />
+      </div>
+      <p className="text-sm text-gray-500">已停止生成</p>
+      <p className="text-xs text-gray-400 mt-1">输入新的需求继续</p>
     </div>
   );
 }

@@ -21,7 +21,7 @@ export interface AgentStep {
   type: "thinking" | "file" | "command" | "read" | "preview" | "error";
   label: string;
   detail?: string;
-  status: "active" | "done" | "error";
+  status: "active" | "done" | "error" | "stopped";
   startedAt: number;
   finishedAt?: number;
 }
@@ -71,6 +71,14 @@ function finishLastActive(steps: AgentStep[], type?: AgentStep["type"]): AgentSt
   });
 }
 
+function stopLastActive(steps: AgentStep[]): AgentStep[] {
+  const now = Date.now();
+  return steps.map((s) => {
+    if (s.status !== "active") return s;
+    return { ...s, status: "stopped" as const, finishedAt: now };
+  });
+}
+
 function toolLabel(tool: string, args: Record<string, unknown>): string {
   switch (tool) {
     case "write_file":
@@ -113,10 +121,10 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
 
     case "STATUS_CHANGE": {
       const rawStatus = action.status;
-      // stopped 映射为 idle（前端不需要 stopped 状态）
-      const phase = (rawStatus === "stopped" ? "idle" : rawStatus) as ProjectPhase;
+      const isStopped = rawStatus === "stopped";
+      const phase = (isStopped ? "idle" : rawStatus) as ProjectPhase;
       if (phase === "idle") {
-        const steps = finishLastActive(state.steps);
+        const steps = isStopped ? stopLastActive(state.steps) : finishLastActive(state.steps);
         return { ...state, phase, message: action.message, steps };
       }
       if (phase === "code_generating") {

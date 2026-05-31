@@ -11,6 +11,7 @@ import {
   Check,
   X,
   Loader2,
+  Square,
 } from "lucide-react";
 import type { StepStatus } from "./types";
 
@@ -28,6 +29,7 @@ const STATUS_RING: Record<StepStatus, string> = {
   active: "border-blue-400 bg-blue-50",
   done: "border-green-400 bg-green-50",
   error: "border-red-400 bg-red-50",
+  stopped: "border-gray-300 bg-gray-50",
 };
 
 const STATUS_ICON_COLOR: Record<StepStatus, string> = {
@@ -35,6 +37,7 @@ const STATUS_ICON_COLOR: Record<StepStatus, string> = {
   active: "text-blue-500",
   done: "text-green-600",
   error: "text-red-500",
+  stopped: "text-gray-400",
 };
 
 export function StepIcon({ type, status }: { type: string; status: StepStatus }) {
@@ -53,6 +56,8 @@ export function StepIcon({ type, status }: { type: string; status: StepStatus })
         <Check className="w-3.5 h-3.5 text-green-600" />
       ) : status === "error" ? (
         <X className="w-3.5 h-3.5 text-red-500" />
+      ) : status === "stopped" ? (
+        <Square className="w-2.5 h-2.5 text-gray-400 fill-current" />
       ) : (
         <Icon className={`w-3.5 h-3.5 ${STATUS_ICON_COLOR[status]}`} />
       )}

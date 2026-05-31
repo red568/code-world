@@ -24,11 +24,17 @@ interface ChatPanelProps {
 }
 
 function agentStepToTimelineStep(step: AgentStep): TimelineStep {
+  const statusMap: Record<AgentStep["status"], TimelineStep["status"]> = {
+    active: "active",
+    done: "done",
+    error: "error",
+    stopped: "stopped",
+  };
   return {
     id: String(step.id),
     type: step.type,
     label: step.label,
-    status: step.status === "error" ? "error" : step.status === "done" ? "done" : "active",
+    status: statusMap[step.status],
     startedAt: step.startedAt,
     finishedAt: step.finishedAt,
     detail: step.detail,
