@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react";
 import { useRouter, usePathname } from "next/navigation";
-import { Plus, MessageSquare, CheckCircle2, XCircle, Loader2, Sparkles, Trash2, PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { Plus, MessageSquare, CheckCircle2, XCircle, Loader2, Sparkles, Trash2, PanelLeftClose } from "lucide-react";
 
 interface ProjectItem {
   id: string;
@@ -85,7 +85,8 @@ export function SessionSidebar({ collapsed = false, onToggle }: SessionSidebarPr
       <div className={`py-4 flex items-center ${collapsed ? "px-3 justify-center" : "px-4 gap-2.5"}`}>
         <div
           className="w-7 h-7 bg-gradient-to-br from-blue-500 to-purple-600 rounded-lg flex items-center justify-center cursor-pointer"
-          onClick={() => router.push("/")}
+          onClick={collapsed ? onToggle : () => router.push("/")}
+          title={collapsed ? "展开侧栏" : "首页"}
         >
           <Sparkles className="w-3.5 h-3.5 text-white" />
         </div>
@@ -100,19 +101,6 @@ export function SessionSidebar({ collapsed = false, onToggle }: SessionSidebarPr
           </button>
         )}
       </div>
-
-      {/* Expand button (collapsed state) */}
-      {collapsed && onToggle && (
-        <div className="px-3 mb-2 flex justify-center">
-          <button
-            onClick={onToggle}
-            className="w-7 h-7 flex items-center justify-center text-gray-400 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors"
-            title="展开侧栏"
-          >
-            <PanelLeftOpen className="w-4 h-4" />
-          </button>
-        </div>
-      )}
 
       {/* New chat */}
       <div className={`mb-2 ${collapsed ? "px-3 flex justify-center" : "px-3"}`}>
