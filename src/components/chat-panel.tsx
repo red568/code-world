@@ -20,6 +20,7 @@ interface ChatPanelProps {
   streamState: StreamState;
   isGenerating: boolean;
   onSend: (message: string) => void;
+  onStop: () => void;
 }
 
 function agentStepToTimelineStep(step: AgentStep): TimelineStep {
@@ -91,6 +92,7 @@ export function ChatPanel({
   streamState,
   isGenerating,
   onSend,
+  onStop,
 }: ChatPanelProps) {
   const [input, setInput] = useState("");
   const [stopping, setStopping] = useState(false);
@@ -112,10 +114,13 @@ export function ChatPanel({
 
   const handleStop = async () => {
     setStopping(true);
+    onStop();
     try {
       await fetch(`/api/projects/${projectId}/stop`, { method: "POST" });
     } catch {
       // 静默处理
+    } finally {
+      setStopping(false);
     }
   };
 

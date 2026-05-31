@@ -246,6 +246,10 @@ export function useProjectStream(projectId: string | null) {
   const [state, dispatch] = useReducer(streamReducer, initialState);
 
   const reset = useCallback(() => dispatch({ type: "RESET" }), []);
+  const forceIdle = useCallback(
+    () => dispatch({ type: "STATUS_CHANGE", status: "stopped", message: "已停止" }),
+    []
+  );
 
   useEffect(() => {
     if (!projectId) return;
@@ -312,5 +316,5 @@ export function useProjectStream(projectId: string | null) {
     };
   }, [projectId]);
 
-  return { state, reset };
+  return { state, reset, forceIdle };
 }

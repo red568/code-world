@@ -21,7 +21,7 @@ export default function ProjectPage({
   const [sending, setSending] = useState(false);
   const [hasActiveRun, setHasActiveRun] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const { state, reset } = useProjectStream(id);
+  const { state, reset, forceIdle } = useProjectStream(id);
 
   useEffect(() => {
     fetch(`/api/projects/${id}`)
@@ -48,11 +48,15 @@ export default function ProjectPage({
     state.phase === "code_generating";
 
   useEffect(() => {
-    if (state.phase !== "idle") {
-      setSending(false);
-      setHasActiveRun(false);
-    }
+    setSending(false);
+    setHasActiveRun(false);
   }, [state.phase]);
+
+  const handleStop = useCallback(() => {
+    setSending(false);
+    setHasActiveRun(false);
+    forceIdle();
+  }, [forceIdle]);
 
   const handleSend = useCallback(
     async (content: string) => {
@@ -97,6 +101,7 @@ export default function ProjectPage({
           streamState={state}
           isGenerating={isGenerating}
           onSend={handleSend}
+          onStop={handleStop}
         />
       </div>
 
