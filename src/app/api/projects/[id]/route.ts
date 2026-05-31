@@ -27,7 +27,15 @@ export async function GET(
     return Response.json({ error: "Project not found" }, { status: 404 });
   }
 
-  return Response.json({ project });
+  const activeRun = await prisma.projectRun.findFirst({
+    where: {
+      projectId: id,
+      status: { in: ["queued", "running"] },
+    },
+    select: { id: true, status: true },
+  });
+
+  return Response.json({ project, activeRun });
 }
 
 export async function DELETE(

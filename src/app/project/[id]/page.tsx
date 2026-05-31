@@ -19,6 +19,8 @@ export default function ProjectPage({
   const { id } = use(params);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sending, setSending] = useState(false);
+  const [hasActiveRun, setHasActiveRun] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const { state, reset } = useProjectStream(id);
 
   useEffect(() => {
@@ -33,16 +35,23 @@ export default function ProjectPage({
             }))
           );
         }
+        if (data.activeRun) {
+          setHasActiveRun(true);
+        }
       })
       .catch(() => {});
   }, [id]);
 
   const isGenerating =
     sending ||
+    hasActiveRun ||
     state.phase === "code_generating";
 
   useEffect(() => {
-    if (state.phase !== "idle") setSending(false);
+    if (state.phase !== "idle") {
+      setSending(false);
+      setHasActiveRun(false);
+    }
   }, [state.phase]);
 
   const handleSend = useCallback(
@@ -73,8 +82,11 @@ export default function ProjectPage({
   return (
     <div className="h-screen flex bg-white">
       {/* Left: Session sidebar */}
-      <div className="w-[220px] flex-shrink-0">
-        <SessionSidebar />
+      <div className={`flex-shrink-0 transition-all duration-200 ${sidebarCollapsed ? "w-[52px]" : "w-[220px]"}`}>
+        <SessionSidebar
+          collapsed={sidebarCollapsed}
+          onToggle={() => setSidebarCollapsed((v) => !v)}
+        />
       </div>
 
       {/* Middle: Chat + Activity trail */}

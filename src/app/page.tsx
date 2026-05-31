@@ -171,7 +171,7 @@ export default function HomePage() {
                   <FolderOpen className="w-4 h-4 text-gray-400 mt-0.5 group-hover:text-blue-500 transition-colors" />
                   <div className="min-w-0">
                     <p className="text-sm font-medium text-gray-800 truncate">
-                      {p.title || "Untitled"}
+                      {(p.title && p.title !== "Untitled") ? p.title : p.originalPrompt.slice(0, 30)}
                     </p>
                     <p className="text-xs text-gray-400 truncate mt-0.5">
                       {p.originalPrompt}

@@ -9,6 +9,14 @@ import { enqueueRun } from "@/lib/queue";
 
 const DEMO_USER_ID = "demo-user-001";
 
+function generateTitle(prompt: string): string {
+  const cleaned = prompt
+    .replace(/^(请|帮我|帮忙|我想要?|我需要|给我|做一个|生成一个|创建一个|搭建一个|建一个|写一个|开发一个|设计一个)/g, "")
+    .trim();
+  const title = cleaned.slice(0, 20);
+  return title || prompt.slice(0, 20);
+}
+
 export async function POST(request: NextRequest) {
   const startTime = Date.now();
   const body = await request.json();
@@ -35,6 +43,7 @@ export async function POST(request: NextRequest) {
       data: {
         userId: DEMO_USER_ID,
         originalPrompt: prompt.trim(),
+        title: generateTitle(prompt.trim()),
         status: "created",
       },
     });
