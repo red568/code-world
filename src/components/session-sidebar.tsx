@@ -82,7 +82,7 @@ export function SessionSidebar({ collapsed = false, onToggle }: SessionSidebarPr
   return (
     <div className="flex flex-col h-full bg-gray-50 border-r border-gray-200 overflow-hidden">
       {/* Logo + Toggle */}
-      <div className="py-4 px-3 flex items-center gap-2.5">
+      <div className={`py-4 flex items-center transition-all duration-200 ${collapsed ? "px-3 justify-center" : "px-4 gap-2.5"}`}>
         <div
           className="w-7 h-7 flex-shrink-0 bg-gradient-to-br from-blue-500 to-purple-600 rounded-lg flex items-center justify-center cursor-pointer"
           onClick={collapsed ? onToggle : () => router.push("/")}
@@ -90,11 +90,11 @@ export function SessionSidebar({ collapsed = false, onToggle }: SessionSidebarPr
         >
           <Sparkles className="w-3.5 h-3.5 text-white" />
         </div>
-        <span className={`font-semibold text-sm text-gray-900 flex-1 whitespace-nowrap transition-opacity duration-200 ${collapsed ? "opacity-0" : "opacity-100"}`}>AI Builder</span>
+        <span className={`font-semibold text-sm text-gray-900 whitespace-nowrap overflow-hidden transition-all duration-200 ${collapsed ? "w-0 opacity-0" : "flex-1 opacity-100"}`}>AI Builder</span>
         {onToggle && (
           <button
             onClick={onToggle}
-            className={`w-6 h-6 flex-shrink-0 flex items-center justify-center text-gray-400 hover:text-gray-600 rounded transition-opacity duration-200 ${collapsed ? "opacity-0 pointer-events-none" : "opacity-100"}`}
+            className={`w-6 h-6 flex-shrink-0 flex items-center justify-center text-gray-400 hover:text-gray-600 rounded transition-all duration-200 ${collapsed ? "w-0 opacity-0 pointer-events-none overflow-hidden" : "opacity-100"}`}
             title="折叠侧栏"
           >
             <PanelLeftClose className="w-4 h-4" />
@@ -103,19 +103,19 @@ export function SessionSidebar({ collapsed = false, onToggle }: SessionSidebarPr
       </div>
 
       {/* New chat */}
-      <div className="mb-2 px-3">
+      <div className={`mb-2 transition-all duration-200 ${collapsed ? "px-2" : "px-3"}`}>
         <button
           onClick={() => router.push("/")}
-          className="flex items-center text-sm text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors w-full gap-2 px-2 py-2"
+          className={`flex items-center text-sm text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors ${collapsed ? "w-9 h-9 justify-center mx-auto" : "w-full gap-2 px-2 py-2"}`}
           title="新建项目"
         >
           <Plus className="w-4 h-4 flex-shrink-0" />
-          <span className={`whitespace-nowrap transition-opacity duration-200 ${collapsed ? "opacity-0" : "opacity-100"}`}>新建项目</span>
+          <span className={`whitespace-nowrap overflow-hidden transition-all duration-200 ${collapsed ? "w-0 opacity-0" : "opacity-100"}`}>新建项目</span>
         </button>
       </div>
 
       {/* Project list */}
-      <div className="flex-1 overflow-y-auto space-y-0.5 px-2">
+      <div className={`flex-1 overflow-y-auto space-y-0.5 transition-all duration-200 ${collapsed ? "px-2" : "px-3"}`}>
         {projects.map((p) => {
           const isActive = p.id === activeId;
           const isDeleting = deletingId === p.id;
@@ -124,7 +124,9 @@ export function SessionSidebar({ collapsed = false, onToggle }: SessionSidebarPr
           return (
             <div
               key={p.id}
-              className={`w-full flex items-center gap-2 px-2 py-2 rounded-lg text-left transition-colors group cursor-pointer ${
+              className={`flex items-center rounded-lg text-left transition-all duration-200 group cursor-pointer ${
+                collapsed ? "w-9 h-9 justify-center mx-auto" : "w-full gap-2 px-2 py-2"
+              } ${
                 isActive
                   ? "bg-white text-gray-900 shadow-sm border border-gray-200"
                   : "text-gray-600 hover:bg-gray-100 hover:text-gray-900"
@@ -133,19 +135,23 @@ export function SessionSidebar({ collapsed = false, onToggle }: SessionSidebarPr
               title={collapsed ? label : undefined}
             >
               <MessageSquare className="w-3.5 h-3.5 flex-shrink-0 text-gray-400" />
-              <span className={`flex-1 text-sm truncate whitespace-nowrap transition-opacity duration-200 ${collapsed ? "opacity-0" : "opacity-100"}`}>
+              <span className={`text-sm truncate whitespace-nowrap overflow-hidden transition-all duration-200 ${collapsed ? "w-0 opacity-0" : "flex-1 opacity-100"}`}>
                 {label}
               </span>
-              <button
-                onClick={(e) => handleDelete(e, p.id)}
-                className={`hidden w-5 h-5 items-center justify-center rounded text-gray-400 hover:text-red-500 hover:bg-red-50 transition-colors flex-shrink-0 ${collapsed ? "" : "group-hover:flex"}`}
-                title="删除项目"
-              >
-                <Trash2 className="w-3 h-3" />
-              </button>
-              <span className={`flex-shrink-0 ${collapsed ? "" : "group-hover:hidden"}`}>
-                <StatusDot status={p.status} />
-              </span>
+              {!collapsed && (
+                <>
+                  <button
+                    onClick={(e) => handleDelete(e, p.id)}
+                    className="hidden group-hover:flex w-5 h-5 items-center justify-center rounded text-gray-400 hover:text-red-500 hover:bg-red-50 transition-colors flex-shrink-0"
+                    title="删除项目"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                  </button>
+                  <span className="flex-shrink-0 group-hover:hidden">
+                    <StatusDot status={p.status} />
+                  </span>
+                </>
+              )}
             </div>
           );
         })}
