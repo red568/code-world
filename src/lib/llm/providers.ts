@@ -2,7 +2,6 @@
  * LLM Provider 配置
  *
  * 所有支持的模型都通过 OpenAI 兼容接口调用。
- * 默认使用 Kimi (moonshot)，可通过环境变量或运行时参数切换。
  */
 
 export interface LLMProviderConfig {

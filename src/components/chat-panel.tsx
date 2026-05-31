@@ -1,14 +1,12 @@
 "use client";
 
 import { useState, useRef, useEffect, useMemo } from "react";
-import { Send, Loader2, Sparkles } from "lucide-react";
+import { Send, Loader2, Sparkles, Square } from "lucide-react";
 import { TimelineRound } from "@/components/timeline";
-import type { StreamState } from "@/hooks/use-project-stream";
+import type { StreamState, AgentStep } from "@/hooks/use-project-stream";
 import type {
   TimelineRound as TRound,
   TimelineStep,
-  TimelineFileItem,
-  StepStatus,
 } from "@/components/timeline/types";
 
 interface Message {
@@ -17,150 +15,62 @@ interface Message {
 }
 
 interface ChatPanelProps {
+  projectId: string;
   messages: Message[];
   streamState: StreamState;
   isGenerating: boolean;
   onSend: (message: string) => void;
+  onStop: () => void;
 }
 
-const PHASE_ORDER = [
-  "spec_generating",
-  "code_generating",
-  "reviewing",
-  "building",
-  "running",
-] as const;
-
-function phaseIndex(phase: string): number {
-  const idx = PHASE_ORDER.indexOf(phase as typeof PHASE_ORDER[number]);
-  return idx >= 0 ? idx : -1;
-}
-
-function stepStatusFromPhase(currentPhase: string, stepPhase: string): StepStatus {
-  if (currentPhase === "failed") return "error";
-  const cur = phaseIndex(currentPhase);
-  const step = phaseIndex(stepPhase);
-  if (cur < 0) return "pending";
-  if (step < cur) return "done";
-  if (step === cur) return "active";
-  return "pending";
+function agentStepToTimelineStep(step: AgentStep): TimelineStep {
+  const statusMap: Record<AgentStep["status"], TimelineStep["status"]> = {
+    active: "active",
+    done: "done",
+    error: "error",
+    stopped: "stopped",
+  };
+  return {
+    id: String(step.id),
+    type: step.type,
+    label: step.label,
+    status: statusMap[step.status],
+    startedAt: step.startedAt,
+    finishedAt: step.finishedAt,
+    detail: step.detail,
+  };
 }
 
 function buildCurrentRoundSteps(streamState: StreamState, isGenerating: boolean): TimelineStep[] {
-  const { phase, timestamps, files, reviewIssues, fixAttempt, message, error } = streamState;
-  const steps: TimelineStep[] = [];
+  const { steps, phase } = streamState;
 
-  const waitingForServer = phase === "idle" && isGenerating;
+  if (steps.length === 0 && isGenerating) {
+    return [{
+      id: "waiting",
+      type: "thinking",
+      label: "等待 Agent 响应...",
+      status: "active",
+      startedAt: Date.now(),
+    }];
+  }
 
-  const specTs = timestamps.spec_generating;
-  steps.push({
-    id: "spec",
-    type: "spec",
-    label: "分析需求",
-    status: waitingForServer ? "active" : stepStatusFromPhase(phase, "spec_generating"),
-    startedAt: waitingForServer ? Date.now() : specTs?.startedAt,
-    finishedAt: specTs?.finishedAt,
-    detail: waitingForServer
-      ? "等待响应..."
-      : phase === "spec_generating" && streamState.specText
-        ? streamState.specText.slice(0, 80) + "..."
-        : undefined,
-  });
+  const timelineSteps = steps.map(agentStepToTimelineStep);
 
-  const codeTs = timestamps.code_generating;
-  const fileItems: TimelineFileItem[] = files.map((f) => ({
-    path: f.path,
-    status: f.status === "done" ? "done" as const : "generating" as const,
-  }));
-  const codegenStatus = stepStatusFromPhase(phase, "code_generating");
-
-  steps.push({
-    id: "plan",
-    type: "plan",
-    label: files.length > 0 ? `规划文件（${files.length} 个）` : "规划文件",
-    status: codegenStatus === "pending" ? "pending" : "done",
-  });
-
-  const doneCount = fileItems.filter((f) => f.status === "done").length;
-  steps.push({
-    id: "codegen",
-    type: "codegen",
-    label: codegenStatus === "done"
-      ? `生成代码（${fileItems.length} 个文件）`
-      : fileItems.length > 0
-        ? `生成代码（${doneCount}/${fileItems.length}）`
-        : "生成代码",
-    status: codegenStatus,
-    startedAt: codeTs?.startedAt,
-    finishedAt: codeTs?.finishedAt,
-    children: fileItems.length > 0 ? fileItems : undefined,
-  });
-
-  const reviewTs = timestamps.reviewing;
-  steps.push({
-    id: "review",
-    type: "review",
-    label: "审查代码",
-    status: stepStatusFromPhase(phase, "reviewing"),
-    startedAt: reviewTs?.startedAt,
-    finishedAt: reviewTs?.finishedAt,
-    detail: reviewIssues.length > 0
-      ? `发现 ${reviewIssues.length} 个问题`
-      : reviewTs?.finishedAt ? "通过" : undefined,
-  });
-
-  if (fixAttempt > 0) {
-    const fixTs = timestamps.fixing;
-    steps.push({
-      id: `fix-${fixAttempt}`,
-      type: "fix",
-      label: `自动修复（第 ${fixAttempt} 轮）`,
-      status: phase === "fixing" ? "active" : "done",
-      startedAt: fixTs?.startedAt,
-      finishedAt: fixTs?.finishedAt,
-      detail: message || undefined,
+  if (phase === "failed" && !steps.some((s) => s.type === "error")) {
+    timelineSteps.push({
+      id: "final-error",
+      type: "error",
+      label: streamState.error || "生成失败",
+      status: "error",
     });
   }
 
-  const buildTs = timestamps.building;
-  steps.push({
-    id: "build",
-    type: "build",
-    label: "构建项目",
-    status: phase === "fixing"
-      ? "active"
-      : stepStatusFromPhase(phase, "building"),
-    startedAt: buildTs?.startedAt,
-    finishedAt: buildTs?.finishedAt,
-  });
-
-  const runTs = timestamps.running;
-  steps.push({
-    id: "preview",
-    type: "preview",
-    label: "预览就绪",
-    status: phase === "running" ? "done" : "pending",
-    startedAt: runTs?.startedAt,
-    finishedAt: runTs?.finishedAt,
-    detail: phase === "running" ? "点击右侧面板查看" : undefined,
-  });
-
-  if (error) {
-    const activeStep = steps.find((s) => s.status === "active");
-    if (activeStep) activeStep.status = "error";
-  }
-
-  return steps;
+  return timelineSteps;
 }
 
 function buildHistoryRoundSteps(): TimelineStep[] {
   return [
-    { id: "spec", type: "spec", label: "分析需求", status: "done" },
-    { id: "plan", type: "plan", label: "规划文件", status: "done" },
-    { id: "codegen", type: "codegen", label: "生成代码", status: "done" },
-    { id: "review", type: "review", label: "审查代码", status: "done" },
-    { id: "build", type: "build", label: "构建项目", status: "done" },
-    { id: "preview", type: "preview", label: "预览就绪", status: "done" },
+    { id: "done", type: "preview", label: "已完成", status: "done" },
   ];
 }
 
@@ -183,12 +93,15 @@ function buildRounds(messages: Message[], streamState: StreamState, isGenerating
 }
 
 export function ChatPanel({
+  projectId,
   messages,
   streamState,
   isGenerating,
   onSend,
+  onStop,
 }: ChatPanelProps) {
   const [input, setInput] = useState("");
+  const [stopping, setStopping] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const rounds = useMemo(
@@ -199,7 +112,23 @@ export function ChatPanel({
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [rounds, streamState.phase, streamState.files]);
+  }, [rounds, streamState.steps.length]);
+
+  useEffect(() => {
+    if (!isGenerating) setStopping(false);
+  }, [isGenerating]);
+
+  const handleStop = async () => {
+    setStopping(true);
+    onStop();
+    try {
+      await fetch(`/api/projects/${projectId}/stop`, { method: "POST" });
+    } catch {
+      // 静默处理
+    } finally {
+      setStopping(false);
+    }
+  };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -235,17 +164,29 @@ export function ChatPanel({
             disabled={isGenerating}
             className="w-full pl-4 pr-12 py-3 text-sm text-gray-800 placeholder-gray-400 bg-transparent focus:outline-none disabled:text-gray-400"
           />
-          <button
-            type="submit"
-            disabled={!input.trim() || isGenerating}
-            className="absolute right-2 top-1/2 -translate-y-1/2 w-8 h-8 bg-gray-900 hover:bg-gray-800 disabled:bg-gray-200 text-white rounded-lg flex items-center justify-center transition-colors"
-          >
-            {isGenerating ? (
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            ) : (
+          {isGenerating ? (
+            <button
+              type="button"
+              onClick={handleStop}
+              disabled={stopping}
+              className="absolute right-2 top-1/2 -translate-y-1/2 w-8 h-8 bg-red-500 hover:bg-red-600 disabled:bg-red-300 text-white rounded-lg flex items-center justify-center transition-colors"
+              title="停止生成"
+            >
+              {stopping ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Square className="w-3 h-3 fill-current" />
+              )}
+            </button>
+          ) : (
+            <button
+              type="submit"
+              disabled={!input.trim()}
+              className="absolute right-2 top-1/2 -translate-y-1/2 w-8 h-8 bg-gray-900 hover:bg-gray-800 disabled:bg-gray-200 text-white rounded-lg flex items-center justify-center transition-colors"
+            >
               <Send className="w-3.5 h-3.5" />
-            )}
-          </button>
+            </button>
+          )}
         </div>
       </form>
     </div>

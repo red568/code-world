@@ -23,7 +23,11 @@ export type SSEEvent =
   | { type: "fix_start"; data: { attempt: number; diagnosis: string } }
   | { type: "fix_done"; data: { attempt: number; success: boolean } }
   | { type: "preview_ready"; data: { previewUrl: string } }
-  | { type: "error"; data: { message: string; code: string } };
+  | { type: "error"; data: { message: string; code: string } }
+  // Agent Loop 新增事件
+  | { type: "agent_thinking"; data: { content: string } }
+  | { type: "tool_call"; data: { tool: string; args: Record<string, unknown> } }
+  | { type: "tool_result"; data: { tool: string; success: boolean; summary: string } };
 
 /**
  * 获取项目事件的 Redis pub/sub 频道名

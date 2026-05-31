@@ -1,8 +1,16 @@
-export type StepStatus = "pending" | "active" | "done" | "error";
+export type StepStatus = "pending" | "active" | "done" | "error" | "stopped";
+
+export type StepType =
+  | "thinking"
+  | "file"
+  | "command"
+  | "read"
+  | "preview"
+  | "error";
 
 export interface TimelineStep {
   id: string;
-  type: "spec" | "plan" | "codegen" | "review" | "build" | "fix" | "preview";
+  type: StepType;
   label: string;
   status: StepStatus;
   startedAt?: number;

@@ -44,12 +44,14 @@ model Project {
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
 
-  user           User            @relation(fields: [userId], references: [id])
-  messages       Message[]
-  files          ProjectFile[]
-  buildLogs      BuildLog[]
-  agentRuns      AgentRun[]
-  sandboxSession SandboxSession?
+  user              User               @relation(fields: [userId], references: [id])
+  messages          Message[]
+  files             ProjectFile[]
+  buildLogs         BuildLog[]
+  agentRuns         AgentRun[]
+  runs              ProjectRun[]
+  sandboxSession    SandboxSession?
+  agentConversation AgentConversation?
 
   @@index([userId])
 }
@@ -96,6 +98,7 @@ model ProjectFile {
 model BuildLog {
   id        String   @id @default(uuid())
   projectId String
+  runId     String?
   command   String
   stdout    String   @default("")
   stderr    String   @default("")
@@ -107,9 +110,50 @@ model BuildLog {
   project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@index([projectId])
+  @@index([runId])
 }
 
-// ─── Agent 运行记录 ──────────────────────────────────────────────────────────────
+// ─── Project Run（执行生命周期） ──────────────────────────────────────────────────
+
+enum ProjectRunType {
+  generate
+  iterate
+}
+
+enum ProjectRunStatus {
+  queued
+  running
+  cancelling
+  cancelled
+  succeeded
+  failed
+}
+
+model ProjectRun {
+  id          String           @id @default(uuid())
+  projectId   String
+  userId      String
+  type        ProjectRunType
+  status      ProjectRunStatus @default(queued)
+  prompt      String
+  error       String?
+  sandboxId   String?
+  previewUrl  String?
+  startedAt   DateTime?
+  finishedAt  DateTime?
+  heartbeatAt DateTime?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([userId])
+  @@index([status])
+  @@index([projectId, status])
+}
+
+// ─── Agent 运行记录（旧版，保留兼容） ────────────────────────────────────────────────
 
 enum AgentRunType {
   spec
@@ -159,4 +203,22 @@ model SandboxSession {
   expiresAt  DateTime?
 
   project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+// ─── Agent 对话记忆 ──────────────────────────────────────────────────────────────
+
+model AgentConversation {
+  id            String   @id @default(uuid())
+  projectId     String   @unique
+  userId        String
+  sandboxId     String?
+  messages      Json     @default("[]")
+  summary       String?
+  tokenEstimate Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
 }

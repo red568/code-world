@@ -2,15 +2,16 @@
 
 import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { ExternalLink, Monitor, RefreshCw, Code2 } from "lucide-react";
+import { ExternalLink, Monitor, RefreshCw, Code2, Square } from "lucide-react";
 
 interface PreviewPanelProps {
   previewUrl: string | null;
   isBuilding: boolean;
   phase: string;
+  stopped?: boolean;
 }
 
-export function PreviewPanel({ previewUrl, isBuilding, phase }: PreviewPanelProps) {
+export function PreviewPanel({ previewUrl, isBuilding, phase, stopped }: PreviewPanelProps) {
   const [iframeKey, setIframeKey] = useState(0);
 
   return (
@@ -82,6 +83,8 @@ export function PreviewPanel({ previewUrl, isBuilding, phase }: PreviewPanelProp
             >
               {isBuilding ? (
                 <BuildingAnimation phase={phase} />
+              ) : stopped ? (
+                <StoppedPlaceholder />
               ) : (
                 <IdlePlaceholder />
               )}
@@ -94,14 +97,7 @@ export function PreviewPanel({ previewUrl, isBuilding, phase }: PreviewPanelProp
 }
 
 function BuildingAnimation({ phase }: { phase: string }) {
-  const labels: Record<string, string> = {
-    spec_generating: "分析需求中...",
-    code_generating: "生成代码中...",
-    reviewing: "审查代码中...",
-    building: "构建项目中...",
-    fixing: "自动修复中...",
-  };
-  const label = labels[phase] || "处理中...";
+  const label = phase === "code_generating" ? "Agent 工作中..." : "处理中...";
 
   return (
     <div className="flex flex-col items-center gap-6">
@@ -147,6 +143,18 @@ function BuildingAnimation({ phase }: { phase: string }) {
           />
         ))}
       </div>
+    </div>
+  );
+}
+
+function StoppedPlaceholder() {
+  return (
+    <div className="text-center">
+      <div className="w-12 h-12 bg-gray-100 rounded-xl flex items-center justify-center mx-auto mb-4">
+        <Square className="w-5 h-5 text-gray-400 fill-current" />
+      </div>
+      <p className="text-sm text-gray-500">已停止生成</p>
+      <p className="text-xs text-gray-400 mt-1">输入新的需求继续</p>
     </div>
   );
 }
