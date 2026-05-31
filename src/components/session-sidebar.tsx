@@ -85,9 +85,9 @@ export function SessionSidebar({ collapsed = false, onToggle }: SessionSidebarPr
       <div className="py-4 flex items-center">
         <div className="w-[52px] flex-shrink-0 flex justify-center">
           <div
-            className="w-7 h-7 bg-gradient-to-br from-blue-500 to-purple-600 rounded-lg flex items-center justify-center cursor-pointer"
-            onClick={collapsed ? onToggle : () => router.push("/")}
-            title={collapsed ? "展开侧栏" : "首页"}
+            className={`w-7 h-7 bg-gradient-to-br from-blue-500 to-purple-600 rounded-lg flex items-center justify-center ${collapsed ? "cursor-pointer" : ""}`}
+            onClick={collapsed ? onToggle : undefined}
+            title={collapsed ? "展开侧栏" : undefined}
           >
             <Sparkles className="w-3.5 h-3.5 text-white" />
           </div>
