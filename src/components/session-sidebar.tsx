@@ -29,15 +29,17 @@ function StatusDot({ status }: { status: string }) {
 interface SessionSidebarProps {
   collapsed?: boolean;
   onToggle?: () => void;
+  activeProjectId?: string | null;
+  onNewProject?: () => void;
 }
 
-export function SessionSidebar({ collapsed = false, onToggle }: SessionSidebarProps) {
+export function SessionSidebar({ collapsed = false, onToggle, activeProjectId, onNewProject }: SessionSidebarProps) {
   const router = useRouter();
   const pathname = usePathname();
   const [projects, setProjects] = useState<ProjectItem[]>([]);
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
-  const activeId = pathname.startsWith("/project/") ? pathname.split("/")[2] : null;
+  const activeId = activeProjectId !== undefined ? activeProjectId : (pathname.startsWith("/project/") ? pathname.split("/")[2] : null);
 
   const handleDelete = async (e: React.MouseEvent, projectId: string) => {
     e.stopPropagation();
@@ -109,7 +111,7 @@ export function SessionSidebar({ collapsed = false, onToggle }: SessionSidebarPr
       {/* New chat button */}
       <div className="mb-2">
         <button
-          onClick={() => router.push("/")}
+          onClick={() => onNewProject ? onNewProject() : router.push("/")}
           className="w-full flex items-center text-sm text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors py-2"
           title="新建项目"
         >
