@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, useMemo } from "react";
-import { Send, Loader2, Sparkles } from "lucide-react";
+import { Send, Loader2, Sparkles, Square } from "lucide-react";
 import { TimelineRound } from "@/components/timeline";
 import type { StreamState, AgentStep } from "@/hooks/use-project-stream";
 import type {
@@ -15,18 +15,26 @@ interface Message {
 }
 
 interface ChatPanelProps {
+  projectId: string;
   messages: Message[];
   streamState: StreamState;
   isGenerating: boolean;
   onSend: (message: string) => void;
+  onStop: () => void;
 }
 
 function agentStepToTimelineStep(step: AgentStep): TimelineStep {
+  const statusMap: Record<AgentStep["status"], TimelineStep["status"]> = {
+    active: "active",
+    done: "done",
+    error: "error",
+    stopped: "stopped",
+  };
   return {
     id: String(step.id),
     type: step.type,
     label: step.label,
-    status: step.status === "error" ? "error" : step.status === "done" ? "done" : "active",
+    status: statusMap[step.status],
     startedAt: step.startedAt,
     finishedAt: step.finishedAt,
     detail: step.detail,
@@ -85,12 +93,15 @@ function buildRounds(messages: Message[], streamState: StreamState, isGenerating
 }
 
 export function ChatPanel({
+  projectId,
   messages,
   streamState,
   isGenerating,
   onSend,
+  onStop,
 }: ChatPanelProps) {
   const [input, setInput] = useState("");
+  const [stopping, setStopping] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const rounds = useMemo(
@@ -102,6 +113,22 @@ export function ChatPanel({
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [rounds, streamState.steps.length]);
+
+  useEffect(() => {
+    if (!isGenerating) setStopping(false);
+  }, [isGenerating]);
+
+  const handleStop = async () => {
+    setStopping(true);
+    onStop();
+    try {
+      await fetch(`/api/projects/${projectId}/stop`, { method: "POST" });
+    } catch {
+      // 静默处理
+    } finally {
+      setStopping(false);
+    }
+  };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -137,17 +164,29 @@ export function ChatPanel({
             disabled={isGenerating}
             className="w-full pl-4 pr-12 py-3 text-sm text-gray-800 placeholder-gray-400 bg-transparent focus:outline-none disabled:text-gray-400"
           />
-          <button
-            type="submit"
-            disabled={!input.trim() || isGenerating}
-            className="absolute right-2 top-1/2 -translate-y-1/2 w-8 h-8 bg-gray-900 hover:bg-gray-800 disabled:bg-gray-200 text-white rounded-lg flex items-center justify-center transition-colors"
-          >
-            {isGenerating ? (
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            ) : (
+          {isGenerating ? (
+            <button
+              type="button"
+              onClick={handleStop}
+              disabled={stopping}
+              className="absolute right-2 top-1/2 -translate-y-1/2 w-8 h-8 bg-red-500 hover:bg-red-600 disabled:bg-red-300 text-white rounded-lg flex items-center justify-center transition-colors"
+              title="停止生成"
+            >
+              {stopping ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Square className="w-3 h-3 fill-current" />
+              )}
+            </button>
+          ) : (
+            <button
+              type="submit"
+              disabled={!input.trim()}
+              className="absolute right-2 top-1/2 -translate-y-1/2 w-8 h-8 bg-gray-900 hover:bg-gray-800 disabled:bg-gray-200 text-white rounded-lg flex items-center justify-center transition-colors"
+            >
               <Send className="w-3.5 h-3.5" />
-            )}
-          </button>
+            </button>
+          )}
         </div>
       </form>
     </div>

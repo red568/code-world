@@ -1,9 +1,12 @@
 /**
- * POST /api/projects/:id/stop — 停止 E2B sandbox
+ * POST /api/projects/:id/stop — Soft Stop：让当前 run 失去写权限
+ *
+ * 不强制中断 Worker/LLM/tool。Worker 在下一个 assertRunWritable 检查点感知并退出。
  */
 
 import { prisma } from "@/lib/prisma";
-import { Sandbox } from "@e2b/code-interpreter";
+import { agentQueue } from "@/lib/queue";
+import { publishStatusChange } from "@/lib/streaming";
 
 export async function POST(
   _request: Request,
@@ -11,30 +14,76 @@ export async function POST(
 ) {
   const { id } = await params;
 
-  const session = await prisma.sandboxSession.findUnique({
-    where: { projectId: id },
-  });
-
-  if (!session) {
-    return Response.json({ error: "No active sandbox" }, { status: 404 });
+  const project = await prisma.project.findUnique({ where: { id } });
+  if (!project) {
+    return Response.json({ error: "Project not found" }, { status: 404 });
   }
 
-  try {
-    const sandbox = await Sandbox.connect(session.sandboxId);
-    await sandbox.kill();
-  } catch {
-    // sandbox 可能已经过期或被停止
+  // 查找当前 active run
+  const activeRun = await prisma.projectRun.findFirst({
+    where: {
+      projectId: id,
+      status: { in: ["queued", "running"] },
+    },
+    orderBy: { createdAt: "desc" },
+  });
+
+  if (!activeRun) {
+    // 没有活跃 run，直接返回成功（幂等）
+    return Response.json({ success: true, message: "No active run to stop" });
   }
 
-  await prisma.sandboxSession.update({
-    where: { projectId: id },
-    data: { status: "stopped", stoppedAt: new Date() },
+  // 事务内条件更新 run 状态
+  await prisma.$transaction(async (tx) => {
+    const run = await tx.projectRun.findFirst({
+      where: {
+        id: activeRun.id,
+        projectId: id,
+        status: { in: ["queued", "running"] },
+      },
+    });
+
+    if (!run) return;
+
+    if (run.status === "queued") {
+      // queued run 直接取消，不需要等 Worker
+      await tx.projectRun.update({
+        where: { id: run.id },
+        data: { status: "cancelled", finishedAt: new Date() },
+      });
+      await tx.project.update({
+        where: { id },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        data: { status: "stopped" as any },
+      });
+    } else {
+      // running → cancelling，Worker 在检查点自行退出
+      await tx.projectRun.update({
+        where: { id: run.id },
+        data: { status: "cancelling" },
+      });
+      await tx.project.update({
+        where: { id },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        data: { status: "stopped" as any },
+      });
+    }
   });
 
-  await prisma.project.update({
-    where: { id },
-    data: { status: "stopped" },
-  });
+  // 尝试移除 queued job（best-effort）
+  if (activeRun.status === "queued") {
+    try {
+      const waitingJobs = await agentQueue.getJobs(["waiting", "delayed"]);
+      for (const job of waitingJobs) {
+        if (job.data.runId === activeRun.id) {
+          await job.remove();
+        }
+      }
+    } catch { /* ignore */ }
+  }
 
-  return Response.json({ success: true });
+  await publishStatusChange(id, "stopped", "已停止");
+
+  console.log(`[API] POST /api/projects/${id.slice(0, 8)}/stop | run=${activeRun.id.slice(0, 8)} | ${activeRun.status} → stop`);
+  return Response.json({ success: true }, { status: 202 });
 }

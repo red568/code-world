@@ -21,7 +21,7 @@ export interface AgentStep {
   type: "thinking" | "file" | "command" | "read" | "preview" | "error";
   label: string;
   detail?: string;
-  status: "active" | "done" | "error";
+  status: "active" | "done" | "error" | "stopped";
   startedAt: number;
   finishedAt?: number;
 }
@@ -71,6 +71,14 @@ function finishLastActive(steps: AgentStep[], type?: AgentStep["type"]): AgentSt
   });
 }
 
+function stopLastActive(steps: AgentStep[]): AgentStep[] {
+  const now = Date.now();
+  return steps.map((s) => {
+    if (s.status !== "active") return s;
+    return { ...s, status: "stopped" as const, finishedAt: now };
+  });
+}
+
 function toolLabel(tool: string, args: Record<string, unknown>): string {
   switch (tool) {
     case "write_file":
@@ -112,7 +120,13 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
       return { ...state, connected: false };
 
     case "STATUS_CHANGE": {
-      const phase = action.status as ProjectPhase;
+      const rawStatus = action.status;
+      const isStopped = rawStatus === "stopped";
+      const phase = (isStopped ? "idle" : rawStatus) as ProjectPhase;
+      if (phase === "idle") {
+        const steps = isStopped ? stopLastActive(state.steps) : finishLastActive(state.steps);
+        return { ...state, phase, message: action.message, steps };
+      }
       if (phase === "code_generating") {
         return {
           ...state,
@@ -240,6 +254,10 @@ export function useProjectStream(projectId: string | null) {
   const [state, dispatch] = useReducer(streamReducer, initialState);
 
   const reset = useCallback(() => dispatch({ type: "RESET" }), []);
+  const forceIdle = useCallback(
+    () => dispatch({ type: "STATUS_CHANGE", status: "stopped", message: "已停止" }),
+    []
+  );
 
   useEffect(() => {
     if (!projectId) return;
@@ -306,5 +324,5 @@ export function useProjectStream(projectId: string | null) {
     };
   }, [projectId]);
 
-  return { state, reset };
+  return { state, reset, forceIdle };
 }

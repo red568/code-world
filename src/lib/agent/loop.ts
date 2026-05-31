@@ -2,6 +2,7 @@
  * Agent Loop 引擎
  *
  * 核心 ReAct 循环：LLM 思考 → 选择工具 → 执行 → 观察结果 → 继续
+ * 使用 assertRunWritable 做检查点校验（替代旧的 Redis cancel flag）。
  */
 
 import OpenAI from "openai";
@@ -14,11 +15,13 @@ import {
 } from "./tools";
 import { publishEvent } from "@/lib/streaming";
 import { prisma } from "@/lib/prisma";
+import { assertRunWritable, RunNotWritableError } from "@/lib/queue/run-fencing";
 import type { Sandbox } from "@e2b/code-interpreter";
 
 // ─── 类型定义 ────────────────────────────────────────────────────────────────────
 
 export interface AgentLoopConfig {
+  runId: string;
   projectId: string;
   sandbox: Sandbox;
   systemPrompt: string;
@@ -42,6 +45,7 @@ export async function agentLoop(
   config: AgentLoopConfig
 ): Promise<AgentLoopResult> {
   const {
+    runId,
     projectId,
     sandbox,
     systemPrompt,
@@ -78,11 +82,28 @@ export async function agentLoop(
   const totalStart = Date.now();
 
   console.log(
-    `[AgentLoop] [${projectId.slice(0, 8)}] 开始 | model=${model} | maxSteps=${maxSteps}`
+    `[AgentLoop] [${projectId.slice(0, 8)}] 开始 | run=${runId.slice(0, 8)} | model=${model} | maxSteps=${maxSteps}`
   );
 
   for (step = 1; step <= maxSteps; step++) {
     const stepStart = Date.now();
+
+    // ─── 检查点 1：每轮 LLM 调用前 ──────────────────────────────────────────
+    try {
+      await assertRunWritable(runId);
+    } catch (e) {
+      if (e instanceof RunNotWritableError) {
+        console.log(`[AgentLoop] [${projectId.slice(0, 8)}] step=${step} Run 已失去写权限，退出`);
+        return {
+          success: false,
+          summary: "已取消",
+          steps: step,
+          previewUrl,
+          finalMessages: messages,
+        };
+      }
+      throw e;
+    }
 
     // ─── 调用 LLM ──────────────────────────────────────────────────────────
 
@@ -102,7 +123,6 @@ export async function agentLoop(
         `[AgentLoop] [${projectId.slice(0, 8)}] step=${step} LLM 调用失败: ${msg}`
       );
 
-      // 重试一次
       try {
         await new Promise((r) => setTimeout(r, 2000));
         response = await client.chat.completions.create({
@@ -185,6 +205,24 @@ export async function agentLoop(
 
     for (const toolCall of assistantMessage.tool_calls) {
       if (toolCall.type !== "function") continue;
+
+      // ─── 检查点 2：每个 tool 执行前 ────────────────────────────────────────
+      try {
+        await assertRunWritable(runId);
+      } catch (e) {
+        if (e instanceof RunNotWritableError) {
+          console.log(`[AgentLoop] [${projectId.slice(0, 8)}] step=${step} Run 已失去写权限（tool 执行前），退出`);
+          return {
+            success: false,
+            summary: "已取消",
+            steps: step,
+            previewUrl,
+            finalMessages: messages,
+          };
+        }
+        throw e;
+      }
+
       const fn = toolCall.function;
       const fnName = fn.name;
       let args: Record<string, unknown> = {};
@@ -192,7 +230,6 @@ export async function agentLoop(
       try {
         args = JSON.parse(fn.arguments || "{}");
       } catch {
-        // JSON 解析失败，返回错误让 Agent 重试
         messages.push({
           role: "tool",
           content: `Error: Invalid JSON in tool arguments. Please retry with valid JSON.\nRaw: ${fn.arguments?.slice(0, 200)}`,
@@ -240,6 +277,7 @@ export async function agentLoop(
           await prisma.buildLog.create({
             data: {
               projectId,
+              runId,
               command,
               stdout: result.output.slice(0, 10000),
               stderr: "",
@@ -250,7 +288,7 @@ export async function agentLoop(
         }
       }
 
-      // 追加 tool result 到 messages（截断防止 context 溢出）
+      // 追加 tool result 到 messages
       messages.push({
         role: "tool",
         content: truncateOutput(result.output, 4000),
@@ -292,14 +330,12 @@ async function publishToolCallEvent(
   tool: string,
   args: Record<string, unknown>
 ): Promise<void> {
-  // 不暴露完整文件内容给前端
   const sanitizedArgs = { ...args };
   if (tool === "write_file" && typeof sanitizedArgs.content === "string") {
     const lines = (sanitizedArgs.content as string).split("\n").length;
     sanitizedArgs.content = `(${lines} lines)`;
   }
 
-  // 复用 codegen_file_start 事件（前端已有处理）
   if (tool === "write_file" && args.path) {
     await publishEvent(projectId, {
       type: "codegen_file_start",
@@ -307,7 +343,6 @@ async function publishToolCallEvent(
     });
   }
 
-  // 复用 build_log 事件
   if (tool === "run_shell") {
     const cmd = args.command as string;
     await publishEvent(projectId, {
@@ -322,7 +357,6 @@ async function publishToolResultEvent(
   tool: string,
   result: ToolResult
 ): Promise<void> {
-  // 构建命令的输出推送为 build_log
   if (tool === "run_shell") {
     const summary = result.output.slice(0, 500);
     const stream = result.success ? "stdout" : "stderr";

@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react";
 import { useRouter, usePathname } from "next/navigation";
-import { Plus, MessageSquare, CheckCircle2, XCircle, Loader2, Sparkles } from "lucide-react";
+import { Plus, MessageSquare, CheckCircle2, XCircle, Loader2, Sparkles, Trash2, PanelLeftClose } from "lucide-react";
 
 interface ProjectItem {
   id: string;
@@ -26,12 +26,43 @@ function StatusDot({ status }: { status: string }) {
   return <div className="w-2 h-2 rounded-full bg-gray-300" />;
 }
 
-export function SessionSidebar() {
+interface SessionSidebarProps {
+  collapsed?: boolean;
+  onToggle?: () => void;
+  activeProjectId?: string | null;
+  onNewProject?: () => void;
+}
+
+export function SessionSidebar({ collapsed = false, onToggle, activeProjectId, onNewProject }: SessionSidebarProps) {
   const router = useRouter();
   const pathname = usePathname();
   const [projects, setProjects] = useState<ProjectItem[]>([]);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
-  const activeId = pathname.startsWith("/project/") ? pathname.split("/")[2] : null;
+  const activeId = activeProjectId !== undefined ? activeProjectId : (pathname.startsWith("/project/") ? pathname.split("/")[2] : null);
+
+  const handleDelete = async (e: React.MouseEvent, projectId: string) => {
+    e.stopPropagation();
+    if (!confirm("确定要删除这个项目吗？此操作不可撤销。")) return;
+
+    setDeletingId(projectId);
+    try {
+      const res = await fetch(`/api/projects/${projectId}`, { method: "DELETE" });
+      if (res.ok) {
+        setProjects((prev) => prev.filter((p) => p.id !== projectId));
+        if (activeId === projectId) {
+          router.push("/");
+        }
+      } else if (res.status === 409) {
+        const data = await res.json();
+        alert(data.error || "项目正在运行中，请先停止项目");
+      }
+    } catch {
+      // 网络错误静默处理
+    } finally {
+      setDeletingId(null);
+    }
+  };
 
   useEffect(() => {
     fetch("/api/projects")
@@ -51,46 +82,81 @@ export function SessionSidebar() {
   }, []);
 
   return (
-    <div className="flex flex-col h-full bg-gray-50 border-r border-gray-200">
-      {/* Logo */}
-      <div className="px-4 py-4 flex items-center gap-2.5">
-        <div className="w-7 h-7 bg-gradient-to-br from-blue-500 to-purple-600 rounded-lg flex items-center justify-center">
-          <Sparkles className="w-3.5 h-3.5 text-white" />
+    <div className="flex flex-col h-full bg-gray-50 border-r border-gray-200 overflow-hidden">
+      {/* Logo row — icon track pattern */}
+      <div className="py-4 flex items-center">
+        <div className="w-[52px] flex-shrink-0 flex justify-center">
+          <div
+            className={`w-7 h-7 bg-gradient-to-br from-blue-500 to-purple-600 rounded-lg flex items-center justify-center ${collapsed ? "cursor-pointer" : ""}`}
+            onClick={collapsed ? onToggle : undefined}
+            title={collapsed ? "展开侧栏" : undefined}
+          >
+            <Sparkles className="w-3.5 h-3.5 text-white" />
+          </div>
         </div>
-        <span className="font-semibold text-sm text-gray-900">AI Builder</span>
+        <div className={`flex items-center gap-2 overflow-hidden transition-opacity duration-200 ${collapsed ? "opacity-0" : "opacity-100"}`}>
+          <span className="font-semibold text-sm text-gray-900 whitespace-nowrap">AI Builder</span>
+        </div>
+        {onToggle && (
+          <button
+            onClick={onToggle}
+            className={`ml-auto mr-3 w-6 h-6 flex-shrink-0 flex items-center justify-center text-gray-400 hover:text-gray-600 rounded transition-opacity duration-200 ${collapsed ? "opacity-0 pointer-events-none" : "opacity-100"}`}
+            title="折叠侧栏"
+          >
+            <PanelLeftClose className="w-4 h-4" />
+          </button>
+        )}
       </div>
 
-      {/* New chat */}
-      <div className="px-3 mb-2">
+      {/* New chat button */}
+      <div className="mb-2">
         <button
-          onClick={() => router.push("/")}
-          className="w-full flex items-center gap-2 px-3 py-2 text-sm text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors"
+          onClick={() => onNewProject ? onNewProject() : router.push("/")}
+          className="w-full flex items-center text-sm text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors py-2"
+          title="新建项目"
         >
-          <Plus className="w-4 h-4" />
-          <span>新建项目</span>
+          <div className="w-[52px] flex-shrink-0 flex justify-center">
+            <Plus className="w-4 h-4" />
+          </div>
+          <span className={`whitespace-nowrap overflow-hidden transition-opacity duration-200 ${collapsed ? "opacity-0" : "opacity-100"}`}>新建项目</span>
         </button>
       </div>
 
       {/* Project list */}
-      <div className="flex-1 overflow-y-auto px-3 space-y-0.5">
+      <div className="flex-1 overflow-y-auto space-y-0.5 px-2">
         {projects.map((p) => {
           const isActive = p.id === activeId;
+          const isDeleting = deletingId === p.id;
+          const label = (p.title && p.title !== "Untitled") ? p.title : p.originalPrompt.slice(0, 30);
+
           return (
-            <button
+            <div
               key={p.id}
-              onClick={() => router.push(`/project/${p.id}`)}
-              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-left transition-colors group ${
+              className={`flex items-center rounded-lg transition-colors group cursor-pointer py-2 ${
                 isActive
                   ? "bg-white text-gray-900 shadow-sm border border-gray-200"
                   : "text-gray-600 hover:bg-gray-100 hover:text-gray-900"
-              }`}
+              } ${isDeleting ? "opacity-50 pointer-events-none" : ""}`}
+              onClick={() => router.push(`/project/${p.id}`)}
+              title={collapsed ? label : undefined}
             >
-              <MessageSquare className="w-3.5 h-3.5 flex-shrink-0 text-gray-400" />
-              <span className="flex-1 text-sm truncate">
-                {p.title || p.originalPrompt.slice(0, 30)}
-              </span>
-              <StatusDot status={p.status} />
-            </button>
+              <div className="w-[36px] flex-shrink-0 flex justify-center">
+                <MessageSquare className="w-3.5 h-3.5 text-gray-400" />
+              </div>
+              <div className={`flex-1 flex items-center gap-1 min-w-0 overflow-hidden transition-opacity duration-200 ${collapsed ? "opacity-0" : "opacity-100"}`}>
+                <span className="flex-1 text-sm truncate">{label}</span>
+                <button
+                  onClick={(e) => handleDelete(e, p.id)}
+                  className="hidden group-hover:flex w-5 h-5 items-center justify-center rounded text-gray-400 hover:text-red-500 hover:bg-red-50 transition-colors flex-shrink-0"
+                  title="删除项目"
+                >
+                  <Trash2 className="w-3 h-3" />
+                </button>
+                <span className="flex-shrink-0 group-hover:hidden">
+                  <StatusDot status={p.status} />
+                </span>
+              </div>
+            </div>
           );
         })}
       </div>

@@ -1,4 +1,4 @@
-export type StepStatus = "pending" | "active" | "done" | "error";
+export type StepStatus = "pending" | "active" | "done" | "error" | "stopped";
 
 export type StepType =
   | "thinking"

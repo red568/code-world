@@ -5,10 +5,17 @@
 
 import { NextRequest } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { enqueueGenerate } from "@/lib/queue";
+import { enqueueRun } from "@/lib/queue";
 
-// 第一版暂用固定用户 ID，后续接入认证
 const DEMO_USER_ID = "demo-user-001";
+
+function generateTitle(prompt: string): string {
+  const cleaned = prompt
+    .replace(/^(请|帮我|帮忙|我想要?|我需要|给我|做一个|生成一个|创建一个|搭建一个|建一个|写一个|开发一个|设计一个)/g, "")
+    .trim();
+  const title = cleaned.slice(0, 20);
+  return title || prompt.slice(0, 20);
+}
 
 export async function POST(request: NextRequest) {
   const startTime = Date.now();
@@ -30,31 +37,45 @@ export async function POST(request: NextRequest) {
     update: {},
   });
 
-  // 创建项目
-  const project = await prisma.project.create({
-    data: {
-      userId: DEMO_USER_ID,
-      originalPrompt: prompt.trim(),
-      status: "created",
-    },
+  // 创建项目 + run + 消息（事务）
+  const { project, run } = await prisma.$transaction(async (tx) => {
+    const project = await tx.project.create({
+      data: {
+        userId: DEMO_USER_ID,
+        originalPrompt: prompt.trim(),
+        title: generateTitle(prompt.trim()),
+        status: "created",
+      },
+    });
+
+    await tx.message.create({
+      data: {
+        projectId: project.id,
+        role: "user",
+        content: prompt.trim(),
+      },
+    });
+
+    const run = await tx.projectRun.create({
+      data: {
+        projectId: project.id,
+        userId: DEMO_USER_ID,
+        type: "generate",
+        status: "queued",
+        prompt: prompt.trim(),
+      },
+    });
+
+    return { project, run };
   });
 
-  // 保存用户消息
-  await prisma.message.create({
-    data: {
-      projectId: project.id,
-      role: "user",
-      content: prompt.trim(),
-    },
-  });
-
-  // 入队生成任务
-  await enqueueGenerate(project.id, prompt.trim());
+  // 入队（jobId = runId，防止重复）
+  await enqueueRun(run.id, project.id, DEMO_USER_ID);
 
   const duration = Date.now() - startTime;
-  console.log(`[API] POST /api/projects | 201 | projectId=${project.id} | prompt="${prompt.trim().slice(0, 40)}" | ${duration}ms`);
+  console.log(`[API] POST /api/projects | 201 | projectId=${project.id} | runId=${run.id} | ${duration}ms`);
 
-  return Response.json({ projectId: project.id }, { status: 201 });
+  return Response.json({ projectId: project.id, runId: run.id }, { status: 201 });
 }
 
 export async function GET() {

@@ -9,7 +9,7 @@
 
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { Sparkles, ArrowUp, Loader2, FolderOpen, Clock } from "lucide-react";
+import { Sparkles, ArrowUp, Loader2, FolderOpen, Clock, Trash2 } from "lucide-react";
 
 interface ProjectSummary {
   id: string;
@@ -31,6 +31,23 @@ export default function HomePage() {
       .then((data) => setProjects(data.projects || []))
       .catch(() => {});
   }, []);
+
+  const handleDelete = async (e: React.MouseEvent, projectId: string) => {
+    e.stopPropagation();
+    if (!confirm("确定要删除这个项目吗？此操作不可撤销。")) return;
+
+    try {
+      const res = await fetch(`/api/projects/${projectId}`, { method: "DELETE" });
+      if (res.ok) {
+        setProjects((prev) => prev.filter((p) => p.id !== projectId));
+      } else if (res.status === 409) {
+        const data = await res.json();
+        alert(data.error || "项目正在运行中，请先停止项目");
+      }
+    } catch {
+      // 网络错误静默处理
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -138,23 +155,30 @@ export default function HomePage() {
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
             {projects.slice(0, 6).map((p) => (
-              <button
+              <div
                 key={p.id}
                 onClick={() => router.push(`/project/${p.id}`)}
-                className="text-left p-4 bg-white border border-gray-200 rounded-xl hover:border-gray-300 hover:shadow-sm transition-all group"
+                className="relative text-left p-4 bg-white border border-gray-200 rounded-xl hover:border-gray-300 hover:shadow-sm transition-all group cursor-pointer"
               >
+                <button
+                  onClick={(e) => handleDelete(e, p.id)}
+                  className="absolute top-2 right-2 hidden group-hover:flex w-6 h-6 items-center justify-center rounded-md text-gray-400 hover:text-red-500 hover:bg-red-50 transition-colors"
+                  title="删除项目"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
                 <div className="flex items-start gap-2">
                   <FolderOpen className="w-4 h-4 text-gray-400 mt-0.5 group-hover:text-blue-500 transition-colors" />
                   <div className="min-w-0">
                     <p className="text-sm font-medium text-gray-800 truncate">
-                      {p.title || "Untitled"}
+                      {(p.title && p.title !== "Untitled") ? p.title : p.originalPrompt.slice(0, 30)}
                     </p>
                     <p className="text-xs text-gray-400 truncate mt-0.5">
                       {p.originalPrompt}
                     </p>
                   </div>
                 </div>
-              </button>
+              </div>
             ))}
           </div>
         </div>
