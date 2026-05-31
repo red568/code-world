@@ -17,6 +17,7 @@ import { publishEvent } from "@/lib/streaming";
 import { prisma } from "@/lib/prisma";
 import { assertRunWritable, RunNotWritableError } from "@/lib/queue/run-fencing";
 import type { Sandbox } from "@e2b/code-interpreter";
+import type { Prisma } from "@/generated/prisma/client";
 
 // ─── 类型定义 ────────────────────────────────────────────────────────────────────
 
@@ -29,6 +30,8 @@ export interface AgentLoopConfig {
   existingMessages?: OpenAI.ChatCompletionMessageParam[];
   maxSteps?: number;
   maxTokensPerTurn?: number;
+  initialStep?: number;
+  initialAskUserCount?: number;
 }
 
 export interface AgentLoopResult {
@@ -37,6 +40,18 @@ export interface AgentLoopResult {
   steps: number;
   previewUrl: string | null;
   finalMessages: OpenAI.ChatCompletionMessageParam[];
+  suspended?: boolean;
+}
+
+export interface LoopSuspendState {
+  messages: OpenAI.ChatCompletionMessageParam[];
+  completedToolResults: { tool_call_id: string; content: string }[];
+  pendingToolCallId: string;
+  pendingArgs: { question: string; options: { label: string; description: string }[]; context: string };
+  step: number;
+  askUserCount: number;
+  previewUrl: string | null;
+  answerToken: string;
 }
 
 // ─── Agent Loop 主函数 ───────────────────────────────────────────────────────────
@@ -52,6 +67,8 @@ export async function agentLoop(
     userMessage,
     maxSteps = 50,
     maxTokensPerTurn = 8192,
+    initialStep = 0,
+    initialAskUserCount = 0,
   } = config;
 
   // 初始化 LLM 客户端
@@ -79,13 +96,14 @@ export async function agentLoop(
 
   let previewUrl: string | null = null;
   let step = 0;
+  let askUserCount = initialAskUserCount;
   const totalStart = Date.now();
 
   console.log(
     `[AgentLoop] [${projectId.slice(0, 8)}] 开始 | run=${runId.slice(0, 8)} | model=${model} | maxSteps=${maxSteps}`
   );
 
-  for (step = 1; step <= maxSteps; step++) {
+  for (step = initialStep + 1; step <= maxSteps; step++) {
     const stepStart = Date.now();
 
     // ─── 检查点 1：每轮 LLM 调用前 ──────────────────────────────────────────
@@ -203,6 +221,8 @@ export async function agentLoop(
 
     // ─── 执行每个 tool_call ──────────────────────────────────────────────────
 
+    const completedToolResults: { tool_call_id: string; content: string }[] = [];
+
     for (const toolCall of assistantMessage.tool_calls) {
       if (toolCall.type !== "function") continue;
 
@@ -241,10 +261,107 @@ export async function agentLoop(
         continue;
       }
 
+      // ─── ask_user 特殊处理：挂起 loop ─────────────────────────────────────
+      if (fnName === "ask_user") {
+        if (askUserCount >= 3) {
+          messages.push({
+            role: "tool",
+            content: "系统限制：本次任务已多次向用户提问。请基于现有信息自行做出最佳判断，继续执行。",
+            tool_call_id: toolCall.id,
+          });
+          console.log(
+            `[AgentLoop] [${projectId.slice(0, 8)}] step=${step} ⚠️ ask_user 被 failsafe 拒绝（count=${askUserCount}）`
+          );
+          continue;
+        }
+
+        askUserCount++;
+        const answerToken = `${runId}-ask-${askUserCount}-${Date.now()}`;
+        const askArgs = args as { question: string; options: { label: string; description: string }[]; context: string };
+
+        // 推送 ask_user 事件给前端
+        await publishEvent(projectId, {
+          type: "ask_user",
+          data: {
+            question: askArgs.question,
+            options: askArgs.options,
+            context: askArgs.context,
+            answerToken,
+          },
+        });
+
+        // 构造挂起状态：裁剪 assistant message 中 ask_user 之后的 tool_calls
+        const askUserIndex = assistantMessage.tool_calls.indexOf(toolCall);
+        const trimmedAssistantMessage = {
+          ...assistantMessage,
+          tool_calls: assistantMessage.tool_calls.slice(0, askUserIndex + 1),
+        };
+        const suspendMessages = [...messages.slice(0, -1), trimmedAssistantMessage];
+
+        const suspendState: LoopSuspendState = {
+          messages: suspendMessages,
+          completedToolResults,
+          pendingToolCallId: toolCall.id,
+          pendingArgs: askArgs,
+          step,
+          askUserCount,
+          previewUrl,
+          answerToken,
+        };
+
+        // 保存到 DB
+        await prisma.loopState.upsert({
+          where: { runId },
+          create: {
+            runId,
+            messages: suspendMessages as unknown as Prisma.InputJsonValue,
+            step,
+            state: {
+              completedToolResults,
+              pendingToolCallId: toolCall.id,
+              pendingArgs: askArgs,
+              askUserCount,
+              previewUrl,
+            } as unknown as Prisma.InputJsonValue,
+            answerToken,
+          },
+          update: {
+            messages: suspendMessages as unknown as Prisma.InputJsonValue,
+            step,
+            state: {
+              completedToolResults,
+              pendingToolCallId: toolCall.id,
+              pendingArgs: askArgs,
+              askUserCount,
+              previewUrl,
+            } as unknown as Prisma.InputJsonValue,
+            answerToken,
+          },
+        });
+
+        await prisma.projectRun.update({
+          where: { id: runId },
+          data: { status: "waiting_for_user" },
+        });
+
+        console.log(
+          `[AgentLoop] [${projectId.slice(0, 8)}] step=${step} ⏸️ ask_user 挂起 | question="${askArgs.question.slice(0, 50)}"`
+        );
+
+        return {
+          success: false,
+          summary: "等待用户确认",
+          steps: step,
+          previewUrl,
+          finalMessages: messages,
+          suspended: true,
+        };
+      }
+
+      // ─── 正常工具执行 ──────────────────────────────────────────────────────
+
       // 推送 tool_call 事件给前端
       await publishToolCallEvent(projectId, fnName, args);
-
-      // ─── 执行工具 ──────────────────────────────────────────────────────────
 
       const toolStart = Date.now();
       const result = await executeTool(fnName, args, toolCtx);
@@ -289,11 +406,13 @@ export async function agentLoop(
       }
 
       // 追加 tool result 到 messages
+      const toolResultContent = truncateOutput(result.output, 4000);
       messages.push({
         role: "tool",
-        content: truncateOutput(result.output, 4000),
+        content: toolResultContent,
         tool_call_id: toolCall.id,
       });
+      completedToolResults.push({ tool_call_id: toolCall.id, content: toolResultContent });
 
       const icon = result.success ? "✓" : "✗";
       console.log(

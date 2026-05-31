@@ -23,7 +23,7 @@ export async function POST(
   const activeRun = await prisma.projectRun.findFirst({
     where: {
       projectId: id,
-      status: { in: ["queued", "running"] },
+      status: { in: ["queued", "running", "waiting_for_user"] },
     },
     orderBy: { createdAt: "desc" },
   });
@@ -39,7 +39,7 @@ export async function POST(
       where: {
         id: activeRun.id,
         projectId: id,
-        status: { in: ["queued", "running"] },
+        status: { in: ["queued", "running", "waiting_for_user"] },
       },
     });
 

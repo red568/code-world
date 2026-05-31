@@ -123,6 +123,7 @@ enum ProjectRunType {
 enum ProjectRunStatus {
   queued
   running
+  waiting_for_user
   cancelling
   cancelled
   succeeded
@@ -221,4 +222,16 @@ model AgentConversation {
   project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@index([userId])
+}
+
+// ─── Agent Loop 挂起状态（ask_user 时保存） ──────────────────────────────────────
+
+model LoopState {
+  id           String   @id @default(uuid())
+  runId        String   @unique
+  messages     Json
+  step         Int
+  state        Json
+  answerToken  String   @unique
+  createdAt    DateTime @default(now())
 }

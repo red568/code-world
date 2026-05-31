@@ -27,7 +27,20 @@ export type SSEEvent =
   // Agent Loop 新增事件
   | { type: "agent_thinking"; data: { content: string } }
   | { type: "tool_call"; data: { tool: string; args: Record<string, unknown> } }
-  | { type: "tool_result"; data: { tool: string; success: boolean; summary: string } };
+  | { type: "tool_result"; data: { tool: string; success: boolean; summary: string } }
+  // Human-in-the-Loop 事件
+  | { type: "clarification_needed"; data: {
+      clarity: "medium" | "low";
+      rewritten_query: string;
+      missing_info: { aspect: string; question: string; options: string[] }[];
+    }}
+  | { type: "clarification_resolved"; data: { enhanced_prompt: string } }
+  | { type: "ask_user"; data: {
+      question: string;
+      options: { label: string; description: string }[];
+      context: string;
+      answerToken: string;
+    }};
 
 /**
  * 获取项目事件的 Redis pub/sub 频道名

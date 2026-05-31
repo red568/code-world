@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect, useMemo } from "react";
 import { Send, Loader2, Sparkles, Square } from "lucide-react";
 import { TimelineRound } from "@/components/timeline";
+import { ClarificationCard, AskUserCard } from "@/components/clarification-card";
 import type { StreamState, AgentStep } from "@/hooks/use-project-stream";
 import type {
   TimelineRound as TRound,
@@ -19,8 +20,10 @@ interface ChatPanelProps {
   messages: Message[];
   streamState: StreamState;
   isGenerating: boolean;
-  onSend: (message: string) => void;
+  onSend: (message: string, clarificationResponse?: Record<string, unknown>) => void;
   onStop: () => void;
+  onAskUserAnswered?: () => void;
+  currentRunId?: string;
 }
 
 function agentStepToTimelineStep(step: AgentStep): TimelineStep {
@@ -99,6 +102,8 @@ export function ChatPanel({
   isGenerating,
   onSend,
   onStop,
+  onAskUserAnswered,
+  currentRunId,
 }: ChatPanelProps) {
   const [input, setInput] = useState("");
   const [stopping, setStopping] = useState(false);
@@ -132,16 +137,18 @@ export function ChatPanel({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!input.trim() || isGenerating) return;
+    if (!input.trim() || isInputDisabled) return;
     onSend(input.trim());
     setInput("");
   };
+
+  const isInputDisabled = isGenerating || streamState.phase === "waiting_for_clarification" || streamState.phase === "waiting_for_answer";
 
   return (
     <div className="flex flex-col h-full bg-white">
       {/* Timeline */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-5 py-4 space-y-6">
-        {rounds.length === 0 && (
+        {rounds.length === 0 && !streamState.clarification && (
           <div className="flex flex-col items-center justify-center h-full text-gray-400">
             <Sparkles className="w-8 h-8 mb-3 text-gray-200" />
             <p className="text-sm">描述你想要的网站，AI 将为你生成</p>
@@ -151,6 +158,38 @@ export function ChatPanel({
         {rounds.map((round) => (
           <TimelineRound key={round.id} round={round} />
         ))}
+
+        {/* 前置澄清卡片 */}
+        {streamState.clarification && (
+          <ClarificationCard
+            data={streamState.clarification}
+            onSubmit={(selections) => {
+              const lastUserMsg = messages.filter((m) => m.role === "user").pop();
+              if (lastUserMsg) {
+                onSend(lastUserMsg.content, {
+                  selections,
+                  rewritten_query: streamState.clarification?.rewritten_query,
+                });
+              }
+            }}
+            onSkip={() => {
+              const lastUserMsg = messages.filter((m) => m.role === "user").pop();
+              if (lastUserMsg) {
+                onSend(lastUserMsg.content, { skip: true });
+              }
+            }}
+          />
+        )}
+
+        {/* 过程中 ask_user 卡片 */}
+        {streamState.askUser && (
+          <AskUserCard
+            data={streamState.askUser}
+            projectId={projectId}
+            runId={currentRunId}
+            onAnswered={() => onAskUserAnswered?.()}
+          />
+        )}
       </div>
 
       {/* Input */}
@@ -160,8 +199,8 @@ export function ChatPanel({
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder={isGenerating ? "生成中，请稍候..." : "描述你想要的网站..."}
-            disabled={isGenerating}
+            placeholder={isInputDisabled ? "生成中，请稍候..." : "描述你想要的网站..."}
+            disabled={isInputDisabled}
             className="w-full pl-4 pr-12 py-3 text-sm text-gray-800 placeholder-gray-400 bg-transparent focus:outline-none disabled:text-gray-400"
           />
           {isGenerating ? (
