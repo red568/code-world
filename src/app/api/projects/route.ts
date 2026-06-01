@@ -8,7 +8,6 @@
 import { NextRequest } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { enqueueRun } from "@/lib/queue";
-import { publishEvent } from "@/lib/streaming";
 import {
   shouldSkipIntentAnalysis,
   analyzeIntent,
@@ -75,7 +74,7 @@ export async function POST(request: NextRequest) {
       return Response.json({ projectId: project.id, runId: run.id }, { status: 201 });
     }
 
-    // clarity: medium 或 low → 先创建项目（不创建 run），推送澄清选项
+    // clarity: medium 或 low → 先创建项目（不创建 run），返回澄清数据
     const project = await prisma.project.create({
       data: {
         userId: DEMO_USER_ID,
@@ -94,15 +93,8 @@ export async function POST(request: NextRequest) {
       },
     });
 
-    // 推送澄清事件
-    await publishEvent(project.id, {
-      type: "clarification_needed",
-      data: {
-        clarity: analysis.clarity,
-        rewritten_query: analysis.rewritten_query,
-        missing_info: analysis.missing_info,
-      },
-    });
+    // 不推送 SSE 事件，直接在 HTTP 响应中返回 clarification 数据
+    // 前端会通过 URL 参数传递给项目页面
 
     const duration = Date.now() - startTime;
     console.log(`[API] POST /api/projects | 202 | clarity=${analysis.clarity} | projectId=${project.id} | awaiting clarification | ${duration}ms`);

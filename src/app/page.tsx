@@ -61,7 +61,13 @@ export default function HomePage() {
         body: JSON.stringify({ prompt: input.trim() }),
       });
       const data = await res.json();
-      router.push(`/project/${data.projectId}`);
+
+      // 如果需要澄清，通过 URL 参数传递 clarification 数据
+      if (data.awaiting_clarification && data.clarification) {
+        router.push(`/project/${data.projectId}?clarification=${encodeURIComponent(JSON.stringify(data.clarification))}`);
+      } else {
+        router.push(`/project/${data.projectId}`);
+      }
     } catch {
       setIsSubmitting(false);
     }

@@ -14,10 +14,13 @@ interface ChatMessage {
 
 export default function ProjectPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ id: string }>;
+  searchParams?: Promise<{ clarification?: string }>;
 }) {
   const { id: routeId } = use(params);
+  const resolvedSearchParams = searchParams ? use(searchParams) : {};
   const router = useRouter();
   const isDraft = routeId === "new";
 
@@ -26,8 +29,24 @@ export default function ProjectPage({
   const [sending, setSending] = useState(false);
   const [hasActiveRun, setHasActiveRun] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const { state, reset, forceIdle } = useProjectStream(projectId);
+  const { state, reset, forceIdle, dispatch } = useProjectStream(projectId);
   const creatingRef = useRef(false);
+
+  // 从 URL 读取 clarification 参数（首次创建项目时）
+  useEffect(() => {
+    const clarificationParam = resolvedSearchParams.clarification;
+    if (clarificationParam && projectId) {
+      try {
+        const clarification = JSON.parse(decodeURIComponent(clarificationParam));
+        // 直接更新 state，不依赖 SSE
+        dispatch({ type: "CLARIFICATION_NEEDED", data: clarification });
+        // 清理 URL 参数，避免刷新时重复触发
+        router.replace(`/project/${projectId}`, { scroll: false });
+      } catch (err) {
+        console.error("[ProjectPage] Failed to parse clarification from URL:", err);
+      }
+    }
+  }, [resolvedSearchParams.clarification, projectId, dispatch, router]);
 
   useEffect(() => {
     if (isDraft) {
