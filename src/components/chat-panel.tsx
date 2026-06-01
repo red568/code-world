@@ -4,7 +4,7 @@ import { useState, useRef, useEffect, useMemo } from "react";
 import { Send, Loader2, Sparkles, Square } from "lucide-react";
 import { TimelineRound } from "@/components/timeline";
 import { ClarificationCard, AskUserCard } from "@/components/clarification-card";
-import type { StreamState, AgentStep } from "@/hooks/use-project-stream";
+import type { StreamState, AgentStep, ClarificationData } from "@/hooks/use-project-stream";
 import type {
   TimelineRound as TRound,
   TimelineStep,
@@ -21,6 +21,7 @@ interface ChatPanelProps {
   streamState: StreamState;
   isGenerating: boolean;
   analyzing?: boolean;
+  clarification?: ClarificationData | null;
   onSend: (message: string, clarificationResponse?: Record<string, unknown>) => void;
   onStop: () => void;
   onAskUserAnswered?: () => void;
@@ -102,6 +103,7 @@ export function ChatPanel({
   streamState,
   isGenerating,
   analyzing,
+  clarification,
   onSend,
   onStop,
   onAskUserAnswered,
@@ -144,13 +146,15 @@ export function ChatPanel({
     setInput("");
   };
 
-  const isInputDisabled = isGenerating || streamState.phase === "waiting_for_clarification" || streamState.phase === "waiting_for_answer";
+  const effectiveClarification = clarification ?? streamState.clarification;
+
+  const isInputDisabled = isGenerating || !!effectiveClarification || streamState.phase === "waiting_for_clarification" || streamState.phase === "waiting_for_answer";
 
   return (
     <div className="flex flex-col h-full bg-white">
       {/* Timeline */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-5 py-4 space-y-6">
-        {rounds.length === 0 && !streamState.clarification && (
+        {rounds.length === 0 && !effectiveClarification && (
           <div className="flex flex-col items-center justify-center h-full text-gray-400">
             <Sparkles className="w-8 h-8 mb-3 text-gray-200" />
             <p className="text-sm">描述你想要的网站，AI 将为你生成</p>
@@ -162,15 +166,15 @@ export function ChatPanel({
         ))}
 
         {/* 前置澄清卡片 */}
-        {streamState.clarification && (
+        {effectiveClarification && (
           <ClarificationCard
-            data={streamState.clarification}
+            data={effectiveClarification}
             onSubmit={(selections) => {
               const lastUserMsg = messages.filter((m) => m.role === "user").pop();
               if (lastUserMsg) {
                 onSend(lastUserMsg.content, {
                   selections,
-                  rewritten_query: streamState.clarification?.rewritten_query,
+                  rewritten_query: effectiveClarification.rewritten_query,
                 });
               }
             }}

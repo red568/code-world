@@ -6,6 +6,7 @@ import { SessionSidebar } from "@/components/session-sidebar";
 import { ChatPanel } from "@/components/chat-panel";
 import { PreviewPanel } from "@/components/preview-panel";
 import { useProjectStream } from "@/hooks/use-project-stream";
+import type { ClarificationData } from "@/hooks/use-project-stream";
 
 interface ChatMessage {
   role: "user" | "assistant";
@@ -30,7 +31,8 @@ export default function ProjectPage({
   const [hasActiveRun, setHasActiveRun] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
-  const { state, reset, forceIdle, dispatch } = useProjectStream(projectId);
+  const [localClarification, setLocalClarification] = useState<ClarificationData | null>(null);
+  const { state, reset, forceIdle } = useProjectStream(projectId);
   const creatingRef = useRef(false);
 
   // 乐观跳转：从首页带着 prompt 过来，立即调用 API
@@ -50,25 +52,21 @@ export default function ProjectPage({
       .then((res) => res.json())
       .then((data) => {
         setProjectId(data.projectId);
+        setAnalyzing(false);
 
         if (data.awaiting_clarification && data.clarification) {
-          dispatch({ type: "CLARIFICATION_NEEDED", data: data.clarification });
-          router.replace(`/project/${data.projectId}`, { scroll: false });
-        } else {
-          router.replace(`/project/${data.projectId}`, { scroll: false });
+          setLocalClarification(data.clarification);
         }
+        router.replace(`/project/${data.projectId}`, { scroll: false });
       })
       .catch((err) => {
+        setAnalyzing(false);
         setMessages((prev) => [
           ...prev,
           { role: "assistant", content: `创建失败: ${err instanceof Error ? err.message : "未知错误"}` },
         ]);
-      })
-      .finally(() => {
-        setAnalyzing(false);
-        creatingRef.current = false;
       });
-  }, [isDraft, resolvedSearchParams.prompt, dispatch, router]);
+  }, [isDraft, resolvedSearchParams.prompt, router]);
 
   // 从 URL 读取 clarification 参数（兼容老路径）
   useEffect(() => {
@@ -76,28 +74,28 @@ export default function ProjectPage({
     if (clarificationParam && projectId) {
       try {
         const clarification = JSON.parse(decodeURIComponent(clarificationParam));
-        dispatch({ type: "CLARIFICATION_NEEDED", data: clarification });
+        setLocalClarification(clarification);
         router.replace(`/project/${projectId}`, { scroll: false });
       } catch (err) {
         console.error("[ProjectPage] Failed to parse clarification from URL:", err);
       }
     }
-  }, [resolvedSearchParams.clarification, projectId, dispatch, router]);
+  }, [resolvedSearchParams.clarification, projectId, router]);
 
   useEffect(() => {
     if (isDraft) {
-      // 如果是乐观跳转流程（带 prompt 参数），不要重置状态
       if (resolvedSearchParams.prompt) return;
       setProjectId(null);
       setMessages([]);
       setSending(false);
       setHasActiveRun(false);
+      setLocalClarification(null);
       reset();
       return;
     }
     setProjectId(routeId);
-    // Skip fetch if we just created this project (messages already in state)
-    if (creatingRef.current) return;
+    // 如果已有消息（乐观跳转流程），跳过重复 fetch
+    if (messages.length > 0) return;
     fetch(`/api/projects/${routeId}`)
       .then((res) => res.json())
       .then((data) => {
@@ -114,7 +112,10 @@ export default function ProjectPage({
         }
       })
       .catch(() => {});
-  }, [routeId, isDraft, reset, resolvedSearchParams.prompt]);
+  }, [routeId, isDraft, reset, resolvedSearchParams.prompt, messages.length]);
+
+  // 合并两个来源的 clarification
+  const effectiveClarification = localClarification || state.clarification;
 
   const isGenerating =
     sending ||
@@ -138,7 +139,12 @@ export default function ProjectPage({
   }, [router]);
 
   const handleSend = useCallback(
-    async (content: string) => {
+    async (content: string, clarificationResponse?: Record<string, unknown>) => {
+      // 如果是 clarification 提交，清掉本地 clarification
+      if (clarificationResponse) {
+        setLocalClarification(null);
+      }
+
       reset();
       setSending(true);
       setMessages((prev) => [...prev, { role: "user", content }]);
@@ -171,10 +177,14 @@ export default function ProjectPage({
       }
 
       try {
+        const body: Record<string, unknown> = { content };
+        if (clarificationResponse) {
+          body.clarification_response = clarificationResponse;
+        }
         await fetch(`/api/projects/${projectId}/messages`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ content }),
+          body: JSON.stringify(body),
         });
       } catch (err) {
         setSending(false);
@@ -197,7 +207,7 @@ export default function ProjectPage({
         <SessionSidebar
           collapsed={sidebarCollapsed}
           onToggle={() => setSidebarCollapsed((v) => !v)}
-          activeProjectId={projectId}
+          activeProjectId={isDraft ? null : projectId}
           onNewProject={handleNewProject}
         />
       </div>
@@ -210,6 +220,7 @@ export default function ProjectPage({
           streamState={state}
           isGenerating={isGenerating}
           analyzing={analyzing}
+          clarification={effectiveClarification}
           onSend={handleSend}
           onStop={handleStop}
         />

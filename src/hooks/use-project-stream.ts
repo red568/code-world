@@ -399,5 +399,5 @@ export function useProjectStream(projectId: string | null) {
     };
   }, [projectId]);
 
-  return { state, reset, forceIdle, dispatch };
+  return { state, reset, forceIdle };
 }

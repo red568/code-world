@@ -71,16 +71,6 @@ export function SessionSidebar({ collapsed = false, onToggle, activeProjectId, o
       .catch(() => {});
   }, []);
 
-  // 当激活的项目 ID 变化时，如果是新项目（不在列表中），立即刷新列表
-  useEffect(() => {
-    if (activeId && !projects.some((p) => p.id === activeId)) {
-      fetch("/api/projects")
-        .then((r) => r.json())
-        .then((d) => setProjects(d.projects || []))
-        .catch(() => {});
-    }
-  }, [activeId, projects]);
-
   useEffect(() => {
     const interval = setInterval(() => {
       fetch("/api/projects")
