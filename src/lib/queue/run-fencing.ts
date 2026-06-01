@@ -1,4 +1,8 @@
 /**
+ * @deprecated v7 架构用 sandbox.kill() 替代 fencing 机制。
+ * 保留用于 Phase 3 并行运行期间 USE_SANDBOX_RUNTIME=false 的旧路径。
+ * 待全量切换后删除。
+ *
  * Run 写权限 fencing 工具
  *
  * 核心机制：所有项目级写入必须通过 run.status 校验。

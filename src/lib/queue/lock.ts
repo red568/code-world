@@ -1,4 +1,8 @@
 /**
+ * @deprecated v7 架构不再需要项目锁（沙盒天然隔离）。
+ * 保留用于 Phase 3 并行运行期间 USE_SANDBOX_RUNTIME=false 的旧路径。
+ * 待全量切换后删除。
+ *
  * 项目级并发锁（Redis SET NX EX + owner token + heartbeat 续租）
  *
  * 保证同一项目同时只有一个 Agent Loop 或删除操作在运行。

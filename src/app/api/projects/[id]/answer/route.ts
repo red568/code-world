@@ -1,31 +1,118 @@
 /**
- * POST /api/projects/:id/answer — 用户回答 ask_user 问题，恢复 Agent Loop
+ * POST /api/projects/:id/answer — 用户回答 ask_user 问题
+ *
+ * 新架构 (v7)：Redis LPUSH 直接推送答案到沙盒内 agent-runtime 的 BRPOP。
+ * 旧架构 (v6)：LoopState + 重新入队方式。
  */
 
 import { prisma } from "@/lib/prisma";
+import { redis } from "@/lib/redis";
 import { agentQueue } from "@/lib/queue";
 
+const USE_SANDBOX_RUNTIME = process.env.USE_SANDBOX_RUNTIME === "true";
 const DEMO_USER_ID = "demo-user-001";
 
 export async function POST(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const { id } = await params;
+  const { id: projectId } = await params;
   const body = await request.json();
-  const { runId, answerToken, answer, isOther, skipAndContinue } = body;
+  const { runId, answer, isOther, skipAndContinue, askCount, answerToken } = body;
 
-  if (!runId || !answerToken) {
+  if (!runId) {
+    return Response.json({ error: "runId is required" }, { status: 400 });
+  }
+
+  // 构造用户回答内容
+  let answerContent: string;
+  if (skipAndContinue) {
+    answerContent = "用户选择跳过，请自行选择最合理方案继续执行。";
+  } else if (isOther && answer) {
+    answerContent = `用户选择了 [其他]，补充说明：${String(answer).slice(0, 200)}`;
+  } else if (answer) {
+    answerContent = `用户选择了：${answer}`;
+  } else {
+    answerContent = "用户选择跳过，请自行选择最合理方案继续执行。";
+  }
+
+  if (USE_SANDBOX_RUNTIME) {
+    return handleSandboxAnswer(projectId, runId, askCount, answerContent);
+  } else {
+    return handleLegacyAnswer(projectId, runId, answerToken, answerContent);
+  }
+}
+
+// ─── 新架构：Redis LPUSH ──────────────────────────────────────────────────────
+
+async function handleSandboxAnswer(
+  projectId: string,
+  runId: string,
+  askCount: number | undefined,
+  answerContent: string
+) {
+  if (askCount == null) {
+    return Response.json({ error: "askCount is required" }, { status: 400 });
+  }
+
+  // 验证 run 状态
+  const run = await prisma.projectRun.findFirst({
+    where: { id: runId, projectId, status: "paused" },
+  });
+
+  if (!run) {
     return Response.json(
-      { error: "runId and answerToken are required" },
+      { error: "Run not found or not paused" },
+      { status: 409 }
+    );
+  }
+
+  // 验证 askCount 匹配
+  if (run.currentAskCount !== askCount) {
+    return Response.json(
+      { error: "askCount mismatch, question may have expired" },
+      { status: 409 }
+    );
+  }
+
+  // 原子防双击：SET NX
+  const dedupeKey = `answer:dedup:${runId}:${askCount}`;
+  const claimed = await redis.set(dedupeKey, "1", "EX", 300, "NX");
+  if (!claimed) {
+    return Response.json(
+      { error: "Answer already submitted" },
+      { status: 409 }
+    );
+  }
+
+  // 推送答案到 agent-runtime 的 BRPOP 队列
+  const answerKey = `loop:${runId}:answer:${askCount}`;
+  await redis.lpush(answerKey, answerContent);
+
+  console.log(
+    `[API] POST /answer | project=${projectId.slice(0, 8)} | run=${runId.slice(0, 8)} | askCount=${askCount}`
+  );
+
+  return Response.json({ ok: true, runId });
+}
+
+// ─── 旧架构：LoopState + 重新入队 ────────────────────────────────────────────
+
+async function handleLegacyAnswer(
+  projectId: string,
+  runId: string,
+  answerToken: string | undefined,
+  answerContent: string
+) {
+  if (!answerToken) {
+    return Response.json(
+      { error: "answerToken is required" },
       { status: 400 }
     );
   }
 
-  // 原子 claim：检查 + 翻转状态合为一条 SQL，防止双击/重试导致双重执行
-  // 设为 queued 而非 running，让 worker 走正常的 queued→running 路径
   const claimed = await prisma.projectRun.updateMany({
-    where: { id: runId, projectId: id, status: "waiting_for_user" },
+    where: { id: runId, projectId, status: "waiting_for_user" },
     data: { status: "queued" },
   });
   if (claimed.count === 0) {
@@ -35,10 +122,8 @@ export async function POST(
     );
   }
 
-  // 幂等检查：确认 answerToken 匹配
   const loopState = await prisma.loopState.findUnique({ where: { runId } });
   if (!loopState || loopState.answerToken !== answerToken) {
-    // answerToken 不匹配，回滚 run 状态
     await prisma.projectRun.update({
       where: { id: runId },
       data: { status: "waiting_for_user" },
@@ -49,36 +134,21 @@ export async function POST(
     );
   }
 
-  // 构造用户回答的 tool result 内容
-  let toolResultContent: string;
-  if (skipAndContinue) {
-    toolResultContent = "用户选择跳过，请自行选择最合理方案继续执行。";
-  } else if (isOther && answer) {
-    const sanitized = String(answer).slice(0, 200);
-    toolResultContent = `用户选择了 [其他]，补充说明：${sanitized}`;
-  } else if (answer) {
-    toolResultContent = `用户选择了：${answer}`;
-  } else {
-    toolResultContent = "用户选择跳过，请自行选择最合理方案继续执行。";
-  }
-
-  // 将恢复信息写入 loopState，由 worker 恢复执行
   const state = loopState.state as Record<string, unknown>;
   await prisma.loopState.update({
     where: { runId },
     data: {
       state: {
         ...state,
-        userAnswer: toolResultContent,
+        userAnswer: answerContent,
         resumeReady: true,
       },
     },
   });
 
-  // 重新入队，用 answerToken 作为 jobId 避免与初始 job 的 runId 冲突
   await agentQueue.add("agent-run", {
     runId,
-    projectId: id,
+    projectId,
     userId: DEMO_USER_ID,
   }, {
     jobId: answerToken,
@@ -86,6 +156,9 @@ export async function POST(
     backoff: { type: "fixed", delay: 5000 },
   });
 
-  console.log(`[API] POST /api/projects/${id.slice(0, 8)}/answer | 200 | runId=${runId.slice(0, 8)} | answer="${toolResultContent.slice(0, 50)}"`);
+  console.log(
+    `[API] POST /answer (legacy) | project=${projectId.slice(0, 8)} | run=${runId.slice(0, 8)}`
+  );
+
   return Response.json({ ok: true, runId });
 }

@@ -1,4 +1,8 @@
 /**
+ * @deprecated v7 架构已将 Agent Loop 移入 e2b-template/agent-runtime/src/loop.ts。
+ * 保留用于 Phase 3 并行运行期间 USE_SANDBOX_RUNTIME=false 的旧路径。
+ * 待全量切换后删除。
+ *
  * Agent Loop 引擎
  *
  * 核心 ReAct 循环：LLM 思考 → 选择工具 → 执行 → 观察结果 → 继续

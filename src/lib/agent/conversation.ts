@@ -1,4 +1,8 @@
 /**
+ * @deprecated v7 架构已将压缩逻辑移入 e2b-template/agent-runtime/src/context-compressor.ts。
+ * 保留用于 Phase 3 并行运行期间 USE_SANDBOX_RUNTIME=false 的旧路径。
+ * 待全量切换后删除。
+ *
  * Agent 对话管理
  *
  * 负责对话摘要生成和 messages 数组的 token 压缩。

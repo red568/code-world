@@ -1,4 +1,8 @@
 /**
+ * @deprecated v7 架构已用 src/lib/dispatcher.ts 替代。
+ * 保留用于 Phase 3 并行运行期间 USE_SANDBOX_RUNTIME=false 的旧路径。
+ * 待全量切换后删除。
+ *
  * Run 执行编排器
  *
  * 统一入口 orchestrateRun：根据 run.type 决定 generate/iterate 流程。

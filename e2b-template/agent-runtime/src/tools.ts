@@ -1,18 +1,19 @@
 /**
- * @deprecated v7 架构已将工具移入 e2b-template/agent-runtime/src/tools.ts（本地执行）。
- * 保留用于 Phase 3 并行运行期间 USE_SANDBOX_RUNTIME=false 的旧路径。
- * 待全量切换后删除。
+ * Agent 工具定义 + 本地执行器
  *
- * Agent 工具定义 + 执行器
- *
- * 6 个工具覆盖 Agent 与 E2B Sandbox 环境的所有交互方式。
- * 工具只做 I/O，不做智能决策。
+ * 工具在沙盒内本地执行（fs + child_process），不依赖 E2B SDK。
+ * ask_user 使用 Redis BRPOP 阻塞等待用户回答。
  */
 
-import type { Sandbox } from "@e2b/code-interpreter";
-import { prisma } from "@/lib/prisma";
+import { readFile, writeFile, mkdir, readdir, stat } from "node:fs/promises";
+import { exec } from "node:child_process";
+import { promisify } from "node:util";
+import { join, dirname } from "node:path";
+import type { ToolContext, ToolResult, AskUserOption } from "./types.js";
 
-// ─── Tool Schema（传递给 LLM 的工具描述）────────────────────────────────────────
+const execAsync = promisify(exec);
+
+// ─── Tool Schema（传递给 LLM）──────────────────────────────────────────────────
 
 export const AGENT_TOOLS = [
   {
@@ -26,8 +27,7 @@ export const AGENT_TOOLS = [
         properties: {
           path: {
             type: "string",
-            description:
-              "相对于项目根目录的路径，如 src/components/Hero.tsx",
+            description: "相对于项目根目录的路径，如 src/components/Hero.tsx",
           },
           content: {
             type: "string",
@@ -91,7 +91,7 @@ export const AGENT_TOOLS = [
     function: {
       name: "get_preview_url",
       description:
-        "获取 dev server 的公网预览 URL。在启动 dev server（npm run dev -- --host 0.0.0.0 --port 5173）之后调用。",
+        "获取 dev server 的公网预览 URL。在启动 dev server 之后调用。",
       parameters: {
         type: "object",
         properties: {
@@ -152,7 +152,7 @@ export const AGENT_TOOLS = [
           },
           success: {
             type: "boolean",
-            description: "任务是否成功完成（true: 成功, false: 失败或部分完成）",
+            description: "任务是否成功完成",
           },
         },
         required: ["summary", "success"],
@@ -161,21 +161,17 @@ export const AGENT_TOOLS = [
   },
 ] as const;
 
-// ─── Executor 上下文 ─────────────────────────────────────────────────────────
+// ─── 安全限制 ────────────────────────────────────────────────────────────────
 
-export interface ToolContext {
-  sandbox: Sandbox;
-  projectId: string;
-  projectDir: string;
-}
+const BLOCKED_COMMANDS = [
+  "rm -rf /",
+  "rm -rf /*",
+  "mkfs",
+  "dd if=",
+  ":(){:|:&};:",
+];
 
-export interface ToolResult {
-  success: boolean;
-  output: string;
-  suspend?: boolean;
-}
-
-// ─── 统一执行入口 ────────────────────────────────────────────────────────────────
+// ─── 统一执行入口 ────────────────────────────────────────────────────────────
 
 export async function executeTool(
   name: string,
@@ -194,7 +190,10 @@ export async function executeTool(
     case "get_preview_url":
       return executeGetPreviewUrl(args as { port?: number }, ctx);
     case "ask_user":
-      return { success: true, output: "", suspend: true };
+      return executeAskUser(
+        args as { question: string; options: AskUserOption[]; context: string },
+        ctx
+      );
     case "finish":
       return executeFinish(args as { summary: string; success: boolean });
     default:
@@ -202,35 +201,20 @@ export async function executeTool(
   }
 }
 
-// ─── 各工具实现 ──────────────────────────────────────────────────────────────────
+// ─── 工具实现 ────────────────────────────────────────────────────────────────
 
 async function executeWriteFile(
   args: { path: string; content: string },
   ctx: ToolContext
 ): Promise<ToolResult> {
-  const fullPath = `${ctx.projectDir}/${args.path}`;
-  const dir = fullPath.split("/").slice(0, -1).join("/");
+  const fullPath = join(ctx.projectDir, args.path);
 
   try {
-    await ctx.sandbox.commands.run(`mkdir -p ${dir}`);
-    await ctx.sandbox.files.write(fullPath, args.content);
-
-    await prisma.projectFile.upsert({
-      where: {
-        projectId_path: { projectId: ctx.projectId, path: args.path },
-      },
-      create: {
-        projectId: ctx.projectId,
-        path: args.path,
-        content: args.content,
-      },
-      update: { content: args.content, version: { increment: 1 } },
-    });
+    await mkdir(dirname(fullPath), { recursive: true });
+    await writeFile(fullPath, args.content, "utf-8");
 
     const lines = args.content.split("\n").length;
     let output = `Written ${args.path}`;
-
-    // 只在明显过长时才提示
     if (lines > 500) {
       output += ` (${lines} lines - 建议拆分为多个文件)`;
     }
@@ -247,9 +231,7 @@ async function executeReadFile(
   ctx: ToolContext
 ): Promise<ToolResult> {
   try {
-    const content = await ctx.sandbox.files.read(
-      `${ctx.projectDir}/${args.path}`
-    );
+    const content = await readFile(join(ctx.projectDir, args.path), "utf-8");
     return { success: true, output: content };
   } catch {
     return { success: false, output: `File not found: ${args.path}` };
@@ -258,10 +240,9 @@ async function executeReadFile(
 
 async function executeListFiles(ctx: ToolContext): Promise<ToolResult> {
   try {
-    const result = await ctx.sandbox.commands.run(
-      `find ${ctx.projectDir}/src -type f \\( -name "*.tsx" -o -name "*.ts" -o -name "*.css" \\) | sort | sed 's|${ctx.projectDir}/||'`
-    );
-    const output = result.stdout?.trim() || "No source files found.";
+    const files = await listFilesRecursive(join(ctx.projectDir, "src"));
+    const relative = files.map((f) => f.replace(ctx.projectDir + "/", ""));
+    const output = relative.length > 0 ? relative.sort().join("\n") : "No source files found.";
     return { success: true, output };
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
@@ -269,13 +250,24 @@ async function executeListFiles(ctx: ToolContext): Promise<ToolResult> {
   }
 }
 
-const BLOCKED_COMMANDS = [
-  "rm -rf /",
-  "rm -rf /*",
-  "mkfs",
-  "dd if=",
-  ":(){:|:&};:",
-];
+async function listFilesRecursive(dir: string): Promise<string[]> {
+  const results: string[] = [];
+  try {
+    const entries = await readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === "node_modules" || entry.name === ".git") continue;
+        results.push(...(await listFilesRecursive(fullPath)));
+      } else if (/\.(tsx?|css|json)$/.test(entry.name)) {
+        results.push(fullPath);
+      }
+    }
+  } catch {
+    // directory doesn't exist
+  }
+  return results;
+}
 
 async function executeRunShell(
   args: { command: string },
@@ -285,36 +277,26 @@ async function executeRunShell(
     return { success: false, output: "Command blocked for security reasons." };
   }
 
-  const stdoutChunks: string[] = [];
-  const stderrChunks: string[] = [];
-
   try {
-    const result = await ctx.sandbox.commands.run(args.command, {
+    const { stdout, stderr } = await execAsync(args.command, {
       cwd: ctx.projectDir,
-      timeoutMs: 120_000,
-      onStdout: (data: string) => { stdoutChunks.push(data); },
-      onStderr: (data: string) => { stderrChunks.push(data); },
+      timeout: 120_000,
+      maxBuffer: 10 * 1024 * 1024,
     });
 
     const parts: string[] = [];
-    if (result.stdout) parts.push(`stdout:\n${result.stdout.slice(-3000)}`);
-    if (result.stderr) parts.push(`stderr:\n${result.stderr.slice(-3000)}`);
-    parts.push(`exit_code: ${result.exitCode}`);
-
-    return { success: result.exitCode === 0, output: parts.join("\n\n") };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const stderr = stderrChunks.join("");
-
-    const exitCodeMatch = message.match(/exit status (\d+)/);
-    const exitCode = exitCodeMatch ? parseInt(exitCodeMatch[1], 10) : 1;
-
-    const stdout = stdoutChunks.join("");
-    const parts: string[] = [];
     if (stdout) parts.push(`stdout:\n${stdout.slice(-3000)}`);
     if (stderr) parts.push(`stderr:\n${stderr.slice(-3000)}`);
-    else parts.push(`error: ${message}`);
-    parts.push(`exit_code: ${exitCode}`);
+    parts.push("exit_code: 0");
+
+    return { success: true, output: parts.join("\n\n") };
+  } catch (error: unknown) {
+    const execError = error as { stdout?: string; stderr?: string; code?: number; message?: string };
+    const parts: string[] = [];
+    if (execError.stdout) parts.push(`stdout:\n${execError.stdout.slice(-3000)}`);
+    if (execError.stderr) parts.push(`stderr:\n${execError.stderr.slice(-3000)}`);
+    else if (execError.message) parts.push(`error: ${execError.message}`);
+    parts.push(`exit_code: ${execError.code ?? 1}`);
 
     return { success: false, output: parts.join("\n\n") };
   }
@@ -326,37 +308,80 @@ async function executeGetPreviewUrl(
 ): Promise<ToolResult> {
   const port = args.port || 5173;
 
-  try {
-    const host = ctx.sandbox.getHost(port);
+  // 沙盒内通过环境变量获取公网 host
+  const sandboxId = process.env.SANDBOX_ID;
+  if (sandboxId) {
+    const host = `${port}-${sandboxId}.e2b.dev`;
     const url = `https://${host}`;
-
-    await prisma.project.update({
-      where: { id: ctx.projectId },
-      data: { previewUrl: url, sandboxId: ctx.sandbox.sandboxId },
-    });
-
-    await prisma.sandboxSession.upsert({
-      where: { projectId: ctx.projectId },
-      create: {
-        projectId: ctx.projectId,
-        sandboxId: ctx.sandbox.sandboxId,
-        status: "running",
-        previewUrl: url,
-        expiresAt: new Date(Date.now() + 10 * 60 * 1000),
-      },
-      update: {
-        sandboxId: ctx.sandbox.sandboxId,
-        status: "running",
-        previewUrl: url,
-        expiresAt: new Date(Date.now() + 10 * 60 * 1000),
-      },
-    });
-
     return { success: true, output: url };
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    return { success: false, output: `Failed to get preview URL: ${msg}` };
   }
+
+  // 本地开发：返回 localhost
+  const url = `http://localhost:${port}`;
+  return { success: true, output: url };
+}
+
+async function executeAskUser(
+  args: { question: string; options: AskUserOption[]; context: string },
+  ctx: ToolContext
+): Promise<ToolResult> {
+  // 检查提问次数限制
+  if (ctx.askUserCount >= 3) {
+    return {
+      success: false,
+      output: "系统限制：已达到最大提问次数（3 次），请自行判断",
+    };
+  }
+
+  ctx.askUserCount++;
+  const answerKey = `loop:${ctx.runId}:answer:${ctx.askUserCount}`;
+
+  // 推送问题到前端
+  await ctx.eventEmitter.emitHITLQuestion(
+    args.question,
+    args.options,
+    ctx.askUserCount
+  );
+
+  // 通知后端：run 进入 paused 状态
+  await callInternalAPI(ctx, "/api/internal/run/pause", {
+    runId: ctx.runId,
+    reason: "user_input",
+    askCount: ctx.askUserCount,
+  });
+
+  ctx.logger.info("Waiting for user answer...", {
+    question: args.question,
+    askCount: ctx.askUserCount,
+  });
+
+  // Redis BRPOP 阻塞等待用户答案（30 分钟超时）
+  const result = await ctx.redis.brpop(answerKey, 1800);
+
+  if (!result) {
+    // 超时
+    await callInternalAPI(ctx, "/api/internal/run/finalize", {
+      runId: ctx.runId,
+      projectId: ctx.projectId,
+      status: "paused",
+      error: "User response timeout (30 minutes)",
+    });
+
+    return {
+      success: false,
+      output: "用户未在 30 分钟内回答，任务已暂停",
+    };
+  }
+
+  const answer = result[1];
+  ctx.logger.info("User answered", { answer, askCount: ctx.askUserCount });
+
+  // 通知后端恢复
+  await callInternalAPI(ctx, "/api/internal/run/resume", {
+    runId: ctx.runId,
+  });
+
+  return { success: true, output: answer };
 }
 
 async function executeFinish(
@@ -367,3 +392,33 @@ async function executeFinish(
     output: args.summary,
   };
 }
+
+// ─── 内部 API 调用辅助 ──────────────────────────────────────────────────────
+
+async function callInternalAPI(
+  ctx: ToolContext,
+  path: string,
+  body: Record<string, unknown>
+): Promise<unknown> {
+  const url = `${ctx.config.apiBaseUrl}${path}`;
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Internal-Secret": ctx.config.internalApiSecret,
+      },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      ctx.logger.warn(`Internal API call failed: ${path}`, { status: response.status, body: text });
+    }
+    return response.json().catch(() => null);
+  } catch (error) {
+    ctx.logger.error(`Internal API call error: ${path}`, { error: String(error) });
+    return null;
+  }
+}
+
+export { callInternalAPI };
