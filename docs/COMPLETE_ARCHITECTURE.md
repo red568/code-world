@@ -1890,346 +1890,988 @@ CMD ["node", "/agent-runtime/dist/main.js"]
 
 ## 五、Agent Runtime 实现
 
-### 5.1 入口：main.ts
+### 5.1 整体架构概览
 
-```typescript
-// agent-runtime/src/main.ts
+**核心理念**：Agent Runtime 是沙盒内的一等公民，负责执行 Agent Loop、管理 Skills、处理上下文压缩。
 
-import { agentLoop } from './loop';
-import { StateManager } from './state-manager';
-import { EventEmitter } from './event-emitter';
-import { AxiomLogger } from './logger';
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Agent Runtime                            │
+├─────────────────────────────────────────────────────────────┤
+│  main.ts (入口)                                              │
+│    ↓                                                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
+│  │ SkillManager │  │MemoryManager │  │  MCPManager  │      │
+│  │  (实现)      │  │  (预留)      │  │  (预留)      │      │
+│  └──────────────┘  └──────────────┘  └──────────────┘      │
+│    ↓                                                         │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │              Agent Loop (核心)                        │  │
+│  │  - 简单任务: ReAct                                    │  │
+│  │  - 复杂任务: Plan + ReAct                            │  │
+│  │  - 上下文压缩: 三层压缩策略                            │  │
+│  └──────────────────────────────────────────────────────┘  │
+│    ↓                                                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
+│  │ Built-in     │  │  Skills      │  │  MCP Tools   │      │
+│  │ Tools        │  │  (DB)        │  │  (预留)      │      │
+│  └──────────────┘  └──────────────┘  └──────────────┘      │
+└─────────────────────────────────────────────────────────────┘
+```
 
-async function main() {
-  // 1. 解析启动参数
-  const args = parseArgs(process.argv);
-  const { runId, projectId, mode, skipFileRestore } = args;
+### 5.2 Skill 管理系统
+
+#### 5.2.1 核心设计
+
+**参考 Claude Code 的 Skill 协议**，实现用户级和项目级的 Skill 持久化与动态加载。
+
+**Skill 类型**：
+- `builtin`：代码实现（如 `write_file`、`read_file`）
+- `composite`：组合多个工具调用（如 `create_component` = write_file + write_file）
+- `mcp`：调用外部 MCP 服务（如 `github.create_pr`）
+
+**数据模型**：
+
+```prisma
+// prisma/schema.prisma
+
+model Skill {
+  id          String   @id @default(cuid())
+  name        String   // 'create_component', 'setup_routing'
+  displayName String   // '创建组件', '设置路由'
+  description String   @db.Text
+  category    String   // 'component', 'api', 'styling', 'testing'
   
-  // 2. 初始化组件
-  const stateManager = new StateManager({
-    databaseUrl: process.env.DATABASE_URL!,
-    redisUrl: process.env.REDIS_URL!,
-  });
+  // Skill 定义（JSON Schema）
+  schema      Json     // { parameters: {...}, returns: {...} }
   
-  const eventEmitter = new EventEmitter({
-    redisUrl: process.env.REDIS_URL!,
-    projectId,
-    runId,
-  });
+  // 实现方式
+  type        SkillType // 'builtin' | 'composite' | 'mcp'
   
-  const logger = new AxiomLogger({
-    runId,
-    projectId,
-    axiomToken: process.env.AXIOM_TOKEN!,
-    axiomDataset: 'ai-website-builder',
-  });
+  // 对于 composite 类型：工具调用序列
+  implementation Json?  // [{ tool: 'write_file', args: {...} }, ...]
   
-  // 3. 加载上下文
-  logger.info('Loading context', { mode, skipFileRestore });
-  const context = await stateManager.loadContext(runId, projectId, mode, skipFileRestore);
+  // 对于 mcp 类型：MCP 服务器配置
+  mcpConfig   Json?    // { server: 'github', method: 'create_pr' }
   
-  try {
-    // 4. 启动 Agent Loop
-    logger.info('Starting Agent Loop');
-    const result = await agentLoop({
-      runId,
-      projectId,
-      context,
-      stateManager,
-      eventEmitter,
-      logger,
-      llmConfig: {
-        apiKey: process.env.LLM_API_KEY!,
-        baseURL: process.env.LLM_BASE_URL!,
-        model: process.env.LLM_MODEL!,
-      },
-    });
-    
-    // 5. 只在成功时保存数据
-    if (result.success) {
-      await stateManager.syncAll();
-    }
-    
-    // 6. 保存最终状态
-    await stateManager.finalizeRun(runId, projectId, result);
-    
-    // 7. 关闭日志
-    await logger.close();
-    
-    // 8. 退出
-    logger.info('Agent Loop completed', { success: result.success });
-    process.exit(result.success ? 0 : 1);
-    
-  } catch (error) {
-    logger.error('Agent Runtime crashed', { error: error.message });
-    await logger.close();
-    process.exit(1);
-  }
+  // 作用域
+  scope       SkillScope // 'global' | 'user' | 'project'
+  
+  // 关联
+  userId      String?
+  user        User?    @relation(fields: [userId], references: [id])
+  projectId   String?
+  project     Project? @relation(fields: [projectId], references: [id])
+  
+  // 元数据
+  version     Int      @default(1)
+  enabled     Boolean  @default(true)
+  usageCount  Int      @default(0)
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  @@unique([name, scope, userId, projectId])
+  @@index([userId, scope])
+  @@index([projectId, scope])
 }
 
-main().catch((error) => {
-  console.error('[Agent Runtime] Fatal error:', error);
-  process.exit(1);
-});
+enum SkillType {
+  builtin    // 内置实现（代码）
+  composite  // 组合多个工具
+  mcp        // MCP 外部服务
+}
 
-function parseArgs(argv: string[]) {
-  const args: Record<string, string> = {};
-  for (const arg of argv.slice(2)) {
-    const [key, value] = arg.replace('--', '').split('=');
-    args[key] = value;
-  }
-  return {
-    runId: args.runId,
-    projectId: args.projectId,
-    mode: args.mode as 'generate' | 'iterate' | 'resume',
-    skipFileRestore: args.skipFileRestore === 'true',
-  };
+enum SkillScope {
+  global     // 全局可用
+  user       // 用户级别
+  project    // 项目级别
 }
 ```
 
-### 5.2 状态管理：state-manager.ts
+#### 5.2.2 Skill 加载机制
+
+**加载优先级**：Project > User > Global（同名覆盖）
 
 ```typescript
-// agent-runtime/src/state-manager.ts
+// agent-runtime/src/skill-manager.ts
 
-import { PrismaClient } from '@prisma/client';
-import { Redis } from 'ioredis';
-import * as fs from 'fs/promises';
-import * as path from 'path';
-
-export class StateManager {
-  private prisma: PrismaClient;
-  private redis: Redis;
-  private projectId: string;
-  private pendingFiles = new Map<string, string>();
-  
-  constructor(config: { databaseUrl: string; redisUrl: string }) {
-    this.prisma = new PrismaClient({
-      datasources: { db: { url: config.databaseUrl } },
-    });
-    this.redis = new Redis(config.redisUrl);
-  }
-  
+class SkillManager {
   /**
-   * 加载上下文（根据 mode 不同加载不同数据）
+   * 加载 Skills（按优先级）
    */
-  async loadContext(
-    runId: string,
-    projectId: string,
-    mode: 'generate' | 'iterate' | 'resume',
-    skipFileRestore: boolean
-  ) {
-    this.projectId = projectId;
+  async loadSkills(userId?: string, projectId?: string): Promise<SkillDefinition[]> {
+    const cacheKey = `skills:${projectId || userId || 'global'}`;
     
-    const run = await this.prisma.projectRun.findUnique({
-      where: { id: runId },
-    });
+    // 1. 尝试从 Redis 缓存读取（5 分钟）
+    const cached = await this.redis.get(cacheKey);
+    if (cached) return JSON.parse(cached);
     
-    if (!run) throw new Error(`Run ${runId} not found`);
-    
-    switch (mode) {
-      case 'generate':
-        return {
-          messages: [],
-          userPrompt: run.prompt,
-          files: {},
-        };
-        
-      case 'iterate':
-        const conversation = await this.loadConversation(projectId);
-        const files = skipFileRestore ? {} : await this.loadFiles(projectId);
-        
-        if (!skipFileRestore) {
-          await this.restoreFiles(files);
-        }
-        
-        return {
-          messages: conversation?.messages || [],
-          userPrompt: run.prompt,
-          files,
-        };
-        
-      case 'resume':
-        const loopState = await this.prisma.loopState.findUnique({
-          where: { runId },
-        });
-        
-        if (!loopState) throw new Error(`LoopState for run ${runId} not found`);
-        
-        const resumeFiles = await this.loadFiles(projectId);
-        await this.restoreFiles(resumeFiles);
-        
-        return {
-          messages: loopState.messages,
-          resumeState: loopState.state,
-          userAnswer: loopState.answer,
-          files: resumeFiles,
-        };
-    }
-  }
-  
-  /**
-   * 恢复文件到沙盒文件系统
-   */
-  private async restoreFiles(files: Record<string, string>) {
-    for (const [filePath, content] of Object.entries(files)) {
-      const fullPath = `/home/user/app/${filePath}`;
-      const dir = path.dirname(fullPath);
-      
-      await fs.mkdir(dir, { recursive: true });
-      await fs.writeFile(fullPath, content, 'utf-8');
-    }
-  }
-  
-  /**
-   * 批量同步到数据库（只在成功时调用）
-   */
-  async syncAll() {
-    if (this.pendingFiles.size === 0) return;
-    
-    const files = Array.from(this.pendingFiles.entries());
-    
-    await this.prisma.$transaction(
-      files.map(([filePath, content]) =>
-        this.prisma.projectFile.upsert({
-          where: {
-            projectId_path: {
-              projectId: this.projectId,
-              path: filePath,
-            },
-          },
-          create: {
-            projectId: this.projectId,
-            path: filePath,
-            content,
-            version: 1,
-          },
-          update: {
-            content,
-            version: { increment: 1 },
-            updatedAt: new Date(),
-          },
-        })
-      )
-    );
-    
-    console.log(`[StateManager] Synced ${files.length} files to DB`);
-  }
-  
-  /**
-   * 保存最终结果（只在成功时保存文件）
-   */
-  async finalizeRun(runId: string, projectId: string, result: any) {
-    if (result.success) {
-      await this.saveConversation(projectId, result.finalMessages);
-    }
-    
-    await this.prisma.projectRun.update({
-      where: { id: runId },
-      data: {
-        status: result.success ? 'succeeded' : 'failed',
-        error: result.summary,
-        previewUrl: result.previewUrl,
-        finishedAt: new Date(),
+    // 2. 从数据库加载（按优先级）
+    const skills = await this.prisma.skill.findMany({
+      where: {
+        enabled: true,
+        OR: [
+          { scope: 'global' },
+          { scope: 'user', userId },
+          { scope: 'project', projectId },
+        ],
       },
+      orderBy: [
+        { scope: 'desc' }, // project > user > global
+        { name: 'asc' },
+      ],
     });
-  }
-  
-  async close() {
-    await this.prisma.$disconnect();
-    await this.redis.quit();
+    
+    // 3. 去重（项目级覆盖用户级，用户级覆盖全局）
+    const uniqueSkills = new Map<string, SkillDefinition>();
+    for (const skill of skills) {
+      if (!uniqueSkills.has(skill.name)) {
+        uniqueSkills.set(skill.name, this.toSkillDefinition(skill));
+      }
+    }
+    
+    const result = Array.from(uniqueSkills.values());
+    
+    // 4. 缓存到 Redis
+    await this.redis.setex(cacheKey, 300, JSON.stringify(result));
+    
+    return result;
   }
 }
 ```
 
-### 5.3 事件推送：event-emitter.ts
+#### 5.2.3 Skill 执行机制
 
 ```typescript
-// agent-runtime/src/event-emitter.ts
+// agent-runtime/src/skill-manager.ts
 
-import { Redis } from 'ioredis';
+class SkillManager {
+  /**
+   * 执行 Skill（根据类型分发）
+   */
+  async executeSkill(
+    skillName: string,
+    args: any,
+    context: ToolContext
+  ): Promise<ToolResult> {
+    const skill = this.loadedSkills.get(skillName);
+    if (!skill) throw new Error(`Skill '${skillName}' not found`);
 
-export class EventEmitter {
-  private redis: Redis;
-  private projectId: string;
-  private runId: string;
-  private channel: string;
-  private currentStep: number = 0;
-  private heartbeatInterval: NodeJS.Timeout;
-  
-  constructor(config: { redisUrl: string; projectId: string; runId: string }) {
-    this.redis = new Redis(config.redisUrl);
-    this.projectId = config.projectId;
-    this.runId = config.runId;
-    this.channel = `project:${this.projectId}:events`;
-    
-    // 启动心跳（每 5 秒）
-    this.heartbeatInterval = setInterval(() => {
-      this.emitHeartbeat();
-    }, 5000);
+    switch (skill.type) {
+      case 'builtin':
+        return this.executeBuiltinSkill(skill, args, context);
+      case 'composite':
+        return this.executeCompositeSkill(skill, args, context);
+      case 'mcp':
+        return this.executeMCPSkill(skill, args, context);
+    }
   }
-  
-  private async emit(event: any) {
-    const fullEvent = {
-      ...event,
-      runId: this.runId,
-      projectId: this.projectId,
-      timestamp: Date.now(),
-      step: this.currentStep,
+
+  /**
+   * 执行组合 Skill（多个工具调用序列）
+   * 支持变量替换：${args.name}, ${outputs.step1}
+   */
+  private async executeCompositeSkill(
+    skill: SkillDefinition,
+    args: any,
+    context: ToolContext
+  ): Promise<ToolResult> {
+    const steps = skill.implementation as CompositeStep[];
+    const outputs: Record<string, any> = {};
+
+    for (const step of steps) {
+      const resolvedArgs = this.resolveVariables(step.args, { args, outputs });
+      const result = await context.executeTool(step.tool, resolvedArgs);
+
+      if (!result.success) {
+        return {
+          success: false,
+          output: `Skill '${skill.name}' failed at step '${step.tool}': ${result.output}`,
+        };
+      }
+
+      if (step.outputVar) {
+        outputs[step.outputVar] = result.output;
+      }
+    }
+
+    return { success: true, output: `Skill '${skill.name}' completed`, artifacts: outputs };
+  }
+}
+```
+
+**关键设计点**：
+1. **缓存策略**：Redis 缓存 5 分钟，避免每次查数据库
+2. **版本管理**：Skill 有版本号，支持升级和回滚
+3. **权限控制**：用户只能修改自己的 User/Project Skills
+4. **热更新**：修改 Skill 后，下次 Run 自动生效（无需重启）
+
+### 5.3 Memory 管理系统（预留接口）
+
+**核心问题**：如何设计 Memory 系统，既不影响当前开发，又为未来扩展留好接口？
+
+**当前阶段**：只定义接口 + 空实现，不创建数据库表。
+
+**Memory 类型（参考 Claude Code）**：
+- `user`：用户角色、偏好、知识背景
+- `feedback`：用户反馈、纠正（"不要用 X，用 Y"）
+- `project`：项目上下文、架构决策（"我们用 Tailwind 不用 CSS Modules"）
+- `reference`：外部资源引用（"API 文档在 xxx"）
+
+```typescript
+// agent-runtime/src/memory-manager.ts
+
+export interface IMemoryManager {
+  save(entry: MemoryEntry): Promise<string>;
+  retrieve(query: string, type?: MemoryType, limit?: number): Promise<MemoryEntry[]>;
+  update(id: string, updates: Partial<MemoryEntry>): Promise<void>;
+  delete(id: string): Promise<void>;
+  list(type?: MemoryType): Promise<MemoryEntry[]>;
+}
+
+// 占位实现（暂不实现，只预留接口）
+export class MemoryManager implements IMemoryManager {
+  async save(entry: MemoryEntry): Promise<string> {
+    console.warn('[MemoryManager] save() not implemented yet');
+    return 'placeholder-id';
+  }
+  async retrieve(query: string): Promise<MemoryEntry[]> {
+    return [];
+  }
+  async update(id: string, updates: Partial<MemoryEntry>): Promise<void> {}
+  async delete(id: string): Promise<void> {}
+  async list(): Promise<MemoryEntry[]> { return []; }
+}
+```
+
+**未来扩展路径**：
+1. **Phase 1**：简单 KV 存储（Redis/数据库）
+2. **Phase 2**：向量搜索（pgvector + Embeddings）
+3. **Phase 3**：自动记忆提取（LLM 分析对话，自动保存关键信息）
+
+### 5.4 Plan + ReAct 混合架构
+
+#### 5.4.1 架构模式选择机制
+
+**核心问题**：不能单纯根据步数判断用什么架构，需要多维度分析。
+
+**决策维度**：
+
+```
+任务分析维度：
+├── 1. 任务类型识别
+│   ├── 单一操作型（"修改按钮颜色"）→ ReAct
+│   ├── 多功能组合型（"添加登录 + 注册 + 找回密码"）→ Plan
+│   └── 探索型（"优化性能"）→ ReAct（边做边调整）
+│
+├── 2. 依赖关系分析
+│   ├── 无依赖/弱依赖 → ReAct
+│   └── 强依赖链（A→B→C）→ Plan
+│
+├── 3. 用户明确性
+│   ├── 需求明确 → Plan（可预先规划）
+│   └── 需求模糊 → ReAct（边做边问）
+│
+└── 4. 用户偏好
+    ├── 用户要求看计划 → 强制 Plan
+    └── 用户要求快速开始 → ReAct
+```
+
+**决策流程**：
+
+```typescript
+// agent-runtime/src/mode-selector.ts
+
+async function selectMode(prompt: string, userPreference?: string): Promise<'plan' | 'react'> {
+  // 1. 用户明确指定
+  if (userPreference === 'plan') return 'plan';
+  if (userPreference === 'react') return 'react';
+
+  // 2. LLM 分析任务特征
+  const analysis = await analyzeLLM(prompt, {
+    dimensions: ['task_type', 'dependencies', 'clarity', 'estimated_steps']
+  });
+
+  // 3. 决策规则
+  if (analysis.task_type === 'single') return 'react';
+  if (analysis.dependencies === 'strong' && analysis.estimated_steps > 3) return 'plan';
+  if (analysis.clarity === 'ambiguous') return 'react';
+
+  // 4. 默认：多步骤用 Plan
+  return analysis.estimated_steps > 5 ? 'plan' : 'react';
+}
+```
+
+**关键改进**：
+- 多维度分析，不只看步数
+- 支持用户偏好（可在设置中配置默认模式）
+- LLM 辅助决策（而不是硬编码规则）
+
+#### 5.4.2 Plan 的工具化管理
+
+**核心问题**：Plan 的状态维护不能单纯依靠 Prompt，需要专门的工具化方式。并且这里要求大模型完成对应的 Plan 任务之后，需要更新 Plan 的状态。为了避免大模型遗漏更新状态，如果连续三次都没有调用这个更新状态，系统将进行强制提醒。
+
+**Plan 管理工具集**：
+
+```typescript
+// agent-runtime/src/plan-tools.ts
+
+const planTools = [
+  {
+    name: 'create_plan',
+    description: '创建任务执行计划',
+    parameters: {
+      title: { type: 'string' },
+      steps: {
+        type: 'array',
+        items: {
+          title: { type: 'string' },
+          description: { type: 'string' },
+          dependencies: { type: 'array', items: { type: 'number' } },
+          estimatedTime: { type: 'string' },
+        },
+      },
+    },
+  },
+  {
+    name: 'update_plan_step',
+    description: '更新计划步骤状态',
+    parameters: {
+      stepId: { type: 'number' },
+      status: { enum: ['pending', 'running', 'completed', 'failed', 'skipped'] },
+      result: { type: 'string', optional: true },
+    },
+  },
+  {
+    name: 'add_plan_step',
+    description: '在计划中插入新步骤（发现遗漏时）',
+    parameters: {
+      afterStepId: { type: 'number' },
+      step: { title: 'string', description: 'string' },
+    },
+  },
+  {
+    name: 'replan_from_step',
+    description: '从某个步骤重新规划后续步骤',
+    parameters: {
+      fromStepId: { type: 'number' },
+      reason: { type: 'string' },
+      newSteps: { type: 'array' },
+    },
+  },
+  {
+    name: 'get_plan_status',
+    description: '获取当前计划执行状态',
+    parameters: {},
+  },
+];
+```
+
+**Plan 状态管理器**：
+
+```typescript
+// agent-runtime/src/plan-state-manager.ts
+
+class PlanStateManager {
+  private currentPlan: Plan | null = null;
+
+  async createPlan(data: CreatePlanInput): Promise<Plan> {
+    this.currentPlan = {
+      id: generateId(),
+      title: data.title,
+      steps: data.steps.map((s, i) => ({
+        id: i + 1,
+        ...s,
+        status: 'pending',
+        startedAt: null,
+        completedAt: null,
+      })),
+      version: 1,
+      createdAt: Date.now(),
     };
-    
-    await this.redis.publish(this.channel, JSON.stringify(fullEvent));
+
+    // 持久化到 Redis（支持恢复）
+    await redis.set(`plan:${runId}`, JSON.stringify(this.currentPlan), 'EX', 3600);
+
+    // 推送到前端展示
+    await eventEmitter.emit({ type: 'plan_created', data: this.currentPlan });
+
+    return this.currentPlan;
   }
-  
-  async emitStatusChange(status: string, message?: string) {
-    await this.emit({
-      type: 'agent_status_change',
-      data: { status, message },
-    });
+
+  async updateStepStatus(stepId: number, status: StepStatus, result?: string) {
+    const step = this.currentPlan.steps.find(s => s.id === stepId);
+    if (!step) throw new Error(`Step ${stepId} not found`);
+
+    step.status = status;
+    if (status === 'running') step.startedAt = Date.now();
+    if (status === 'completed' || status === 'failed') {
+      step.completedAt = Date.now();
+      step.result = result;
+    }
+
+    // 持久化 + 推送
+    await redis.set(`plan:${runId}`, JSON.stringify(this.currentPlan));
+    await eventEmitter.emit({ type: 'plan_step_updated', data: { stepId, status, result } });
   }
-  
-  async emitHeartbeat() {
-    await this.emit({
-      type: 'agent_heartbeat',
-      data: { uptime: process.uptime() },
-    });
+
+  async addStep(afterStepId: number, newStep: StepInput) {
+    const index = this.currentPlan.steps.findIndex(s => s.id === afterStepId);
+    const insertedStep = { ...newStep, id: this.nextStepId(), status: 'pending' };
+    this.currentPlan.steps.splice(index + 1, 0, insertedStep);
+    this.currentPlan.version++;
+
+    await redis.set(`plan:${runId}`, JSON.stringify(this.currentPlan));
+    await eventEmitter.emit({ type: 'plan_step_added', data: { afterStepId, newStep: insertedStep } });
   }
-  
-  async emitStepStart(step: number) {
-    this.currentStep = step;
-    await this.emit({
-      type: 'agent_step_start',
-      data: { step },
-    });
-  }
-  
-  async emitToolCall(tool: string, args: any) {
-    await this.emit({
-      type: 'tool_call_start',
-      data: { tool, args },
-    });
-  }
-  
-  async emitAskUser(question: string, options: any[], answerToken: string) {
-    await this.emit({
-      type: 'ask_user',
-      data: { question, options, answerToken },
-    });
-  }
-  
-  async emitPreviewReady(previewUrl: string) {
-    await this.emit({
-      type: 'preview_ready',
-      data: { previewUrl },
-    });
-  }
-  
-  async close() {
-    clearInterval(this.heartbeatInterval);
-    await this.redis.quit();
+
+  async replanFromStep(fromStepId: number, reason: string, newSteps: StepInput[]) {
+    const index = this.currentPlan.steps.findIndex(s => s.id === fromStepId);
+    // 保留已完成的步骤，替换后续步骤
+    this.currentPlan.steps = [
+      ...this.currentPlan.steps.slice(0, index),
+      ...newSteps.map((s, i) => ({ ...s, id: this.nextStepId() + i, status: 'pending' })),
+    ];
+    this.currentPlan.version++;
+
+    await redis.set(`plan:${runId}`, JSON.stringify(this.currentPlan));
+    await eventEmitter.emit({ type: 'plan_replanned', data: { fromStepId, reason, newSteps } });
   }
 }
 ```
+
+**关键改进**：
+- Plan 状态独立管理，不依赖 Prompt 记忆
+- 工具化操作，LLM 通过工具调用更新状态
+- 持久化到 Redis，支持崩溃恢复
+- 版本管理，每次调整自动递增版本号
+
+#### 5.4.3 Plan 生成与用户确认流程
+
+**核心问题**：Plan 生成后需要用户确认，并实时展示执行进度。
+
+**三阶段流程**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Phase 1: Plan 生成                                           │
+├─────────────────────────────────────────────────────────────┤
+│ Agent 分析任务 → 调用 create_plan 工具                        │
+│ PlanStateManager 创建 Plan → 推送到前端展示                   │
+│ Agent 调用 ask_user（类型：plan_approval）→ 阻塞等待确认      │
+└─────────────────────────────────────────────────────────────┘
+         ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Phase 2: 用户交互                                            │
+├─────────────────────────────────────────────────────────────┤
+│ 前端展示 Plan 编辑器：                                        │
+│ - 用户可查看每个步骤的详细描述                                 │
+│ - 用户可调整步骤顺序（拖拽）                                  │
+│ - 用户可修改步骤描述 / 添加 / 删除步骤                        │
+│ - 用户选择：[开始执行] / [修改计划] / [取消]                  │
+└─────────────────────────────────────────────────────────────┘
+         ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Phase 3: 执行与进度展示                                      │
+├─────────────────────────────────────────────────────────────┤
+│ Agent 恢复执行 → 按顺序执行每个步骤（ReAct 模式）             │
+│ 每步骤：update_plan_step(running) → 执行 → update(completed) │
+│ 前端实时展示：进度条 + 当前步骤 + 工具调用详情                 │
+│ 支持暂停/恢复（复用 HITL 机制）                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**前端进度展示**：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ 🔄 正在执行 (步骤 2/5)                                   │
+│                                                          │
+│ ✅ 步骤 1: 创建用户模型              [已完成 - 2m 15s]   │
+│ 🔄 步骤 2: 实现注册 API              [进行中 - 1m 30s]   │
+│    └─ 正在写入文件: api/register.ts                     │
+│ ⏳ 步骤 3: 实现登录 API              [等待中]            │
+│ ⏳ 步骤 4: 添加 JWT 中间件           [等待中]            │
+│ ⏳ 步骤 5: 前端登录页面              [等待中]            │
+│                                                          │
+│ 进度: ████████░░░░░░░░░░ 40%                            │
+│                                                          │
+│ [⏸️ 暂停]  [⏹️ 停止]                                    │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### 5.4.4 Plan 动态调整机制
+
+**场景**：执行过程中发现问题，需要调整计划。
+
+```typescript
+// 场景 1：发现遗漏的步骤
+await executeTool('add_plan_step', {
+  afterStepId: 2,
+  step: {
+    title: '配置数据库连接',
+    description: '发现需要先配置数据库才能创建 API',
+  }
+});
+// → 前端通知："计划已更新，新增步骤"
+
+// 场景 2：步骤失败，需要重新规划
+await executeTool('replan_from_step', {
+  fromStepId: 3,
+  reason: '原方案使用 Prisma 失败，改用 Drizzle ORM',
+  newSteps: [
+    { title: '安装 Drizzle ORM', description: '...' },
+    { title: '重新实现注册 API（使用 Drizzle）', description: '...' },
+  ]
+});
+// → 前端显示："计划已调整，请确认新方案"
+// → 用户确认后继续执行
+```
+
+**调整策略**：
+
+| 调整类型 | 是否需要用户确认 | 说明 |
+|---------|---------------|------|
+| 新增步骤（小改动） | 否，通知即可 | 例如补充一个配置文件 |
+| 删除步骤 | 否，通知即可 | 发现某步骤不需要了 |
+| 重新规划（大改动） | **是** | 例如更换技术方案 |
+| 失败后重试 | 否，自动重试 | 同一步骤重试 ≤ 2 次 |
+
+#### 5.4.5 完整执行流程
+
+```
+1. 任务开始
+   ↓
+2. 多维度分析 → 选择模式（Plan / ReAct）
+   ↓
+3-A. ReAct 模式（简单任务）：
+   └─ 直接执行 Thought → Action → Observe 循环
+   ↓
+3-B. Plan 模式（复杂任务）：
+   ├─ Agent 调用 create_plan 工具
+   ├─ PlanStateManager 创建 Plan → 推送前端
+   ├─ Agent 调用 ask_user（等待用户确认）
+   ├─ 用户查看/编辑 Plan → 点击"开始执行"
+   └─ 按步骤执行（每步 ReAct 模式）：
+       ├─ update_plan_step(running)
+       ├─ 执行工具调用（ReAct 循环）
+       ├─ 如果发现问题：add_plan_step / replan_from_step
+       └─ update_plan_step(completed)
+   ↓
+4. 任务完成
+```
+
+### 5.5 上下文管理机制
+
+#### 5.5.1 核心设计理念
+
+**不持久化压缩后的对话，而是用项目级 Memory + Redis 缓存解决多轮对话问题。**
+
+```
+核心思路：
+├── 沙盒存活期间（15 分钟内）
+│   → 对话历史在 Redis 缓存中，多轮 iterate 直接读取
+│   → 零成本，无需持久化
+│
+├── Run 完成时
+│   → 提取关键信息 → 写入项目级 Memory
+│   → 例如："用户选择 JWT 认证"、"首页有 3 个 section"
+│
+└── 新沙盒启动时（iterate）
+    → 加载项目级 Memory（结构化摘要，几百字）
+    → 加载代码文件（文件系统恢复）
+    → 新的用户 Prompt
+    → Agent 有足够上下文继续工作
+```
+
+**为什么不持久化压缩后的对话？**
+
+| 方案 | 问题 |
+|------|------|
+| 持久化完整对话 | 存储成本高，加载慢 |
+| 持久化 LLM 摘要 | 摘要有信息损失，且"摘要的摘要"会失真 |
+| **项目级 Memory + 代码文件** | Memory 是结构化知识，代码即最新状态，零失真 |
+
+#### 5.5.2 多轮对话上下文衔接
+
+**Run ID 关系**：每次请求创建新 Run，但多个 Run 共享同一沙盒。
+
+```
+Run A (runId: "run-001", generate):
+  → 创建沙盒 → Agent Loop → 完成
+  → 对话历史写入 Redis 缓存（key: conversation:{projectId}）
+  → 提取 Memory → 沙盒保留 15 分钟
+
+Run B (runId: "run-002", iterate):  ← 新的 Run ID，复用沙盒
+  → 从 Redis 缓存加载 Run A 的对话历史
+  → 追加新用户消息
+  → Agent 基于完整上下文继续工作
+  → 完成 → 更新缓存 + 更新 Memory
+
+Run C (runId: "run-003", iterate):  ← 沙盒已过期，新沙盒
+  → Redis 缓存已过期
+  → 从数据库加载项目级 Memory + 代码文件
+  → Agent 基于 Memory + 当前代码状态工作
+```
+
+**Redis 缓存设计**：
+
+```typescript
+// 对话历史缓存（TTL = 沙盒生命周期）
+key: `conversation:${projectId}`
+value: JSON.stringify(messages)
+TTL: 900 (15 分钟，与沙盒 TTL 一致)
+```
+
+#### 5.5.3 运行时压缩（L1: In-Loop Compression）
+
+**目标**：防止单次 Run 内对话过长（仍然需要）。
+
+**核心策略**：按 Tool 重要性分级，选择性丢弃。
+
+**Tool 重要性分级**：
+
+| 分级 | Tool 类型 | 处理方式 | 原因 |
+|------|----------|---------|------|
+| **可丢弃** | `read_file` | 完全丢弃 | 文件随时可重新读取 |
+| **可丢弃** | `run_shell`（成功） | 丢弃输出，保留命令 | npm install 日志无价值 |
+| **可丢弃** | `get_preview_url` | 完全丢弃 | URL 是临时的 |
+| **可丢弃** | `write_file`（被覆盖） | 丢弃旧版本 | 中间版本无意义 |
+| **压缩保留** | `write_file`（最终版本） | 保留路径 + 摘要 | 代表当前项目状态 |
+| **压缩保留** | `run_shell`（失败） | 保留错误信息 | Agent 需避免重蹈覆辙 |
+| **必须保留** | `ask_user` | 完整保留 | 用户决策，不可重现 |
+| **必须保留** | 导致错误的调用 | 完整保留 | 上下文关键信息 |
+
+**实现方案**：
+
+```typescript
+// agent-runtime/src/context-compressor.ts
+
+interface CompressorConfig {
+  checkInterval: number;      // 每 N 步检查一次（默认 10）
+  maxTokens: number;          // token 上限（默认 60K）
+  recentRoundsToKeep: number; // 保留最近 N 轮完整（默认 5）
+}
+
+class InLoopCompressor {
+  private config: CompressorConfig = {
+    checkInterval: 10,
+    maxTokens: 60000,
+    recentRoundsToKeep: 5,
+  };
+
+  // 可安全丢弃的 Tool 类型
+  private discardableTools = new Set([
+    'read_file',
+    'get_preview_url',
+  ]);
+
+  // 可压缩的 Tool 类型（保留摘要）
+  private compressibleTools = new Set([
+    'write_file',
+    'run_shell',
+  ]);
+
+  // 必须保留的 Tool 类型
+  private criticalTools = new Set([
+    'ask_user',
+  ]);
+
+  shouldCompress(messages: Message[], currentStep: number): boolean {
+    if (currentStep % this.config.checkInterval !== 0) return false;
+    return this.estimateTokens(messages) > this.config.maxTokens;
+  }
+
+  compress(messages: Message[]): Message[] {
+    if (messages.length < 6) return messages;
+
+    const systemMsg = messages[0];
+    const recentStart = this.findRecentRoundsStart(
+      messages,
+      this.config.recentRoundsToKeep
+    );
+
+    const compressed: Message[] = [systemMsg];
+
+    // 早期轮次：按 Tool 重要性过滤
+    for (let i = 1; i < recentStart; i++) {
+      const msg = messages[i];
+
+      if (msg.role === 'user' && typeof msg.content === 'string') {
+        // 用户消息：始终保留（截断）
+        compressed.push({
+          role: 'user',
+          content: msg.content.slice(0, 500),
+        });
+        continue;
+      }
+
+      if (msg.role === 'assistant') {
+        // Assistant 消息：保留文本思考，按规则处理 tool_use
+        const filtered = this.filterAssistantContent(msg);
+        if (filtered) compressed.push(filtered);
+        continue;
+      }
+
+      if (msg.role === 'tool') {
+        // Tool 结果：按重要性决定保留/压缩/丢弃
+        const processed = this.processToolResult(msg);
+        if (processed) compressed.push(processed);
+        continue;
+      }
+    }
+
+    // 最近 N 轮：完整保留
+    compressed.push(...messages.slice(recentStart));
+    return compressed;
+  }
+
+  private processToolResult(msg: ToolMessage): Message | null {
+    const toolName = msg.name;
+
+    // 1. 可丢弃：直接跳过
+    if (this.discardableTools.has(toolName)) {
+      return null;
+    }
+
+    // 2. 必须保留：完整保留
+    if (this.criticalTools.has(toolName)) {
+      return msg;
+    }
+
+    // 3. 失败的调用：保留错误信息
+    if (msg.isError || msg.content?.includes('Error')) {
+      return {
+        ...msg,
+        content: `[ERROR] ${msg.content.slice(0, 300)}`,
+      };
+    }
+
+    // 4. write_file：保留路径，丢弃完整内容
+    if (toolName === 'write_file') {
+      return {
+        ...msg,
+        content: `[已写入文件: ${msg.filePath}]`,
+      };
+    }
+
+    // 5. run_shell（成功）：只保留命令
+    if (toolName === 'run_shell') {
+      return {
+        ...msg,
+        content: `[已执行: ${msg.command}] → 成功`,
+      };
+    }
+
+    // 6. 其他：截断
+    return {
+      ...msg,
+      content: msg.content.slice(0, 200) + '...',
+    };
+  }
+}
+```
+
+**在 Agent Loop 中使用**：
+
+```typescript
+// agent-runtime/src/loop.ts
+
+for (let step = 1; step <= maxSteps; step++) {
+  // ... LLM 调用、工具执行 ...
+
+  if (compressor.shouldCompress(messages, step)) {
+    const before = messages.length;
+    messages = compressor.compress(messages);
+    logger.info('Context compressed', {
+      step,
+      messages: `${before} → ${messages.length}`,
+    });
+    await eventEmitter.emit({ type: 'context_compressed', data: { step } });
+  }
+}
+```
+
+#### 5.5.4 项目级 Memory 提取（替代 L2/L3 压缩）
+
+**Run 完成时，自动提取关键信息写入项目级 Memory**：
+
+```typescript
+// agent-runtime/src/memory-extractor.ts
+
+class MemoryExtractor {
+  /**
+   * Run 完成后，从对话历史中提取项目级 Memory
+   */
+  async extractAndSave(
+    projectId: string,
+    messages: Message[],
+    memoryManager: IMemoryManager
+  ) {
+    // 1. 提取用户决策（从 ask_user 工具的问答中）
+    const decisions = this.extractUserDecisions(messages);
+
+    // 2. 提取技术选型（从 write_file、run_shell 中推断）
+    const techStack = this.extractTechStack(messages);
+
+    // 3. 提取项目结构（从文件操作中）
+    const structure = this.extractProjectStructure(messages);
+
+    // 4. 保存到项目级 Memory
+    await memoryManager.save({
+      type: 'project',
+      name: `run-summary-${Date.now()}`,
+      content: JSON.stringify({ decisions, techStack, structure }),
+      projectId,
+    });
+  }
+
+  private extractUserDecisions(messages: Message[]): string[] {
+    // 从 ask_user 的问答对中提取
+    const decisions: string[] = [];
+    for (const msg of messages) {
+      if (msg.role === 'tool' && msg.name === 'ask_user') {
+        decisions.push(msg.content); // 用户的回答
+      }
+    }
+    return decisions;
+  }
+
+  private extractTechStack(messages: Message[]): Record<string, string> {
+    // 从 package.json 写入、npm install 等推断
+    const stack: Record<string, string> = {};
+    for (const msg of messages) {
+      if (msg.role === 'tool' && msg.name === 'write_file') {
+        if (msg.filePath === 'package.json') {
+          // 解析依赖
+          try {
+            const pkg = JSON.parse(msg.content);
+            Object.assign(stack, pkg.dependencies || {});
+          } catch {}
+        }
+      }
+    }
+    return stack;
+  }
+}
+```
+
+#### 5.5.5 完整上下文管理流程
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 1. Run 开始                                                  │
+│    沙盒复用？ → 从 Redis 缓存读取对话历史                     │
+│    新沙盒？  → 加载项目级 Memory + 恢复代码文件               │
+├─────────────────────────────────────────────────────────────┤
+│ 2. 执行过程中                                                │
+│    每 10 步检查 token 数                                     │
+│    超过 60K → 触发 L1 运行时压缩                             │
+│    按 Tool 重要性分级：丢弃/压缩/保留                         │
+├─────────────────────────────────────────────────────────────┤
+│ 3. Run 完成                                                  │
+│    对话历史 → Redis 缓存（TTL 15 分钟，供复用）               │
+│    提取关键信息 → 写入项目级 Memory                           │
+│    代码文件 → 同步到数据库                                    │
+├─────────────────────────────────────────────────────────────┤
+│ 4. 下次 iterate                                              │
+│    沙盒还在 → 读缓存（完整对话，零损失）                      │
+│    沙盒过期 → Memory + 代码文件（结构化知识，无失真）          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**与旧方案对比**：
+
+| 维度 | 旧方案（三层压缩） | 新方案（Memory + 缓存） |
+|------|-------------------|----------------------|
+| 多轮对话 | 持久化压缩对话 → 加载 → 再压缩 | 缓存命中直接用，否则 Memory + 代码 |
+| 信息损失 | 摘要会逐步失真 | Memory 是结构化知识，零失真 |
+| 存储成本 | ~200KB/项目（压缩后对话） | ~5KB/项目（Memory 条目） |
+| 实现复杂度 | 高（三层压缩器 + LLM 摘要） | 低（一层 L1 + Memory 提取） |
+| LLM 额外调用 | 每次保存/加载都要摘要 | 只在提取 Memory 时调用一次 |
+
+### 5.6 MCP 和 CLI 扩展能力（预留）
+
+**当前阶段**：只预留接口和配置模型，不实现具体逻辑。
+
+#### 5.6.1 能力架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Agent 能力层                              │
+├─────────────────────────────────────────────────────────────┤
+│ L1: 内置工具（Built-in Tools）                                │
+│   - write_file, read_file, run_shell, get_preview_url       │
+│   - 直接在 tools.ts 中实现                                    │
+├─────────────────────────────────────────────────────────────┤
+│ L2: Skill（可组合的高级能力）                                 │
+│   - 由多个内置工具组合而成                                     │
+│   - 用户级 / 项目级持久化                                     │
+├─────────────────────────────────────────────────────────────┤
+│ L3: MCP（Model Context Protocol）[预留]                      │
+│   - 连接外部服务：GitHub, Figma, Database                    │
+│   - 通过 MCP Server 提供标准化接口                            │
+│   - 区分用户级 / 项目级 MCP Server 配置                       │
+├─────────────────────────────────────────────────────────────┤
+│ L4: CLI（命令行工具）[预留]                                   │
+│   - 在沙盒内执行任意 CLI 命令                                 │
+│   - 命令白名单 + 超时控制                                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 5.6.2 预留接口设计
+
+```typescript
+// agent-runtime/src/mcp-manager.ts
+
+export interface IMCPManager {
+  listServers(): Promise<MCPServerConfig[]>;
+  callTool(server: string, method: string, args: any): Promise<any>;
+  connect(serverConfig: MCPServerConfig): Promise<void>;
+  disconnect(serverName: string): Promise<void>;
+}
+
+// 占位实现
+export class MCPManager implements IMCPManager {
+  async listServers(): Promise<MCPServerConfig[]> {
+    console.warn('[MCPManager] not implemented yet');
+    return [];
+  }
+  async callTool(server: string, method: string, args: any): Promise<any> {
+    throw new Error('MCP not implemented yet');
+  }
+  async connect(config: MCPServerConfig): Promise<void> {}
+  async disconnect(name: string): Promise<void> {}
+}
+
+// 数据模型（预留）
+interface MCPServerConfig {
+  name: string;           // 'github', 'figma'
+  command: string;        // 启动命令
+  args: string[];         // 启动参数
+  scope: 'global' | 'user' | 'project';
+  userId?: string;
+  projectId?: string;
+  env?: Record<string, string>;  // 环境变量（Token 等）
+}
+```
+
+#### 5.6.3 安全考虑
+
+- **沙盒隔离**：CLI 命令只能在沙盒内执行，无法访问宿主机
+- **命令白名单**：可配置允许的命令列表
+- **超时控制**：命令执行超过 30 秒自动终止
+- **MCP Token 管理**：用户级 Token 加密存储，运行时注入环境变量
+
+### 5.7 实施优先级
+
+| 优先级 | 模块 | 说明 |
+|--------|------|------|
+| **P0（当前实现）** | SkillManager + ReAct 模式 + L1 压缩 | 最小可用版本 |
+| **P1（下个版本）** | Plan + ReAct 混合模式 + L2/L3 压缩 | 复杂任务支持 |
+| **P2（未来）** | Memory 系统（向量搜索） | 长期记忆 |
+| **P3（未来）** | MCP + CLI 集成 | 外部能力扩展 |
 
 ---
 
@@ -2269,12 +2911,8 @@ export class SandboxSessionManager {
           data: { expiresAt: new Date(Date.now() + SESSION_TTL) },
         });
         
-        console.log(`[Session] Reused sandbox ${session.sandboxId.slice(0, 8)} for project ${projectId.slice(0, 8)}`);
-        
         return { sandbox, isReused: true };
       } catch (error) {
-        console.warn(`[Session] Failed to reconnect sandbox ${session.sandboxId}:`, error);
-        
         await prisma.sandboxSession.update({
           where: { projectId },
           data: { status: 'expired' },
@@ -2293,7 +2931,6 @@ export class SandboxSessionManager {
         LLM_BASE_URL: process.env.LLM_BASE_URL!,
         LLM_MODEL: process.env.LLM_MODEL!,
         AXIOM_TOKEN: process.env.AXIOM_TOKEN!,
-        E2B_SANDBOX_ID: sandbox.sandboxId,
       },
     });
     
@@ -2317,8 +2954,6 @@ export class SandboxSessionManager {
       },
     });
     
-    console.log(`[Session] Created new sandbox ${sandbox.sandboxId.slice(0, 8)} for project ${projectId.slice(0, 8)}`);
-    
     return { sandbox, isReused: false };
   }
   
@@ -2336,15 +2971,13 @@ export class SandboxSessionManager {
       const sandbox = await Sandbox.connect(session.sandboxId);
       await sandbox.kill();
     } catch (error) {
-      console.warn(`[Session] Failed to kill sandbox ${session.sandboxId}:`, error);
+      console.warn(`[Session] Failed to kill sandbox:`, error);
     }
     
     await prisma.sandboxSession.update({
       where: { projectId },
       data: { status: 'stopped', stoppedAt: new Date() },
     });
-    
-    console.log(`[Session] Terminated sandbox ${session.sandboxId.slice(0, 8)}`);
   }
 }
 
@@ -2361,21 +2994,16 @@ import { sandboxSessionManager } from './sandbox-session';
 
 export async function dispatchRun(runId: string, projectId: string) {
   const run = await prisma.projectRun.findUnique({ where: { id: runId } });
-  
-  if (!run) {
-    throw new Error(`Run ${runId} not found`);
-  }
+  if (!run) throw new Error(`Run ${runId} not found`);
   
   // 1. 确定运行模式
-  const mode = await determineMode(runId, run.type);
+  const mode = run.type === 'generate' ? 'generate' : 'iterate';
   
   // 2. 获取或创建沙盒（自动复用）
   const { sandbox, isReused } = await sandboxSessionManager.acquireForProject(projectId);
   
   // 3. 如果是复用且是 iterate 模式，跳过文件恢复
   const skipFileRestore = isReused && mode === 'iterate';
-  
-  console.log(`[Dispatcher] Starting Agent Runtime | run=${runId.slice(0, 8)} | mode=${mode} | reused=${isReused}`);
   
   // 4. 执行 Agent Runtime
   const process = await sandbox.process.start({
@@ -2384,14 +3012,9 @@ export async function dispatchRun(runId: string, projectId: string) {
   
   // 5. 监听退出
   process.on('exit', async (exitCode) => {
-    console.log(`[Dispatcher] Agent Runtime exited | run=${runId.slice(0, 8)} | code=${exitCode}`);
-    
-    // 根据退出码决定是否保留沙盒
     if (exitCode === 0) {
-      // 成功：保留沙盒 15 分钟（复用）
       console.log(`[Dispatcher] Keeping sandbox for reuse`);
     } else {
-      // 失败/取消：立即清理
       await sandboxSessionManager.terminateSession(projectId);
     }
   });
@@ -2401,20 +3024,6 @@ export async function dispatchRun(runId: string, projectId: string) {
     where: { id: runId },
     data: { sandboxId: sandbox.sandboxId },
   });
-}
-
-async function determineMode(runId: string, runType: string): Promise<'generate' | 'iterate' | 'resume'> {
-  // 检查是否有 LoopState（resume）
-  const loopState = await prisma.loopState.findUnique({
-    where: { runId },
-  });
-  
-  if (loopState && loopState.answer) {
-    return 'resume';
-  }
-  
-  // 根据 run.type 决定
-  return runType === 'generate' ? 'generate' : 'iterate';
 }
 ```
 
@@ -2433,59 +3042,31 @@ const worker = new Worker<AgentJobData>(
   QUEUE_NAME,
   async (job) => {
     const { runId, projectId } = job.data;
-    console.log(`[Worker] Job ${job.id} started | run=${runId.slice(0, 8)}`);
 
     // 乐观锁：queued → running
     const claimed = await prisma.projectRun.updateMany({
       where: { id: runId, status: "queued" },
-      data: {
-        status: "running",
-        startedAt: new Date(),
-      },
+      data: { status: "running", startedAt: new Date() },
     });
 
-    if (claimed.count === 0) {
-      console.log(`[Worker] Run ${runId.slice(0, 8)} 不再是 queued，跳过`);
-      return;
-    }
+    if (claimed.count === 0) return;
 
     try {
-      // 调度到沙盒（不阻塞，立即返回）
       await dispatchRun(runId, projectId);
-      
-      console.log(`[Worker] Job ${job.id} dispatched`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error(`[Worker] Job ${job.id} failed: ${message}`);
-
-      // 兜底：确保 run 不会永久卡在 running 状态
       await prisma.projectRun.update({
         where: { id: runId },
-        data: {
-          status: 'failed',
-          error: message,
-          finishedAt: new Date(),
-        },
-      }).catch((e: unknown) => {
-        console.error(`[Worker] Failed to update run status: ${e instanceof Error ? e.message : e}`);
-      });
-
+        data: { status: 'failed', error: message, finishedAt: new Date() },
+      }).catch(() => {});
       throw error;
     }
   },
   {
     connection: redis,
-    concurrency: 50, // 大幅提升并发
+    concurrency: 50,
   }
 );
-
-worker.on("completed", (job) => {
-  console.log(`[Worker] Job ${job.id} completed`);
-});
-
-worker.on("failed", (job, err) => {
-  console.error(`[Worker] Job ${job?.id} failed: ${err.message}`);
-});
 ```
 
 ---
