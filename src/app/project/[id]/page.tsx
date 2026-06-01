@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { SessionSidebar } from "@/components/session-sidebar";
 import { ChatPanel } from "@/components/chat-panel";
 import { PreviewPanel } from "@/components/preview-panel";
+import { ResizeHandle } from "@/components/resize-handle";
 import { useProjectStream } from "@/hooks/use-project-stream";
 import type { ClarificationData } from "@/hooks/use-project-stream";
 
@@ -30,6 +31,8 @@ export default function ProjectPage({
   const [sending, setSending] = useState(false);
   const [hasActiveRun, setHasActiveRun] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [previewCollapsed, setPreviewCollapsed] = useState(false);
+  const [chatWidth, setChatWidth] = useState(420);
   const [analyzing, setAnalyzing] = useState(false);
   const [localClarification, setLocalClarification] = useState<ClarificationData | null>(null);
   const { state, reset, forceIdle, answerDone } = useProjectStream(projectId);
@@ -138,6 +141,10 @@ export default function ProjectPage({
     router.replace("/project/new");
   }, [router]);
 
+  const handleResize = useCallback((deltaX: number) => {
+    setChatWidth((w) => Math.max(320, Math.min(800, w + deltaX)));
+  }, []);
+
   const handleSend = useCallback(
     async (content: string, clarificationResponse?: Record<string, unknown>) => {
       // 如果是 clarification 提交，清掉本地 clarification
@@ -213,7 +220,10 @@ export default function ProjectPage({
       </div>
 
       {/* Middle: Chat + Activity trail */}
-      <div className="w-[420px] flex-shrink-0 border-r border-gray-200">
+      <div
+        className={`border-r border-gray-200 ${previewCollapsed ? "flex-1 min-w-0" : "flex-shrink-0"}`}
+        style={previewCollapsed ? undefined : { width: chatWidth }}
+      >
         <ChatPanel
           projectId={projectId || ""}
           messages={messages}
@@ -227,15 +237,31 @@ export default function ProjectPage({
         />
       </div>
 
+      {/* Resize handle */}
+      {!previewCollapsed && <ResizeHandle onResize={handleResize} />}
+
       {/* Right: Preview */}
-      <div className="flex-1 min-w-0 border-l border-gray-200">
+      <div className={`border-l border-gray-200 transition-all duration-200 ${previewCollapsed ? "w-0 overflow-hidden" : "flex-1 min-w-0"}`}>
         <PreviewPanel
           previewUrl={state.previewUrl}
           isBuilding={isGenerating}
           phase={state.phase}
           stopped={state.phase === "idle" && state.message === "已停止"}
+          collapsed={previewCollapsed}
+          onToggleCollapse={() => setPreviewCollapsed((v) => !v)}
         />
       </div>
+
+      {/* Collapse toggle when preview is hidden */}
+      {previewCollapsed && (
+        <button
+          onClick={() => setPreviewCollapsed(false)}
+          className="w-[36px] flex-shrink-0 border-l border-gray-200 bg-gray-50 flex items-center justify-center hover:bg-gray-100 transition-colors"
+          title="展开预览"
+        >
+          <span className="text-gray-400 text-xs [writing-mode:vertical-rl]">预览</span>
+        </button>
+      )}
     </div>
   );
 }

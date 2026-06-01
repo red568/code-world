@@ -2,17 +2,21 @@
 
 import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { ExternalLink, Monitor, RefreshCw, Code2, Square } from "lucide-react";
+import { ExternalLink, Monitor, RefreshCw, Code2, Square, PanelRightClose } from "lucide-react";
 
 interface PreviewPanelProps {
   previewUrl: string | null;
   isBuilding: boolean;
   phase: string;
   stopped?: boolean;
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
 }
 
-export function PreviewPanel({ previewUrl, isBuilding, phase, stopped }: PreviewPanelProps) {
+export function PreviewPanel({ previewUrl, isBuilding, phase, stopped, collapsed, onToggleCollapse }: PreviewPanelProps) {
   const [iframeKey, setIframeKey] = useState(0);
+
+  if (collapsed) return null;
 
   return (
     <div className="flex flex-col h-full bg-white">
@@ -31,26 +35,37 @@ export function PreviewPanel({ previewUrl, isBuilding, phase, stopped }: Preview
             <span className="text-xs text-gray-400">预览地址</span>
           )}
         </div>
-        {previewUrl && (
-          <div className="flex items-center gap-1">
+        <div className="flex items-center gap-1">
+          {previewUrl && (
+            <>
+              <button
+                onClick={() => setIframeKey((k) => k + 1)}
+                className="p-1.5 text-gray-400 hover:text-gray-600 transition-colors"
+                title="刷新预览"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+              </button>
+              <a
+                href={previewUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="p-1.5 text-gray-400 hover:text-gray-600 transition-colors"
+                title="在新窗口打开"
+              >
+                <ExternalLink className="w-3.5 h-3.5" />
+              </a>
+            </>
+          )}
+          {onToggleCollapse && (
             <button
-              onClick={() => setIframeKey((k) => k + 1)}
+              onClick={onToggleCollapse}
               className="p-1.5 text-gray-400 hover:text-gray-600 transition-colors"
-              title="刷新预览"
+              title="折叠预览面板"
             >
-              <RefreshCw className="w-3.5 h-3.5" />
+              <PanelRightClose className="w-3.5 h-3.5" />
             </button>
-            <a
-              href={previewUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="p-1.5 text-gray-400 hover:text-gray-600 transition-colors"
-              title="在新窗口打开"
-            >
-              <ExternalLink className="w-3.5 h-3.5" />
-            </a>
-          </div>
-        )}
+          )}
+        </div>
       </div>
 
       {/* Preview area */}
