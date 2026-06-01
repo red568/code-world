@@ -26,17 +26,30 @@ export interface IntentAnalysis {
 // ─── 快速跳过判断 ────────────────────────────────────────────────────────────────
 
 export function shouldSkipIntentAnalysis(content: string, isFirstMessage: boolean): boolean {
+  console.log(`[Intent] shouldSkipIntentAnalysis | isFirstMessage=${isFirstMessage} | length=${content.length} | content="${content.slice(0, 50)}"`);
+
   // 首轮消息：不限制长度，都进行意图分析（除非是明确的修改指令）
   if (isFirstMessage) {
     // 首轮如果是明确的修改指令，跳过（这种情况很少见）
-    if (/^(把|将|修改|删除|去掉|添加|加个|换成|改成)/.test(content)) return true;
+    if (/^(把|将|修改|删除|去掉|添加|加个|换成|改成)/.test(content)) {
+      console.log(`[Intent] shouldSkipIntentAnalysis | SKIP | reason=明确修改指令`);
+      return true;
+    }
+    console.log(`[Intent] shouldSkipIntentAnalysis | ANALYZE | reason=首轮消息`);
     return false;
   }
 
   // 非首轮：短消息或明确修改指令跳过
-  if (content.length < 80) return true;
-  if (/^(把|将|修改|删除|去掉|添加|加个|换成|改成)/.test(content)) return true;
+  if (content.length < 80) {
+    console.log(`[Intent] shouldSkipIntentAnalysis | SKIP | reason=非首轮短消息`);
+    return true;
+  }
+  if (/^(把|将|修改|删除|去掉|添加|加个|换成|改成)/.test(content)) {
+    console.log(`[Intent] shouldSkipIntentAnalysis | SKIP | reason=明确修改指令`);
+    return true;
+  }
 
+  console.log(`[Intent] shouldSkipIntentAnalysis | ANALYZE | reason=非首轮长消息`);
   return false;
 }
 
@@ -87,6 +100,8 @@ const INTENT_ANALYSIS_PROMPT = `你是一个需求分析助手。用户想要构
 // ─── 主函数 ──────────────────────────────────────────────────────────────────────
 
 export async function analyzeIntent(userInput: string): Promise<IntentAnalysis> {
+  console.log(`[Intent] analyzeIntent | START | input="${userInput.slice(0, 100)}"`);
+
   const raw = await chatCompletion(
     [
       { role: "system", content: INTENT_ANALYSIS_PROMPT },
@@ -100,9 +115,12 @@ export async function analyzeIntent(userInput: string): Promise<IntentAnalysis> 
     }
   );
 
+  console.log(`[Intent] analyzeIntent | LLM response | raw="${raw.slice(0, 200)}"`);
+
   const parsed = safeJsonParse<IntentAnalysis>(raw, "intent-analysis");
 
   if (!parsed.clarity || !parsed.rewritten_query) {
+    console.log(`[Intent] analyzeIntent | FALLBACK | reason=解析失败或缺少字段`);
     return {
       clarity: "high",
       intent: "other",
@@ -117,6 +135,11 @@ export async function analyzeIntent(userInput: string): Promise<IntentAnalysis> 
 
   if (parsed.missing_info && parsed.missing_info.length > 3) {
     parsed.missing_info = parsed.missing_info.slice(0, 3);
+  }
+
+  console.log(`[Intent] analyzeIntent | RESULT | clarity=${parsed.clarity} | intent=${parsed.intent} | missing_info_count=${parsed.missing_info?.length || 0}`);
+  if (parsed.missing_info && parsed.missing_info.length > 0) {
+    console.log(`[Intent] analyzeIntent | missing_info:`, JSON.stringify(parsed.missing_info, null, 2));
   }
 
   return parsed;
