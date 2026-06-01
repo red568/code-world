@@ -40,7 +40,7 @@ export const LLM_PROVIDERS: Record<string, LLMProviderConfig> = {
 };
 
 export function getProviderConfig(provider?: string): LLMProviderConfig {
-  const key = provider || process.env.LLM_PROVIDER || "kimi";
+  const key = provider || process.env.LLM_PROVIDER || "deepseek";
   const config = LLM_PROVIDERS[key];
   if (!config) {
     throw new Error(

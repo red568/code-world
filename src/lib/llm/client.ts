@@ -1,7 +1,7 @@
 /**
  * LLM 客户端
  *
- * 使用 OpenAI SDK 调用所有兼容接口（Kimi、OpenAI、DeepSeek 等）。
+ * 使用 OpenAI SDK 调用所有兼容接口（DeepSeek、OpenAI、Anthropic、Kimi 等）。
  * 支持流式和非流式两种调用方式。
  */
 

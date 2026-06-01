@@ -6,7 +6,7 @@
 
 "use client";
 
-import { useEffect, useCallback, useReducer } from "react";
+import { useEffect, useCallback, useReducer, useRef } from "react";
 
 // ─── 状态类型 ────────────────────────────────────────────────────────────────────
 
@@ -14,16 +14,37 @@ export type ProjectPhase =
   | "idle"
   | "code_generating"
   | "running"
-  | "failed";
+  | "failed"
+  | "waiting_for_clarification"
+  | "waiting_for_answer";
 
 export interface AgentStep {
   id: number;
-  type: "thinking" | "file" | "command" | "read" | "preview" | "error";
+  type: "thinking" | "file" | "command" | "read" | "preview" | "error" | "ask_user";
   label: string;
   detail?: string;
   status: "active" | "done" | "error" | "stopped";
   startedAt: number;
   finishedAt?: number;
+}
+
+export interface AskUserOption {
+  label: string;
+  description: string;
+}
+
+export interface ClarificationData {
+  clarity: "medium" | "low";
+  rewritten_query: string;
+  missing_info: { aspect: string; question: string; options: string[] }[];
+}
+
+export interface AskUserData {
+  runId: string;
+  question: string;
+  options: AskUserOption[];
+  context: string;
+  answerToken: string;
 }
 
 export interface StreamState {
@@ -33,6 +54,8 @@ export interface StreamState {
   previewUrl: string | null;
   error: string | null;
   connected: boolean;
+  clarification: ClarificationData | null;
+  askUser: AskUserData | null;
 }
 
 // ─── Reducer ─────────────────────────────────────────────────────────────────────
@@ -51,6 +74,10 @@ type StreamAction =
   | { type: "BUILD_LOG"; line: string }
   | { type: "PREVIEW_READY"; previewUrl: string }
   | { type: "ERROR"; message: string }
+  | { type: "CLARIFICATION_NEEDED"; data: ClarificationData }
+  | { type: "CLARIFICATION_RESOLVED" }
+  | { type: "ASK_USER"; data: AskUserData }
+  | { type: "ASK_USER_ANSWERED" }
   | { type: "RESET" };
 
 const initialState: StreamState = {
@@ -60,6 +87,8 @@ const initialState: StreamState = {
   previewUrl: null,
   error: null,
   connected: false,
+  clarification: null,
+  askUser: null,
 };
 
 function finishLastActive(steps: AgentStep[], type?: AgentStep["type"]): AgentStep[] {
@@ -91,6 +120,8 @@ function toolLabel(tool: string, args: Record<string, unknown>): string {
       return `$ ${((args.command as string) || "").slice(0, 50)}`;
     case "get_preview_url":
       return "获取预览地址";
+    case "ask_user":
+      return "等待用户确认";
     default:
       return tool;
   }
@@ -107,6 +138,8 @@ function toolStepType(tool: string): AgentStep["type"] {
       return "command";
     case "get_preview_url":
       return "preview";
+    case "ask_user":
+      return "ask_user";
     default:
       return "command";
   }
@@ -135,6 +168,7 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
           steps: [],
           error: null,
           previewUrl: null,
+          askUser: null,
         };
       }
       if (phase === "running") {
@@ -243,6 +277,35 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
       stepId = 0;
       return { ...initialState };
 
+    case "CLARIFICATION_NEEDED":
+      return { ...state, phase: "waiting_for_clarification", clarification: action.data };
+
+    case "CLARIFICATION_RESOLVED":
+      return { ...state, phase: "code_generating", clarification: null };
+
+    case "ASK_USER": {
+      const steps = finishLastActive(state.steps, "thinking");
+      const newStep: AgentStep = {
+        id: ++stepId,
+        type: "ask_user",
+        label: action.data.question.slice(0, 60),
+        status: "active",
+        startedAt: Date.now(),
+      };
+      return { ...state, phase: "waiting_for_answer", askUser: action.data, steps: [...steps, newStep] };
+    }
+
+    case "ASK_USER_ANSWERED": {
+      const now = Date.now();
+      const steps = state.steps.map((s) => {
+        if (s.status === "active" && s.type === "ask_user") {
+          return { ...s, status: "done" as const, finishedAt: now };
+        }
+        return s;
+      });
+      return { ...state, phase: "code_generating", askUser: null, steps };
+    }
+
     default:
       return state;
   }
@@ -252,17 +315,23 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
 
 export function useProjectStream(projectId: string | null) {
   const [state, dispatch] = useReducer(streamReducer, initialState);
+  const prevProjectIdRef = useRef<string | null>(null);
 
   const reset = useCallback(() => dispatch({ type: "RESET" }), []);
   const forceIdle = useCallback(
     () => dispatch({ type: "STATUS_CHANGE", status: "stopped", message: "已停止" }),
     []
   );
+  const answerDone = useCallback(() => dispatch({ type: "ASK_USER_ANSWERED" }), []);
 
   useEffect(() => {
     if (!projectId) return;
 
-    dispatch({ type: "RESET" });
+    const isNewCreation = prevProjectIdRef.current === null;
+    prevProjectIdRef.current = projectId;
+    if (!isNewCreation) {
+      dispatch({ type: "RESET" });
+    }
 
     const eventSource = new EventSource(`/api/projects/${projectId}/stream`);
 
@@ -310,6 +379,20 @@ export function useProjectStream(projectId: string | null) {
       dispatch({ type: "PREVIEW_READY", previewUrl: data.previewUrl });
     });
 
+    eventSource.addEventListener("clarification_needed", (e) => {
+      const data = JSON.parse(e.data);
+      dispatch({ type: "CLARIFICATION_NEEDED", data });
+    });
+
+    eventSource.addEventListener("clarification_resolved", () => {
+      dispatch({ type: "CLARIFICATION_RESOLVED" });
+    });
+
+    eventSource.addEventListener("ask_user", (e) => {
+      const data = JSON.parse(e.data);
+      dispatch({ type: "ASK_USER", data });
+    });
+
     eventSource.addEventListener("error", (e) => {
       if (e instanceof MessageEvent) {
         const data = JSON.parse(e.data);
@@ -324,5 +407,5 @@ export function useProjectStream(projectId: string | null) {
     };
   }, [projectId]);
 
-  return { state, reset, forceIdle };
+  return { state, reset, forceIdle, answerDone };
 }

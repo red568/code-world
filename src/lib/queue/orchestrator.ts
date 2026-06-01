@@ -65,6 +65,27 @@ export async function orchestrateRun(
     return;
   }
 
+  // 检查是否是从 ask_user 恢复的 run（原子 claim，防止重复入队导致双重执行）
+  const loopState = await prisma.loopState.findUnique({ where: { runId } });
+  if (loopState) {
+    const state = loopState.state as Record<string, unknown>;
+    if (state.resumeReady) {
+      // 用 answerToken 做 claim：单条 UPDATE 天然串行，只有第一个 worker 能 match
+      const claimed = await prisma.loopState.updateMany({
+        where: { runId, answerToken: loopState.answerToken },
+        data: { answerToken: "" },
+      });
+
+      if (claimed.count === 0) {
+        log(projectId, "start", `Resume 已被其他 worker 领取，跳过 | run=${runId.slice(0, 8)}`);
+        return;
+      }
+
+      await executeResume(runId, projectId, loopState);
+      return;
+    }
+  }
+
   if (run.type === "generate") {
     await executeGenerate(runId, projectId, run.prompt);
   } else {
@@ -112,6 +133,11 @@ async function executeGenerate(
       userMessage: prompt,
       maxSteps: 50,
     });
+
+    if (result.suspended) {
+      log(projectId, "agent", "Agent Loop 挂起等待用户");
+      return;
+    }
 
     const totalDuration = ((Date.now() - totalStart) / 1000).toFixed(1);
     await handleResult(runId, projectId, result, sandbox, instance.sandboxId, totalDuration, false);
@@ -207,10 +233,90 @@ async function executeIterate(
       maxSteps: 50,
     });
 
+    if (result.suspended) {
+      log(projectId, "agent", "Agent Loop 挂起等待用户");
+      return;
+    }
+
     const totalDuration = ((Date.now() - totalStart) / 1000).toFixed(1);
     await handleResult(runId, projectId, result, sandbox, finalSandboxId, totalDuration, isReused);
   } catch (error) {
     await handleError(error, runId, projectId, sandbox, isReused);
+  }
+}
+
+// ─── Resume 流程（从 ask_user 恢复）─────────────────────────────────────────────
+
+async function executeResume(
+  runId: string,
+  projectId: string,
+  loopState: { messages: unknown; step: number; state: unknown }
+): Promise<void> {
+  let sandbox: Sandbox | null = null;
+  const totalStart = Date.now();
+  const state = loopState.state as Record<string, unknown>;
+  const userAnswer = state.userAnswer as string;
+  const completedToolResults = (state.completedToolResults || []) as { tool_call_id: string; content: string }[];
+  const pendingToolCallId = state.pendingToolCallId as string;
+  const savedStep = loopState.step;
+  const askUserCount = (state.askUserCount || 0) as number;
+  const savedPreviewUrl = (state.previewUrl || null) as string | null;
+
+  log(projectId, "resume", `恢复 Agent Loop | run=${runId.slice(0, 8)} | step=${savedStep}`);
+
+  try {
+    await publishStatusChange(projectId, "code_generating", "Agent 继续工作...");
+
+    // 重建 messages
+    const savedMessages = loopState.messages as Messages;
+    const messages: Messages = [...savedMessages];
+    for (const result of completedToolResults) {
+      messages.push({ role: "tool", content: result.content, tool_call_id: result.tool_call_id });
+    }
+    messages.push({ role: "tool", content: userAnswer, tool_call_id: pendingToolCallId });
+
+    // 恢复沙箱
+    sandbox = await tryReuseSandbox(projectId);
+    if (!sandbox) {
+      log(projectId, "sandbox", "创建 E2B 沙箱...");
+      const instance = await createSandbox();
+      sandbox = instance.sandbox;
+      await writeTemplateFiles(sandbox);
+
+      const dbFiles = await prisma.projectFile.findMany({ where: { projectId } });
+      for (const file of dbFiles) {
+        const fullPath = `/home/user/app/${file.path}`;
+        const dir = fullPath.split("/").slice(0, -1).join("/");
+        await sandbox.commands.run(`mkdir -p ${dir}`);
+        await sandbox.files.write(fullPath, file.content);
+      }
+      log(projectId, "sandbox", `恢复文件 | count=${dbFiles.length}`);
+    }
+
+    const result = await agentLoop({
+      runId,
+      projectId,
+      sandbox,
+      systemPrompt: BUILDER_SYSTEM_PROMPT,
+      userMessage: "",
+      existingMessages: messages,
+      maxSteps: 50,
+      initialStep: savedStep,
+      initialAskUserCount: askUserCount,
+    });
+
+    if (result.suspended) {
+      log(projectId, "resume", "再次挂起等待用户");
+      return;
+    }
+
+    // 清理 loopState（仅在 loop 正常结束时，不能删除再次挂起时保存的新存档）
+    await prisma.loopState.delete({ where: { runId } }).catch(() => {});
+
+    const totalDuration = ((Date.now() - totalStart) / 1000).toFixed(1);
+    await handleResult(runId, projectId, result, sandbox, undefined, totalDuration, true);
+  } catch (error) {
+    await handleError(error, runId, projectId, sandbox, true);
   }
 }
 

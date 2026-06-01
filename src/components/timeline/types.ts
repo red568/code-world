@@ -6,7 +6,8 @@ export type StepType =
   | "command"
   | "read"
   | "preview"
-  | "error";
+  | "error"
+  | "ask_user";
 
 export interface TimelineStep {
   id: string;
