@@ -106,14 +106,8 @@ export async function POST(
     }
 
     // clarity: medium 或 low → 推送选项让用户选择
-    // 先保存用户消息（但不创建 run）
-    const message = await prisma.message.create({
-      data: {
-        projectId: id,
-        role: "user",
-        content: trimmedContent,
-      },
-    });
+    // 不在此处保存 message，等用户确认后由 branch 1 的 createMessageAndRun 统一保存
+    // 避免重复写入
 
     await publishEvent(id, {
       type: "clarification_needed",
@@ -126,7 +120,7 @@ export async function POST(
 
     console.log(`[API] POST /api/projects/${id.slice(0, 8)}/messages | 202 | clarity=${analysis.clarity} | awaiting clarification`);
     return Response.json(
-      { message, clarification: analysis, awaiting_clarification: true },
+      { clarification: analysis, awaiting_clarification: true },
       { status: 202 }
     );
   } catch (error) {

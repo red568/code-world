@@ -65,11 +65,22 @@ export async function orchestrateRun(
     return;
   }
 
-  // 检查是否是从 ask_user 恢复的 run
+  // 检查是否是从 ask_user 恢复的 run（原子 claim，防止重复入队导致双重执行）
   const loopState = await prisma.loopState.findUnique({ where: { runId } });
   if (loopState) {
     const state = loopState.state as Record<string, unknown>;
     if (state.resumeReady) {
+      // 用 answerToken 做 claim：单条 UPDATE 天然串行，只有第一个 worker 能 match
+      const claimed = await prisma.loopState.updateMany({
+        where: { runId, answerToken: loopState.answerToken },
+        data: { answerToken: "" },
+      });
+
+      if (claimed.count === 0) {
+        log(projectId, "start", `Resume 已被其他 worker 领取，跳过 | run=${runId.slice(0, 8)}`);
+        return;
+      }
+
       await executeResume(runId, projectId, loopState);
       return;
     }

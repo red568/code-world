@@ -653,3 +653,106 @@ model LoopState {
 | Devin | Plan → Confirm → Execute | 计划确认制 |
 | Bolt.new | 直接执行 + 快速迭代 | 对比：不确认但允许快速修改 |
 | Dialogflow | Intent + Slot Filling | 结构化意图分类思路 |
+
+## 12. Code Review 发现的 P0 问题
+
+### 12.1 `/answer` 路由竞态 — 同一 run 被双重执行
+
+**问题描述**
+
+`/api/projects/:id/answer` 中，状态检查（`status !== "waiting_for_user"`）和状态更新（`status → "running"`）之间没有原子保护。双击按钮、网络重试等场景下：
+
+```
+请求A: 读取 status = "waiting_for_user" ✓
+请求B: 读取 status = "waiting_for_user" ✓  (请求A的 update 还没落盘)
+请求A: update status → "running", enqueueRun
+请求B: update status → "running", enqueueRun  ← 同一个 run 被入队两次
+```
+
+后果：两个 worker 并行执行同一个 run，写同一批文件，输出交叉、数据损坏。
+
+**解决思路**
+
+用带条件的 `updateMany` 做乐观锁，把"检查+翻转"合成一条原子 SQL：
+
+```typescript
+const claimed = await prisma.projectRun.updateMany({
+  where: { id: runId, status: "waiting_for_user" },
+  data: { status: "running" },
+});
+if (claimed.count === 0) {
+  return Response.json({ error: "Run is not waiting for user input" }, { status: 409 });
+}
+```
+
+单条 UPDATE 在数据库层面天然串行化——两个请求同时执行，只有一个能 match 到 `status = "waiting_for_user"`。
+
+---
+
+### 12.2 消息重复写入 — 澄清流程产生脏数据
+
+**问题描述**
+
+流程追踪：
+1. 用户发送模糊消息 → `messages/route.ts` 保存了一条 message（返回 202）
+2. 用户选完选项后，前端带着相同 `content` + `clarification_response` 再次 POST
+3. 进入 branch 1 → `createMessageAndRun` 又创建了一条相同内容的 message
+
+后果：conversation history 出现重复的用户消息，Agent 后续 iterate 时读到重复上下文影响推理质量；前端 timeline 也会渲染两条一样的气泡。
+
+**解决思路**
+
+两种方案可选：
+
+- 方案 A：status 202 时不保存 message，等用户确认后才保存（最干净）
+- 方案 B：branch 1 中不创建 message，只创建 run 并引用已有的 messageId
+
+推荐方案 A——保持"一次用户动作 = 一条 message"的不变式。
+
+---
+
+### 12.3 三步非原子操作 — 崩溃导致 run 永久卡死
+
+**问题描述**
+
+`/answer` 路由中三步操作没有原子性保证：
+
+```typescript
+await prisma.projectRun.update({ status: "running" });     // step 1
+await prisma.loopState.update({ resumeReady: true });      // step 2
+await enqueueRun(runId, id, DEMO_USER_ID);                 // step 3
+```
+
+如果进程在 step 1 之后、step 3 之前崩溃：run 状态变成 `running` 但没有 worker 会处理它（没入队或 loopState 没标记 resumeReady）。这个 run 将永远卡在 `running` 状态。
+
+**解决思路：orchestrator 层加幂等 claim**
+
+不在 `/answer` 路由层追求三步原子（跨 Redis 入队无法事务化），而是在消费侧（orchestrator）做幂等保护。利用现有的 `answerToken` 字段做 claim 标记：
+
+```typescript
+// orchestrator 中 claim resume 执行权
+const claimed = await prisma.loopState.updateMany({
+  where: { runId, answerToken: loopState.answerToken }, // answerToken 非空 = 还没被领
+  data: { answerToken: "" },                            // 置空 = 标记已领取
+});
+
+if (claimed.count === 0) {
+  // 别的 worker 已经抢走了，或重复入队，跳过
+  return;
+}
+
+await executeResume(runId, projectId, loopState);
+```
+
+**原理**：PostgreSQL 单条 UPDATE 天然串行化。两个 worker 同时执行这条 SQL，只有一个能 match 到 `answerToken = "xxx"`（另一个执行时行已经被改成空字符串了）。不需要事务、不需要 `FOR UPDATE`、不需要加字段、不需要 Redis 锁。
+
+**多 worker 横向扩展也安全**：这个方案不依赖应用层状态，完全靠数据库行级锁语义，多进程/多机器部署天然兼容。
+
+**防御层次总结**：
+
+| 层 | 防什么 | 手段 |
+|----|--------|------|
+| `/answer` API 层 | 双击/前端重试产生重复入队 | `updateMany` 乐观锁（12.1 的修复） |
+| orchestrator 消费层 | 队列 at-least-once 投递 / 崩溃重启 redeliver | `answerToken` claim（本节方案） |
+
+两层一起才稳——API 层减少误入队概率，orchestrator 层做最终的幂等保障。
