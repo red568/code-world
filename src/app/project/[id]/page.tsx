@@ -2,6 +2,7 @@
 
 import { useState, useCallback, useEffect, useRef, use } from "react";
 import { useRouter } from "next/navigation";
+import { PanelRightOpen } from "lucide-react";
 import { SessionSidebar } from "@/components/session-sidebar";
 import { ChatPanel } from "@/components/chat-panel";
 import { PreviewPanel } from "@/components/preview-panel";
@@ -256,10 +257,10 @@ export default function ProjectPage({
       {previewCollapsed && (
         <button
           onClick={() => setPreviewCollapsed(false)}
-          className="w-[36px] flex-shrink-0 border-l border-gray-200 bg-gray-50 flex items-center justify-center hover:bg-gray-100 transition-colors"
+          className="w-[32px] flex-shrink-0 border-l border-gray-200 bg-gray-50 flex items-center justify-center hover:bg-gray-100 transition-colors"
           title="展开预览"
         >
-          <span className="text-gray-400 text-xs [writing-mode:vertical-rl]">预览</span>
+          <PanelRightOpen className="w-4 h-4 text-gray-400" />
         </button>
       )}
     </div>
