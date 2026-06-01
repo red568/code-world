@@ -57,7 +57,7 @@ export default function ProjectPage({
         if (data.awaiting_clarification && data.clarification) {
           setLocalClarification(data.clarification);
         }
-        router.replace(`/project/${data.projectId}`, { scroll: false });
+        window.history.replaceState(null, "", `/project/${data.projectId}`);
       })
       .catch((err) => {
         setAnalyzing(false);
@@ -66,7 +66,7 @@ export default function ProjectPage({
           { role: "assistant", content: `创建失败: ${err instanceof Error ? err.message : "未知错误"}` },
         ]);
       });
-  }, [isDraft, resolvedSearchParams.prompt, router]);
+  }, [isDraft, resolvedSearchParams.prompt]);
 
   // 从 URL 读取 clarification 参数（兼容老路径）
   useEffect(() => {
@@ -75,12 +75,12 @@ export default function ProjectPage({
       try {
         const clarification = JSON.parse(decodeURIComponent(clarificationParam));
         setLocalClarification(clarification);
-        router.replace(`/project/${projectId}`, { scroll: false });
+        window.history.replaceState(null, "", `/project/${projectId}`);
       } catch (err) {
         console.error("[ProjectPage] Failed to parse clarification from URL:", err);
       }
     }
-  }, [resolvedSearchParams.clarification, projectId, router]);
+  }, [resolvedSearchParams.clarification, projectId]);
 
   useEffect(() => {
     if (isDraft) {
@@ -160,7 +160,7 @@ export default function ProjectPage({
           });
           const data = await res.json();
           setProjectId(data.projectId);
-          router.replace(`/project/${data.projectId}`);
+          window.history.replaceState(null, "", `/project/${data.projectId}`);
         } catch (err) {
           setSending(false);
           setMessages((prev) => [
@@ -197,7 +197,7 @@ export default function ProjectPage({
         ]);
       }
     },
-    [projectId, reset, router]
+    [projectId, reset]
   );
 
   return (
@@ -207,7 +207,7 @@ export default function ProjectPage({
         <SessionSidebar
           collapsed={sidebarCollapsed}
           onToggle={() => setSidebarCollapsed((v) => !v)}
-          activeProjectId={isDraft ? null : projectId}
+          activeProjectId={projectId}
           onNewProject={handleNewProject}
         />
       </div>

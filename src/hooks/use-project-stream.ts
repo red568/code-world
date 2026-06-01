@@ -6,7 +6,7 @@
 
 "use client";
 
-import { useEffect, useCallback, useReducer } from "react";
+import { useEffect, useCallback, useReducer, useRef } from "react";
 
 // ─── 状态类型 ────────────────────────────────────────────────────────────────────
 
@@ -313,6 +313,7 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
 
 export function useProjectStream(projectId: string | null) {
   const [state, dispatch] = useReducer(streamReducer, initialState);
+  const prevProjectIdRef = useRef<string | null>(null);
 
   const reset = useCallback(() => dispatch({ type: "RESET" }), []);
   const forceIdle = useCallback(
@@ -323,7 +324,11 @@ export function useProjectStream(projectId: string | null) {
   useEffect(() => {
     if (!projectId) return;
 
-    dispatch({ type: "RESET" });
+    const isNewCreation = prevProjectIdRef.current === null;
+    prevProjectIdRef.current = projectId;
+    if (!isNewCreation) {
+      dispatch({ type: "RESET" });
+    }
 
     const eventSource = new EventSource(`/api/projects/${projectId}/stream`);
 
