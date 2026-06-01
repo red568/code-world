@@ -54,23 +54,8 @@ export default function HomePage() {
     if (!input.trim() || isSubmitting) return;
 
     setIsSubmitting(true);
-    try {
-      const res = await fetch("/api/projects", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: input.trim() }),
-      });
-      const data = await res.json();
-
-      // 如果需要澄清，通过 URL 参数传递 clarification 数据
-      if (data.awaiting_clarification && data.clarification) {
-        router.push(`/project/${data.projectId}?clarification=${encodeURIComponent(JSON.stringify(data.clarification))}`);
-      } else {
-        router.push(`/project/${data.projectId}`);
-      }
-    } catch {
-      setIsSubmitting(false);
-    }
+    // 乐观跳转：立即导航到项目页面，API 调用在项目页面进行
+    router.push(`/project/new?prompt=${encodeURIComponent(input.trim())}`);
   };
 
   return (

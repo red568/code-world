@@ -17,7 +17,7 @@ export default function ProjectPage({
   searchParams,
 }: {
   params: Promise<{ id: string }>;
-  searchParams?: Promise<{ clarification?: string }>;
+  searchParams?: Promise<{ clarification?: string; prompt?: string }>;
 }) {
   const { id: routeId } = use(params);
   const resolvedSearchParams = searchParams ? use(searchParams) : {};
@@ -29,18 +29,54 @@ export default function ProjectPage({
   const [sending, setSending] = useState(false);
   const [hasActiveRun, setHasActiveRun] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
   const { state, reset, forceIdle, dispatch } = useProjectStream(projectId);
   const creatingRef = useRef(false);
 
-  // 从 URL 读取 clarification 参数（首次创建项目时）
+  // 乐观跳转：从首页带着 prompt 过来，立即调用 API
+  useEffect(() => {
+    const promptParam = resolvedSearchParams.prompt;
+    if (!isDraft || !promptParam || creatingRef.current) return;
+
+    creatingRef.current = true;
+    setAnalyzing(true);
+    setMessages([{ role: "user", content: promptParam }]);
+
+    fetch("/api/projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: promptParam }),
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        setProjectId(data.projectId);
+
+        if (data.awaiting_clarification && data.clarification) {
+          dispatch({ type: "CLARIFICATION_NEEDED", data: data.clarification });
+          router.replace(`/project/${data.projectId}`, { scroll: false });
+        } else {
+          router.replace(`/project/${data.projectId}`, { scroll: false });
+        }
+      })
+      .catch((err) => {
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: `创建失败: ${err instanceof Error ? err.message : "未知错误"}` },
+        ]);
+      })
+      .finally(() => {
+        setAnalyzing(false);
+        creatingRef.current = false;
+      });
+  }, [isDraft, resolvedSearchParams.prompt, dispatch, router]);
+
+  // 从 URL 读取 clarification 参数（兼容老路径）
   useEffect(() => {
     const clarificationParam = resolvedSearchParams.clarification;
     if (clarificationParam && projectId) {
       try {
         const clarification = JSON.parse(decodeURIComponent(clarificationParam));
-        // 直接更新 state，不依赖 SSE
         dispatch({ type: "CLARIFICATION_NEEDED", data: clarification });
-        // 清理 URL 参数，避免刷新时重复触发
         router.replace(`/project/${projectId}`, { scroll: false });
       } catch (err) {
         console.error("[ProjectPage] Failed to parse clarification from URL:", err);
@@ -80,6 +116,7 @@ export default function ProjectPage({
 
   const isGenerating =
     sending ||
+    analyzing ||
     hasActiveRun ||
     state.phase === "code_generating";
 
