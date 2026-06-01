@@ -44,26 +44,26 @@ export function PreviewPanel({ previewUrl, isBuilding, phase, stopped, collapsed
             <span className="text-xs text-gray-400">预览地址</span>
           )}
         </div>
-        {previewUrl && (
-          <div className="flex items-center gap-1">
-            <button
-              onClick={() => setIframeKey((k) => k + 1)}
-              className="p-1.5 text-gray-400 hover:text-gray-600 transition-colors"
-              title="刷新预览"
-            >
-              <RefreshCw className="w-3.5 h-3.5" />
-            </button>
-            <a
-              href={previewUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="p-1.5 text-gray-400 hover:text-gray-600 transition-colors"
-              title="在新窗口打开"
-            >
-              <ExternalLink className="w-3.5 h-3.5" />
-            </a>
-          </div>
-        )}
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => setIframeKey((k) => k + 1)}
+            className={`p-1.5 transition-colors ${previewUrl ? "text-gray-400 hover:text-gray-600" : "text-gray-200 cursor-not-allowed"}`}
+            title="刷新预览"
+            disabled={!previewUrl}
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+          </button>
+          <a
+            href={previewUrl || undefined}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={`p-1.5 transition-colors ${previewUrl ? "text-gray-400 hover:text-gray-600" : "text-gray-200 pointer-events-none"}`}
+            title="在新窗口打开"
+            aria-disabled={!previewUrl}
+          >
+            <ExternalLink className="w-3.5 h-3.5" />
+          </a>
+        </div>
       </div>
 
       {/* Preview area */}

@@ -255,13 +255,15 @@ export default function ProjectPage({
 
       {/* Collapse toggle when preview is hidden */}
       {previewCollapsed && (
-        <button
-          onClick={() => setPreviewCollapsed(false)}
-          className="w-[32px] flex-shrink-0 border-l border-gray-200 bg-gray-50 flex items-center justify-center hover:bg-gray-100 transition-colors"
-          title="展开预览"
-        >
-          <PanelRightOpen className="w-4 h-4 text-gray-400" />
-        </button>
+        <div className="w-[32px] flex-shrink-0 border-l border-gray-200 bg-gray-50">
+          <button
+            onClick={() => setPreviewCollapsed(false)}
+            className="w-full pt-4 flex justify-center text-gray-400 hover:text-gray-600 transition-colors"
+            title="展开预览"
+          >
+            <PanelRightOpen className="w-4 h-4" />
+          </button>
+        </div>
       )}
     </div>
   );
