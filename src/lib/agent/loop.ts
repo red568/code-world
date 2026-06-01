@@ -200,23 +200,17 @@ export async function agentLoop(
 
     messages.push(assistantMessage);
 
-    // ─── 无 tool_calls → Agent 认为完成 ─────────────────────────────────────
+    // ─── 无 tool_calls → 继续循环（可能是在回答用户问题）─────────────────────
 
     if (
       !assistantMessage.tool_calls ||
       assistantMessage.tool_calls.length === 0
     ) {
-      const duration = ((Date.now() - totalStart) / 1000).toFixed(1);
       console.log(
-        `[AgentLoop] [${projectId.slice(0, 8)}] step=${step} 无 tool_call，隐式结束 | total=${duration}s`
+        `[AgentLoop] [${projectId.slice(0, 8)}] step=${step} 无 tool_call，继续等待（可能在回答用户问题）`
       );
-      return {
-        success: !!previewUrl,
-        summary: assistantMessage.content || "Agent 结束",
-        steps: step,
-        previewUrl,
-        finalMessages: messages,
-      };
+      // 不终止，继续下一轮循环
+      continue;
     }
 
     // ─── 执行每个 tool_call ──────────────────────────────────────────────────
@@ -355,6 +349,31 @@ export async function agentLoop(
           previewUrl,
           finalMessages: messages,
           suspended: true,
+        };
+      }
+
+      // ─── finish 特殊处理：终止 loop ─────────────────────────────────────────
+      if (fnName === "finish") {
+        const finishArgs = args as { summary: string; success: boolean };
+        const duration = ((Date.now() - totalStart) / 1000).toFixed(1);
+
+        console.log(
+          `[AgentLoop] [${projectId.slice(0, 8)}] step=${step} ✓ finish 调用，任务结束 | total=${duration}s`
+        );
+
+        // 追加 finish 工具的结果到消息历史
+        messages.push({
+          role: "tool",
+          content: `任务已完成: ${finishArgs.summary}`,
+          tool_call_id: toolCall.id,
+        });
+
+        return {
+          success: finishArgs.success,
+          summary: finishArgs.summary,
+          steps: step,
+          previewUrl,
+          finalMessages: messages,
         };
       }
 

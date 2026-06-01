@@ -133,6 +133,28 @@ export const AGENT_TOOLS = [
       },
     },
   },
+  {
+    type: "function" as const,
+    function: {
+      name: "finish",
+      description:
+        "任务已完成，结束 Agent Loop。当网站已成功构建并获取到预览 URL，或者任务已按用户要求完成时调用此工具。",
+      parameters: {
+        type: "object",
+        properties: {
+          summary: {
+            type: "string",
+            description: "任务完成总结，简要说明完成了什么",
+          },
+          success: {
+            type: "boolean",
+            description: "任务是否成功完成（true: 成功, false: 失败或部分完成）",
+          },
+        },
+        required: ["summary", "success"],
+      },
+    },
+  },
 ] as const;
 
 // ─── Executor 上下文 ─────────────────────────────────────────────────────────
@@ -169,6 +191,8 @@ export async function executeTool(
       return executeGetPreviewUrl(args as { port?: number }, ctx);
     case "ask_user":
       return { success: true, output: "", suspend: true };
+    case "finish":
+      return executeFinish(args as { summary: string; success: boolean });
     default:
       return { success: false, output: `Unknown tool: ${name}` };
   }
@@ -200,7 +224,14 @@ async function executeWriteFile(
     });
 
     const lines = args.content.split("\n").length;
-    return { success: true, output: `Written ${args.path} (${lines} lines)` };
+    let output = `Written ${args.path}`;
+
+    // 只在明显过长时才提示
+    if (lines > 500) {
+      output += ` (${lines} lines - 建议拆分为多个文件)`;
+    }
+
+    return { success: true, output };
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     return { success: false, output: `Failed to write ${args.path}: ${msg}` };
@@ -322,4 +353,13 @@ async function executeGetPreviewUrl(
     const msg = error instanceof Error ? error.message : String(error);
     return { success: false, output: `Failed to get preview URL: ${msg}` };
   }
+}
+
+async function executeFinish(
+  args: { summary: string; success: boolean }
+): Promise<ToolResult> {
+  return {
+    success: args.success,
+    output: args.summary,
+  };
 }
