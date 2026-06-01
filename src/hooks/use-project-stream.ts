@@ -40,6 +40,7 @@ export interface ClarificationData {
 }
 
 export interface AskUserData {
+  runId: string;
   question: string;
   options: AskUserOption[];
   context: string;
@@ -167,6 +168,7 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
           steps: [],
           error: null,
           previewUrl: null,
+          askUser: null,
         };
       }
       if (phase === "running") {
@@ -320,6 +322,7 @@ export function useProjectStream(projectId: string | null) {
     () => dispatch({ type: "STATUS_CHANGE", status: "stopped", message: "已停止" }),
     []
   );
+  const answerDone = useCallback(() => dispatch({ type: "ASK_USER_ANSWERED" }), []);
 
   useEffect(() => {
     if (!projectId) return;
@@ -404,5 +407,5 @@ export function useProjectStream(projectId: string | null) {
     };
   }, [projectId]);
 
-  return { state, reset, forceIdle };
+  return { state, reset, forceIdle, answerDone };
 }

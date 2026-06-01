@@ -36,6 +36,7 @@ export type SSEEvent =
     }}
   | { type: "clarification_resolved"; data: { enhanced_prompt: string } }
   | { type: "ask_user"; data: {
+      runId: string;
       question: string;
       options: { label: string; description: string }[];
       context: string;

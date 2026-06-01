@@ -133,11 +133,10 @@ export function ClarificationCard({ data, onSubmit, onSkip }: ClarificationCardP
 interface AskUserCardProps {
   data: AskUserData;
   projectId: string;
-  runId?: string;
   onAnswered: () => void;
 }
 
-export function AskUserCard({ data, projectId, runId, onAnswered }: AskUserCardProps) {
+export function AskUserCard({ data, projectId, onAnswered }: AskUserCardProps) {
   const [submitting, setSubmitting] = useState(false);
   const [expandedOther, setExpandedOther] = useState(false);
   const [otherText, setOtherText] = useState("");
@@ -147,18 +146,22 @@ export function AskUserCard({ data, projectId, runId, onAnswered }: AskUserCardP
     setSubmitting(true);
 
     try {
-      await fetch(`/api/projects/${projectId}/answer`, {
+      const res = await fetch(`/api/projects/${projectId}/answer`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          runId,
+          runId: data.runId,
           answerToken: data.answerToken,
           answer,
           isOther,
           skipAndContinue: skip,
         }),
       });
-      onAnswered();
+      if (res.ok) {
+        onAnswered();
+      } else {
+        setSubmitting(false);
+      }
     } catch {
       setSubmitting(false);
     }

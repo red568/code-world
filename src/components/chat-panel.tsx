@@ -25,7 +25,6 @@ interface ChatPanelProps {
   onSend: (message: string, clarificationResponse?: Record<string, unknown>) => void;
   onStop: () => void;
   onAskUserAnswered?: () => void;
-  currentRunId?: string;
 }
 
 function agentStepToTimelineStep(step: AgentStep): TimelineStep {
@@ -107,7 +106,6 @@ export function ChatPanel({
   onSend,
   onStop,
   onAskUserAnswered,
-  currentRunId,
 }: ChatPanelProps) {
   const [input, setInput] = useState("");
   const [stopping, setStopping] = useState(false);
@@ -192,7 +190,6 @@ export function ChatPanel({
           <AskUserCard
             data={streamState.askUser}
             projectId={projectId}
-            runId={currentRunId}
             onAnswered={() => onAskUserAnswered?.()}
           />
         )}

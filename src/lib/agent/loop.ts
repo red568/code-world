@@ -277,6 +277,7 @@ export async function agentLoop(
         await publishEvent(projectId, {
           type: "ask_user",
           data: {
+            runId,
             question: askArgs.question,
             options: askArgs.options,
             context: askArgs.context,

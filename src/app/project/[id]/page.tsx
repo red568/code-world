@@ -32,7 +32,7 @@ export default function ProjectPage({
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
   const [localClarification, setLocalClarification] = useState<ClarificationData | null>(null);
-  const { state, reset, forceIdle } = useProjectStream(projectId);
+  const { state, reset, forceIdle, answerDone } = useProjectStream(projectId);
   const creatingRef = useRef(false);
 
   // 乐观跳转：从首页带着 prompt 过来，立即调用 API
@@ -223,6 +223,7 @@ export default function ProjectPage({
           clarification={effectiveClarification}
           onSend={handleSend}
           onStop={handleStop}
+          onAskUserAnswered={answerDone}
         />
       </div>
 
