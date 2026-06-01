@@ -26,9 +26,17 @@ export interface IntentAnalysis {
 // ─── 快速跳过判断 ────────────────────────────────────────────────────────────────
 
 export function shouldSkipIntentAnalysis(content: string, isFirstMessage: boolean): boolean {
-  if (!isFirstMessage && content.length < 80) return true;
+  // 首轮消息：不限制长度，都进行意图分析（除非是明确的修改指令）
+  if (isFirstMessage) {
+    // 首轮如果是明确的修改指令，跳过（这种情况很少见）
+    if (/^(把|将|修改|删除|去掉|添加|加个|换成|改成)/.test(content)) return true;
+    return false;
+  }
+
+  // 非首轮：短消息或明确修改指令跳过
+  if (content.length < 80) return true;
   if (/^(把|将|修改|删除|去掉|添加|加个|换成|改成)/.test(content)) return true;
-  if (content.length < 30) return true;
+
   return false;
 }
 
