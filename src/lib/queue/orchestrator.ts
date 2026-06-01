@@ -305,13 +305,13 @@ async function executeResume(
       initialAskUserCount: askUserCount,
     });
 
-    // 清理 loopState
-    await prisma.loopState.delete({ where: { runId } }).catch(() => {});
-
     if (result.suspended) {
       log(projectId, "resume", "再次挂起等待用户");
       return;
     }
+
+    // 清理 loopState（仅在 loop 正常结束时，不能删除再次挂起时保存的新存档）
+    await prisma.loopState.delete({ where: { runId } }).catch(() => {});
 
     const totalDuration = ((Date.now() - totalStart) / 1000).toFixed(1);
     await handleResult(runId, projectId, result, sandbox, undefined, totalDuration, true);
