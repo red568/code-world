@@ -86,6 +86,8 @@ export default function ProjectPage({
 
   useEffect(() => {
     if (isDraft) {
+      // 如果是乐观跳转流程（带 prompt 参数），不要重置状态
+      if (resolvedSearchParams.prompt) return;
       setProjectId(null);
       setMessages([]);
       setSending(false);
@@ -112,7 +114,7 @@ export default function ProjectPage({
         }
       })
       .catch(() => {});
-  }, [routeId, isDraft, reset]);
+  }, [routeId, isDraft, reset, resolvedSearchParams.prompt]);
 
   const isGenerating =
     sending ||
@@ -207,6 +209,7 @@ export default function ProjectPage({
           messages={messages}
           streamState={state}
           isGenerating={isGenerating}
+          analyzing={analyzing}
           onSend={handleSend}
           onStop={handleStop}
         />

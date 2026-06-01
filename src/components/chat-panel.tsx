@@ -20,6 +20,7 @@ interface ChatPanelProps {
   messages: Message[];
   streamState: StreamState;
   isGenerating: boolean;
+  analyzing?: boolean;
   onSend: (message: string, clarificationResponse?: Record<string, unknown>) => void;
   onStop: () => void;
   onAskUserAnswered?: () => void;
@@ -44,14 +45,14 @@ function agentStepToTimelineStep(step: AgentStep): TimelineStep {
   };
 }
 
-function buildCurrentRoundSteps(streamState: StreamState, isGenerating: boolean): TimelineStep[] {
+function buildCurrentRoundSteps(streamState: StreamState, isGenerating: boolean, analyzing?: boolean): TimelineStep[] {
   const { steps, phase } = streamState;
 
   if (steps.length === 0 && isGenerating) {
     return [{
       id: "waiting",
       type: "thinking",
-      label: "等待 Agent 响应...",
+      label: analyzing ? "正在分析需求..." : "等待 Agent 响应...",
       status: "active",
       startedAt: Date.now(),
     }];
@@ -77,7 +78,7 @@ function buildHistoryRoundSteps(): TimelineStep[] {
   ];
 }
 
-function buildRounds(messages: Message[], streamState: StreamState, isGenerating: boolean): TRound[] {
+function buildRounds(messages: Message[], streamState: StreamState, isGenerating: boolean, analyzing?: boolean): TRound[] {
   const rounds: TRound[] = [];
   const userMessages = messages.filter((m) => m.role === "user");
 
@@ -87,7 +88,7 @@ function buildRounds(messages: Message[], streamState: StreamState, isGenerating
       id: idx,
       userMessage: msg.content,
       steps: isCurrentRound
-        ? buildCurrentRoundSteps(streamState, isGenerating)
+        ? buildCurrentRoundSteps(streamState, isGenerating, analyzing)
         : buildHistoryRoundSteps(),
     });
   });
@@ -100,6 +101,7 @@ export function ChatPanel({
   messages,
   streamState,
   isGenerating,
+  analyzing,
   onSend,
   onStop,
   onAskUserAnswered,
@@ -110,8 +112,8 @@ export function ChatPanel({
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const rounds = useMemo(
-    () => buildRounds(messages, streamState, isGenerating),
-    [messages, streamState, isGenerating]
+    () => buildRounds(messages, streamState, isGenerating, analyzing),
+    [messages, streamState, isGenerating, analyzing]
   );
 
   useEffect(() => {
