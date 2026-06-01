@@ -3,7 +3,7 @@
  */
 
 import { prisma } from "@/lib/prisma";
-import { enqueueRun } from "@/lib/queue";
+import { agentQueue } from "@/lib/queue";
 
 const DEMO_USER_ID = "demo-user-001";
 
@@ -23,9 +23,10 @@ export async function POST(
   }
 
   // 原子 claim：检查 + 翻转状态合为一条 SQL，防止双击/重试导致双重执行
+  // 设为 queued 而非 running，让 worker 走正常的 queued→running 路径
   const claimed = await prisma.projectRun.updateMany({
     where: { id: runId, projectId: id, status: "waiting_for_user" },
-    data: { status: "running" },
+    data: { status: "queued" },
   });
   if (claimed.count === 0) {
     return Response.json(
@@ -74,8 +75,16 @@ export async function POST(
     },
   });
 
-  // 重新入队，orchestrator 检测到 resumeReady 后恢复 loop
-  await enqueueRun(runId, id, DEMO_USER_ID);
+  // 重新入队，用 answerToken 作为 jobId 避免与初始 job 的 runId 冲突
+  await agentQueue.add("agent-run", {
+    runId,
+    projectId: id,
+    userId: DEMO_USER_ID,
+  }, {
+    jobId: answerToken,
+    attempts: 3,
+    backoff: { type: "fixed", delay: 5000 },
+  });
 
   console.log(`[API] POST /api/projects/${id.slice(0, 8)}/answer | 200 | runId=${runId.slice(0, 8)} | answer="${toolResultContent.slice(0, 50)}"`);
   return Response.json({ ok: true, runId });

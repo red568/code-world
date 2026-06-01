@@ -88,7 +88,7 @@ export async function agentLoop(
 
   // 初始化消息
   const messages: OpenAI.ChatCompletionMessageParam[] = config.existingMessages
-    ? [...config.existingMessages, { role: "user" as const, content: userMessage }]
+    ? [...config.existingMessages, ...(userMessage ? [{ role: "user" as const, content: userMessage }] : [])]
     : [
         { role: "system" as const, content: systemPrompt },
         { role: "user" as const, content: userMessage },
