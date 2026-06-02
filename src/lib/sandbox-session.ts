@@ -59,10 +59,19 @@ export class SandboxSessionManager {
       }
     }
 
-    // 3. 创建新沙盒
+    // 3. 创建新沙盒（基础设施级环境变量在此注入，整个生命周期有效）
     const sandbox = await Sandbox.create({
       template: process.env.E2B_TEMPLATE || "ai-website-builder-v2",
       timeoutMs: SESSION_TTL,
+      envs: {
+        REDIS_URL: process.env.REDIS_URL || "",
+        LLM_API_KEY: process.env.LLM_API_KEY || "",
+        LLM_BASE_URL: process.env.LLM_BASE_URL || "",
+        LLM_MODEL: process.env.LLM_MODEL || "",
+        API_BASE_URL: process.env.API_BASE_URL || process.env.NEXTAUTH_URL || "http://localhost:3000",
+        INTERNAL_API_SECRET: process.env.INTERNAL_API_SECRET || "",
+        AXIOM_TOKEN: process.env.AXIOM_TOKEN || "",
+      },
     });
 
     console.log(

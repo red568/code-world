@@ -45,15 +45,8 @@ export async function dispatchRun(runId: string, projectId: string): Promise<voi
     USER_ID: project.userId,
     RUN_ID: runId,
     PROJECT_ID: projectId,
-    USER_MESSAGE: run.prompt,
-    REDIS_URL: process.env.REDIS_URL!,
-    LLM_API_KEY: process.env.LLM_API_KEY!,
-    LLM_BASE_URL: process.env.LLM_BASE_URL || "",
-    LLM_MODEL: process.env.LLM_MODEL || "",
-    API_BASE_URL: process.env.API_BASE_URL || process.env.NEXTAUTH_URL || "http://localhost:3000",
-    INTERNAL_API_SECRET: process.env.INTERNAL_API_SECRET!,
+    USER_MESSAGE: run.prompt || "",
     SANDBOX_ID: sandbox.sandboxId,
-    AXIOM_TOKEN: process.env.AXIOM_TOKEN || "",
   };
 
   // 捕获当前 sandboxId，用于退出回调的安全检查
@@ -129,15 +122,8 @@ export async function dispatchResumeRun(
     USER_ID: project.userId,
     RUN_ID: runId,
     PROJECT_ID: projectId,
-    USER_MESSAGE: run.prompt,
-    REDIS_URL: process.env.REDIS_URL!,
-    LLM_API_KEY: process.env.LLM_API_KEY!,
-    LLM_BASE_URL: process.env.LLM_BASE_URL || "",
-    LLM_MODEL: process.env.LLM_MODEL || "",
-    API_BASE_URL: process.env.API_BASE_URL || process.env.NEXTAUTH_URL || "http://localhost:3000",
-    INTERNAL_API_SECRET: process.env.INTERNAL_API_SECRET!,
+    USER_MESSAGE: run.prompt || "",
     SANDBOX_ID: sandbox.sandboxId,
-    AXIOM_TOKEN: process.env.AXIOM_TOKEN || "",
   };
 
   const currentSandboxId = sandbox.sandboxId;
