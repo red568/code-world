@@ -14,6 +14,12 @@ export async function dispatchRun(runId: string, projectId: string): Promise<voi
   const run = await prisma.projectRun.findUnique({ where: { id: runId } });
   if (!run) throw new Error(`Run ${runId} not found`);
 
+  // 二次校验：如果在 Worker 消费到 dispatch 之间 run 已被取消，直接返回
+  if (run.status !== "running") {
+    console.log(`[Dispatcher] Run ${runId.slice(0, 8)} status=${run.status}, skip dispatch`);
+    return;
+  }
+
   const mode = run.type === "generate" ? "generate" : "iterate";
 
   const { sandbox, isReused } = await sandboxSessionManager.acquireForProject(projectId);
@@ -50,6 +56,9 @@ export async function dispatchRun(runId: string, projectId: string): Promise<voi
     AXIOM_TOKEN: process.env.AXIOM_TOKEN || "",
   };
 
+  // 捕获当前 sandboxId，用于退出回调的安全检查
+  const currentSandboxId = sandbox.sandboxId;
+
   // 异步执行（不 await），Worker 不阻塞等待完成
   sandbox.commands
     .run(cmd, { timeoutMs: AGENT_RUNTIME_TIMEOUT, envs })
@@ -58,7 +67,7 @@ export async function dispatchRun(runId: string, projectId: string): Promise<voi
         console.log(
           `[Dispatcher] Agent exited with code ${result.exitCode}, terminating sandbox | run=${runId.slice(0, 8)}`
         );
-        sandboxSessionManager.terminateSession(projectId);
+        sandboxSessionManager.terminateSession(projectId, currentSandboxId);
       } else {
         console.log(
           `[Dispatcher] Agent completed successfully, keeping sandbox for reuse | run=${runId.slice(0, 8)}`
@@ -68,7 +77,7 @@ export async function dispatchRun(runId: string, projectId: string): Promise<voi
     .catch((error: unknown) => {
       const msg = error instanceof Error ? error.message : String(error);
       console.error(`[Dispatcher] Agent process error: ${msg} | run=${runId.slice(0, 8)}`);
-      sandboxSessionManager.terminateSession(projectId);
+      sandboxSessionManager.terminateSession(projectId, currentSandboxId);
     });
 
   // 保存 sandboxId（用于停止功能）
@@ -89,6 +98,13 @@ export async function dispatchResumeRun(
   runId: string,
   projectId: string
 ): Promise<void> {
+  // 校验 run 仍然有效
+  const runCheck = await prisma.projectRun.findUnique({ where: { id: runId } });
+  if (!runCheck || runCheck.status === "cancelled") {
+    console.log(`[Dispatcher] Resume skipped: run ${runId.slice(0, 8)} status=${runCheck?.status}`);
+    return;
+  }
+
   const { sandbox } = await sandboxSessionManager.acquireForProject(projectId);
 
   const project = await prisma.project.findUnique({
@@ -124,15 +140,17 @@ export async function dispatchResumeRun(
     AXIOM_TOKEN: process.env.AXIOM_TOKEN || "",
   };
 
+  const currentSandboxId = sandbox.sandboxId;
+
   sandbox.commands
     .run(cmd, { timeoutMs: AGENT_RUNTIME_TIMEOUT, envs })
     .then((result) => {
       if (result.exitCode !== 0) {
-        sandboxSessionManager.terminateSession(projectId);
+        sandboxSessionManager.terminateSession(projectId, currentSandboxId);
       }
     })
     .catch(() => {
-      sandboxSessionManager.terminateSession(projectId);
+      sandboxSessionManager.terminateSession(projectId, currentSandboxId);
     });
 
   await prisma.projectRun.update({

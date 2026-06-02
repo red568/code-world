@@ -74,7 +74,7 @@ export async function POST(
     },
   });
 
-  await sandboxSessionManager.terminateSession(projectId);
+  await sandboxSessionManager.terminateSession(projectId, activeRun.sandboxId || undefined);
 
   await prisma.project.update({
     where: { id: projectId },

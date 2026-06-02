@@ -94,13 +94,23 @@ export class SandboxSessionManager {
 
   /**
    * 主动终止会话（停止/失败时调用）
+   * 只有当前 session 的 sandboxId 与 expectedSandboxId 匹配时才执行 kill。
+   * 防止异步回调误杀后续新建的沙盒。
    */
-  async terminateSession(projectId: string): Promise<void> {
+  async terminateSession(projectId: string, expectedSandboxId?: string): Promise<void> {
     const session = await prisma.sandboxSession.findUnique({
       where: { projectId },
     });
 
     if (!session) return;
+
+    // 如果指定了 expectedSandboxId，但 session 已经被新 run 更新，跳过
+    if (expectedSandboxId && session.sandboxId !== expectedSandboxId) {
+      console.log(
+        `[Session] Skip terminate: sandbox replaced | project=${projectId.slice(0, 8)} | expected=${expectedSandboxId.slice(0, 8)} | current=${session.sandboxId.slice(0, 8)}`
+      );
+      return;
+    }
 
     try {
       const sandbox = await Sandbox.connect(session.sandboxId);
@@ -112,8 +122,9 @@ export class SandboxSessionManager {
       console.warn(`[Session] Failed to kill sandbox (may already be dead):`, error);
     }
 
-    await prisma.sandboxSession.update({
-      where: { projectId },
+    // 只有 sandboxId 仍然匹配时才更新状态（原子条件更新）
+    await prisma.sandboxSession.updateMany({
+      where: { projectId, sandboxId: session.sandboxId },
       data: { status: "stopped", stoppedAt: new Date() },
     });
   }
