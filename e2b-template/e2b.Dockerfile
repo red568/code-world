@@ -18,21 +18,25 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /agent-runtime
 
-# 复制并安装依赖
-COPY agent-runtime/package*.json ./
-RUN npm ci --production
+# 复制并安装全部依赖（含 devDependencies 用于编译）
+COPY agent-runtime/package.json ./
+RUN npm install
 
 # 复制源码并编译
 COPY agent-runtime/tsconfig.json ./
 COPY agent-runtime/src/ ./src/
 RUN npx tsc
 
+# 编译完成，清理 devDependencies 减小体积
+RUN npm prune --omit=dev
+
 # ─── 用户项目模板 ─────────────────────────────────────────────────────────────
 
 WORKDIR /home/user/app
 
-# 复制模板文件
-COPY package.json index.html vite.config.ts tsconfig.json tailwind.config.js postcss.config.js ./
+# 复制模板配置文件
+COPY package.json ./
+COPY index.html tsconfig.json vite.config.ts tailwind.config.js postcss.config.js ./
 COPY src/ ./src/
 
 # 预装依赖
@@ -45,5 +49,5 @@ RUN npm run build || true
 
 WORKDIR /home/user
 
-# 默认命令（会被 dispatcher 覆盖）
-CMD ["node", "/agent-runtime/dist/main.js"]
+# 默认命令：保持容器存活，实际执行由 dispatcher 通过 sandbox.commands.run 触发
+CMD ["sleep", "infinity"]
