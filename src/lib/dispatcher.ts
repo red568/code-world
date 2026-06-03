@@ -53,13 +53,19 @@ export async function dispatchRun(runId: string, projectId: string): Promise<voi
   const currentSandboxId = sandbox.sandboxId;
 
   // 异步执行（不 await），Worker 不阻塞等待完成
+  console.log(`[Dispatcher] Launching agent | run=${runId.slice(0, 8)} | cmd=${cmd.slice(0, 80)}`);
+  console.log(`[Dispatcher] Envs: ${Object.keys(envs).join(", ")} | run=${runId.slice(0, 8)}`);
+
   sandbox.commands
     .run(cmd, { timeoutMs: AGENT_RUNTIME_TIMEOUT, envs })
     .then((result) => {
       if (result.exitCode !== 0) {
         console.log(
-          `[Dispatcher] Agent exited with code ${result.exitCode}, terminating sandbox | run=${runId.slice(0, 8)}`
+          `[Dispatcher] Agent exited with code ${result.exitCode} | run=${runId.slice(0, 8)}`
         );
+        if (result.stderr) {
+          console.log(`[Dispatcher] stderr: ${result.stderr.slice(0, 500)} | run=${runId.slice(0, 8)}`);
+        }
         sandboxSessionManager.terminateSession(projectId, currentSandboxId);
       } else {
         console.log(
@@ -128,14 +134,24 @@ export async function dispatchResumeRun(
 
   const currentSandboxId = sandbox.sandboxId;
 
+  console.log(`[Dispatcher] Resuming agent | run=${runId.slice(0, 8)} | cmd=${cmd.slice(0, 80)}`);
+
   sandbox.commands
     .run(cmd, { timeoutMs: AGENT_RUNTIME_TIMEOUT, envs })
     .then((result) => {
       if (result.exitCode !== 0) {
+        console.log(`[Dispatcher] Resumed agent exited with code ${result.exitCode} | run=${runId.slice(0, 8)}`);
+        if (result.stderr) {
+          console.log(`[Dispatcher] stderr: ${result.stderr.slice(0, 500)} | run=${runId.slice(0, 8)}`);
+        }
         sandboxSessionManager.terminateSession(projectId, currentSandboxId);
+      } else {
+        console.log(`[Dispatcher] Resumed agent completed successfully | run=${runId.slice(0, 8)}`);
       }
     })
-    .catch(() => {
+    .catch((error: unknown) => {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.error(`[Dispatcher] Resumed agent process error: ${msg} | run=${runId.slice(0, 8)}`);
       sandboxSessionManager.terminateSession(projectId, currentSandboxId);
     });
 

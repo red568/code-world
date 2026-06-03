@@ -15,7 +15,6 @@ export type ProjectPhase =
   | "code_generating"
   | "running"
   | "failed"
-  | "waiting_for_clarification"
   | "waiting_for_answer";
 
 export interface AgentStep {
@@ -33,12 +32,6 @@ export interface AskUserOption {
   description: string;
 }
 
-export interface ClarificationData {
-  clarity: "medium" | "low";
-  rewritten_query: string;
-  missing_info: { aspect: string; question: string; options: string[] }[];
-}
-
 export interface AskUserData {
   runId: string;
   question: string;
@@ -54,7 +47,6 @@ export interface StreamState {
   previewUrl: string | null;
   error: string | null;
   connected: boolean;
-  clarification: ClarificationData | null;
   askUser: AskUserData | null;
 }
 
@@ -74,8 +66,6 @@ type StreamAction =
   | { type: "BUILD_LOG"; line: string }
   | { type: "PREVIEW_READY"; previewUrl: string }
   | { type: "ERROR"; message: string }
-  | { type: "CLARIFICATION_NEEDED"; data: ClarificationData }
-  | { type: "CLARIFICATION_RESOLVED" }
   | { type: "ASK_USER"; data: AskUserData }
   | { type: "ASK_USER_ANSWERED" }
   | { type: "RESET" };
@@ -87,7 +77,6 @@ const initialState: StreamState = {
   previewUrl: null,
   error: null,
   connected: false,
-  clarification: null,
   askUser: null,
 };
 
@@ -277,12 +266,6 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
       stepId = 0;
       return { ...initialState };
 
-    case "CLARIFICATION_NEEDED":
-      return { ...state, phase: "waiting_for_clarification", clarification: action.data };
-
-    case "CLARIFICATION_RESOLVED":
-      return { ...state, phase: "code_generating", clarification: null };
-
     case "ASK_USER": {
       const steps = finishLastActive(state.steps, "thinking");
       const newStep: AgentStep = {
@@ -377,15 +360,6 @@ export function useProjectStream(projectId: string | null) {
     eventSource.addEventListener("preview_ready", (e) => {
       const data = JSON.parse(e.data);
       dispatch({ type: "PREVIEW_READY", previewUrl: data.previewUrl });
-    });
-
-    eventSource.addEventListener("clarification_needed", (e) => {
-      const data = JSON.parse(e.data);
-      dispatch({ type: "CLARIFICATION_NEEDED", data });
-    });
-
-    eventSource.addEventListener("clarification_resolved", () => {
-      dispatch({ type: "CLARIFICATION_RESOLVED" });
     });
 
     eventSource.addEventListener("ask_user", (e) => {

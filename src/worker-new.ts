@@ -15,10 +15,68 @@ import { createBullBoard } from "@bull-board/api";
 import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
 import { ExpressAdapter } from "@bull-board/express";
 import { Queue } from "bullmq";
-import { redis } from "@/lib/redis";
+import { redis, redisSub } from "@/lib/redis";
 import { QUEUE_NAME, type AgentJobData } from "@/lib/queue";
 import { dispatchRun } from "@/lib/dispatcher";
 import { prisma } from "@/lib/prisma";
+
+// ─── Agent 事件日志订阅 ────────────────────────────────────────────────────────
+
+function startAgentLogger() {
+  redisSub.psubscribe("project:*:events").then(() => {
+    console.log("[AgentLog] Subscribed to project:*:events");
+  });
+
+  redisSub.on("pmessage", (_pattern, channel, message) => {
+    try {
+      const projectId = channel.split(":")[1]?.slice(0, 8);
+      const event = JSON.parse(message);
+      const { type, data } = event;
+
+      switch (type) {
+        case "status_change":
+          console.log(`[Agent] ${projectId} | status → ${data.status} | ${data.message}`);
+          break;
+        case "agent_thinking":
+          console.log(`[Agent] ${projectId} | thinking | ${data.content.slice(0, 120)}`);
+          break;
+        case "tool_call":
+          console.log(`[Agent] ${projectId} | tool_call | ${data.tool} | ${JSON.stringify(data.args).slice(0, 100)}`);
+          break;
+        case "tool_result":
+          console.log(`[Agent] ${projectId} | tool_result | ${data.tool} | success=${data.success} | ${data.summary.slice(0, 80)}`);
+          break;
+        case "ask_user":
+          console.log(`[Agent] ${projectId} | ask_user | ${data.question}`);
+          break;
+        case "preview_ready":
+          console.log(`[Agent] ${projectId} | preview_ready | ${data.previewUrl}`);
+          break;
+        case "build_log":
+          console.log(`[Agent] ${projectId} | ${data.stream} | ${data.line}`);
+          break;
+        case "error":
+          console.error(`[Agent] ${projectId} | ERROR | ${data.code} | ${data.message}`);
+          break;
+        case "codegen_file_start":
+          console.log(`[Agent] ${projectId} | codegen | start ${data.path}`);
+          break;
+        case "codegen_file_done":
+          console.log(`[Agent] ${projectId} | codegen | done ${data.path}`);
+          break;
+        case "clarification_needed":
+          console.log(`[Agent] ${projectId} | clarification | clarity=${data.clarity} | questions=${data.missing_info?.length}`);
+          break;
+        default:
+          console.log(`[Agent] ${projectId} | ${type}`);
+      }
+    } catch {
+      // ignore malformed messages
+    }
+  });
+}
+
+startAgentLogger();
 
 // ─── Bull Board 监控面板 ────────────────────────────────────────────────────────
 

@@ -8,7 +8,6 @@ import { ChatPanel } from "@/components/chat-panel";
 import { PreviewPanel } from "@/components/preview-panel";
 import { ResizeHandle } from "@/components/resize-handle";
 import { useProjectStream } from "@/hooks/use-project-stream";
-import type { ClarificationData } from "@/hooks/use-project-stream";
 
 interface ChatMessage {
   role: "user" | "assistant";
@@ -20,7 +19,7 @@ export default function ProjectPage({
   searchParams,
 }: {
   params: Promise<{ id: string }>;
-  searchParams?: Promise<{ clarification?: string; prompt?: string }>;
+  searchParams?: Promise<{ prompt?: string }>;
 }) {
   const { id: routeId } = use(params);
   const resolvedSearchParams = searchParams ? use(searchParams) : {};
@@ -35,7 +34,6 @@ export default function ProjectPage({
   const [previewCollapsed, setPreviewCollapsed] = useState(false);
   const [chatWidth, setChatWidth] = useState(420);
   const [analyzing, setAnalyzing] = useState(false);
-  const [localClarification, setLocalClarification] = useState<ClarificationData | null>(null);
   const { state, reset, forceIdle, answerDone } = useProjectStream(projectId);
   const creatingRef = useRef(false);
 
@@ -57,10 +55,6 @@ export default function ProjectPage({
       .then((data) => {
         setProjectId(data.projectId);
         setAnalyzing(false);
-
-        if (data.awaiting_clarification && data.clarification) {
-          setLocalClarification(data.clarification);
-        }
         window.history.replaceState(null, "", `/project/${data.projectId}`);
       })
       .catch((err) => {
@@ -72,20 +66,6 @@ export default function ProjectPage({
       });
   }, [isDraft, resolvedSearchParams.prompt]);
 
-  // 从 URL 读取 clarification 参数（兼容老路径）
-  useEffect(() => {
-    const clarificationParam = resolvedSearchParams.clarification;
-    if (clarificationParam && projectId) {
-      try {
-        const clarification = JSON.parse(decodeURIComponent(clarificationParam));
-        setLocalClarification(clarification);
-        window.history.replaceState(null, "", `/project/${projectId}`);
-      } catch (err) {
-        console.error("[ProjectPage] Failed to parse clarification from URL:", err);
-      }
-    }
-  }, [resolvedSearchParams.clarification, projectId]);
-
   useEffect(() => {
     if (isDraft) {
       if (resolvedSearchParams.prompt) return;
@@ -93,12 +73,10 @@ export default function ProjectPage({
       setMessages([]);
       setSending(false);
       setHasActiveRun(false);
-      setLocalClarification(null);
       reset();
       return;
     }
     setProjectId(routeId);
-    // 如果已有消息（乐观跳转流程），跳过重复 fetch
     if (messages.length > 0) return;
     fetch(`/api/projects/${routeId}`)
       .then((res) => res.json())
@@ -117,9 +95,6 @@ export default function ProjectPage({
       })
       .catch(() => {});
   }, [routeId, isDraft, reset, resolvedSearchParams.prompt, messages.length]);
-
-  // 合并两个来源的 clarification
-  const effectiveClarification = localClarification || state.clarification;
 
   const isGenerating =
     sending ||
@@ -147,12 +122,7 @@ export default function ProjectPage({
   }, []);
 
   const handleSend = useCallback(
-    async (content: string, clarificationResponse?: Record<string, unknown>) => {
-      // 如果是 clarification 提交，清掉本地 clarification
-      if (clarificationResponse) {
-        setLocalClarification(null);
-      }
-
+    async (content: string) => {
       reset();
       setSending(true);
       setMessages((prev) => [...prev, { role: "user", content }]);
@@ -185,14 +155,10 @@ export default function ProjectPage({
       }
 
       try {
-        const body: Record<string, unknown> = { content };
-        if (clarificationResponse) {
-          body.clarification_response = clarificationResponse;
-        }
         await fetch(`/api/projects/${projectId}/messages`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
+          body: JSON.stringify({ content }),
         });
       } catch (err) {
         setSending(false);
@@ -231,7 +197,6 @@ export default function ProjectPage({
           streamState={state}
           isGenerating={isGenerating}
           analyzing={analyzing}
-          clarification={effectiveClarification}
           onSend={handleSend}
           onStop={handleStop}
           onAskUserAnswered={answerDone}
