@@ -277,6 +277,11 @@ async function executeRunShell(
     return { success: false, output: "Command blocked for security reasons." };
   }
 
+  // 兜底：启动 vite 前确保 allowedHosts: true
+  if (args.command.includes("vite") && !args.command.includes("build")) {
+    await ensureViteAllowedHosts(ctx.projectDir);
+  }
+
   try {
     const { stdout, stderr } = await execAsync(args.command, {
       cwd: ctx.projectDir,
@@ -422,3 +427,43 @@ async function callInternalAPI(
 }
 
 export { callInternalAPI };
+
+// ─── Vite allowedHosts 兜底 ────────────────────────────────────────────────
+
+async function ensureViteAllowedHosts(projectDir: string): Promise<void> {
+  const configPath = join(projectDir, "vite.config.ts");
+  try {
+    let content = await readFile(configPath, "utf-8");
+    if (content.includes("allowedHosts")) return;
+
+    // 注入 allowedHosts: true 到 server 配置块
+    if (content.includes("server:") || content.includes("server :")) {
+      content = content.replace(
+        /(server\s*:\s*\{)/,
+        "$1\n    allowedHosts: true,"
+      );
+    } else {
+      // 没有 server 块，在 defineConfig 内追加
+      content = content.replace(
+        /(defineConfig\s*\(\s*\{)/,
+        "$1\n  server: { host: '0.0.0.0', port: 5173, allowedHosts: true },"
+      );
+    }
+    await writeFile(configPath, content, "utf-8");
+  } catch {
+    // 文件不存在，写一个完整的
+    const fallback = `import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    host: '0.0.0.0',
+    port: 5173,
+    allowedHosts: true,
+  },
+})
+`;
+    await writeFile(configPath, fallback, "utf-8");
+  }
+}

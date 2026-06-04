@@ -42,6 +42,7 @@ const SYSTEM_PROMPT = `你是一个高级全栈网站开发 Agent。用户描述
 ## 技术栈（固定，不可更改）
 
 - React 18 + TypeScript + Vite + Tailwind CSS
+- vite.config.ts 中必须配置 server.allowedHosts: true（沙盒环境通过外部域名访问）
 - 白名单依赖（已预装，可直接 import）：
   - react, react-dom
   - lucide-react（图标）
