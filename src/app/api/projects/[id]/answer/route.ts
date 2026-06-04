@@ -13,11 +13,14 @@ export async function POST(
 ) {
   const { id: projectId } = await params;
   const body = await request.json();
-  const { runId, answer, isOther, skipAndContinue, askCount } = body;
+  const { runId, answer, isOther, skipAndContinue, answerToken } = body;
+
+  // answerToken 就是 askCount（前端从 SSE 事件中获取）
+  const askCount = answerToken != null ? Number(answerToken) : null;
 
   if (!runId || askCount == null) {
     return Response.json(
-      { error: "runId and askCount are required" },
+      { error: "runId and answerToken are required" },
       { status: 400 }
     );
   }

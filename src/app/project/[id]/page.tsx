@@ -100,7 +100,9 @@ export default function ProjectPage({
     sending ||
     analyzing ||
     hasActiveRun ||
-    state.phase === "code_generating";
+    state.phase === "code_generating" ||
+    state.phase === "running" ||
+    state.phase === "waiting_for_answer";
 
   useEffect(() => {
     setSending(false);

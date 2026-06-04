@@ -2,8 +2,10 @@
  * GET /api/projects/:id/stream — SSE 实时事件流
  *
  * 订阅 Redis pub/sub 频道，将 Worker 推送的事件实时转发给浏览器。
+ * 连接建立时回放当前 run 状态，避免因时序竞态丢失早期事件。
  */
 
+import { prisma } from "@/lib/prisma";
 import { redisSub } from "@/lib/redis";
 import { getProjectChannel } from "@/lib/streaming";
 
@@ -26,6 +28,33 @@ export async function GET(
       controller.enqueue(
         encoder.encode(`event: connected\ndata: ${JSON.stringify({ projectId: id })}\n\n`)
       );
+
+      // 回放当前 run 状态（解决 SSE 订阅 vs 事件发射的竞态）
+      try {
+        const activeRun = await prisma.projectRun.findFirst({
+          where: {
+            projectId: id,
+            status: { in: ["queued", "running", "paused"] },
+          },
+          orderBy: { createdAt: "desc" },
+        });
+
+        if (activeRun) {
+          const status = activeRun.status === "queued" ? "code_generating" : activeRun.status;
+          const message = activeRun.status === "queued"
+            ? "排队中..."
+            : activeRun.status === "running"
+              ? "Agent 执行中..."
+              : activeRun.status === "paused"
+                ? "等待用户回答..."
+                : activeRun.status;
+          controller.enqueue(
+            encoder.encode(`event: status_change\ndata: ${JSON.stringify({ status, message })}\n\n`)
+          );
+        }
+      } catch {
+        // best effort，不阻塞连接
+      }
 
       const messageHandler = (receivedChannel: string, message: string) => {
         if (receivedChannel === channel) {

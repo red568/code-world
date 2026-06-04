@@ -93,7 +93,13 @@ export class EventEmitter implements EventEmitterInterface {
     options: AskUserOption[],
     askCount: number
   ): Promise<void> {
-    await this.emit("HITL_QUESTION", { question, options, askCount });
+    await this.emit("ask_user", {
+      runId: this.runId,
+      question,
+      options,
+      context: "",
+      answerToken: String(askCount),
+    });
   }
 
   async emitPlanCreated(plan: Plan): Promise<void> {

@@ -8,7 +8,7 @@
     "db:deploy": "prisma db push",
     "start": "next start",
     "lint": "eslint",
-    "worker": "npx tsx src/worker-new.ts",
+    "worker": "npx tsx src/worker.ts",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:push": "prisma db push",
