@@ -60,23 +60,61 @@ export class SandboxSessionManager {
     }
 
     // 3. 创建新沙盒（基础设施级环境变量在此注入，整个生命周期有效）
-    const sandbox = await Sandbox.create({
-      template: process.env.E2B_TEMPLATE || "ai-website-builder-v2",
-      timeoutMs: SESSION_TTL,
-      envs: {
-        REDIS_URL: process.env.REDIS_URL || "",
-        LLM_API_KEY: process.env.LLM_API_KEY || "",
-        LLM_BASE_URL: process.env.LLM_BASE_URL || "",
-        LLM_MODEL: process.env.LLM_MODEL || "",
-        API_BASE_URL: process.env.API_BASE_URL || process.env.NEXTAUTH_URL || "http://localhost:3000",
-        INTERNAL_API_SECRET: process.env.INTERNAL_API_SECRET || "",
-        AXIOM_TOKEN: process.env.AXIOM_TOKEN || "",
-      },
-    });
+    const template = process.env.E2B_TEMPLATE || "ai-website-builder-v2";
+    const sandboxEnvs = {
+      REDIS_URL: process.env.REDIS_URL || "",
+      LLM_API_KEY: process.env.LLM_API_KEY || "",
+      LLM_BASE_URL: process.env.LLM_BASE_URL || "",
+      LLM_MODEL: process.env.LLM_MODEL || "",
+      API_BASE_URL: process.env.API_BASE_URL || process.env.NEXTAUTH_URL || "http://localhost:3000",
+      INTERNAL_API_SECRET: process.env.INTERNAL_API_SECRET || "",
+      AXIOM_TOKEN: process.env.AXIOM_TOKEN || "",
+    };
 
-    console.log(
-      `[Session] Created new sandbox | project=${projectId.slice(0, 8)} | sandbox=${sandbox.sandboxId.slice(0, 8)}`
+    // 诊断日志：检查注入沙盒的环境变量是否齐全
+    const envStatus = Object.entries(sandboxEnvs).map(
+      ([key, val]) => `${key}=${val ? "✓" : "✗ MISSING"}`
     );
+    console.log(`[Session] Creating sandbox | template=${template} | project=${projectId.slice(0, 8)}`);
+    console.log(`[Session] Sandbox envs: ${envStatus.join(", ")}`);
+
+    const createStart = Date.now();
+    let sandbox: Sandbox;
+    try {
+      sandbox = await Sandbox.create({
+        template,
+        timeoutMs: SESSION_TTL,
+        envs: sandboxEnvs,
+      });
+    } catch (createError) {
+      const elapsed = Date.now() - createStart;
+      console.error(
+        `[Session] ✗ Sandbox.create() FAILED after ${elapsed}ms | project=${projectId.slice(0, 8)} | template=${template}`,
+        createError
+      );
+      throw createError;
+    }
+
+    const createElapsed = Date.now() - createStart;
+    console.log(
+      `[Session] Created new sandbox | project=${projectId.slice(0, 8)} | sandbox=${sandbox.sandboxId} | took=${createElapsed}ms`
+    );
+
+    // 健康检查：确认沙盒环境可用
+    try {
+      const healthCheck = await sandbox.commands.run(
+        "echo OK && node --version && ls /agent-runtime/dist/main.js 2>&1",
+        { timeoutMs: 10000 }
+      );
+      console.log(
+        `[Session] Sandbox health check | exitCode=${healthCheck.exitCode} | stdout=${healthCheck.stdout?.trim()}`
+      );
+      if (healthCheck.exitCode !== 0) {
+        console.error(`[Session] ⚠ Health check failed | stderr=${healthCheck.stderr}`);
+      }
+    } catch (healthErr) {
+      console.error(`[Session] ⚠ Health check exception:`, healthErr);
+    }
 
     // 4. 保存到数据库
     await prisma.sandboxSession.upsert({

@@ -53,29 +53,43 @@ export async function dispatchRun(runId: string, projectId: string): Promise<voi
   const currentSandboxId = sandbox.sandboxId;
 
   // 异步执行（不 await），Worker 不阻塞等待完成
-  console.log(`[Dispatcher] Launching agent | run=${runId.slice(0, 8)} | cmd=${cmd.slice(0, 80)}`);
-  console.log(`[Dispatcher] Envs: ${Object.keys(envs).join(", ")} | run=${runId.slice(0, 8)}`);
+  console.log(`[Dispatcher] Launching agent | run=${runId.slice(0, 8)} | sandbox=${sandbox.sandboxId} | mode=${mode} | reused=${isReused}`);
+  console.log(`[Dispatcher] CMD: ${cmd}`);
+  console.log(`[Dispatcher] Envs: ${Object.entries(envs).map(([k, v]) => `${k}=${k === "USER_MESSAGE" ? v.slice(0, 50) : v.slice(0, 20)}`).join(" | ")}`);
+
+  const launchTime = Date.now();
 
   sandbox.commands
     .run(cmd, { timeoutMs: AGENT_RUNTIME_TIMEOUT, envs })
     .then((result) => {
+      const elapsed = Math.round((Date.now() - launchTime) / 1000);
       if (result.exitCode !== 0) {
-        console.log(
-          `[Dispatcher] Agent exited with code ${result.exitCode} | run=${runId.slice(0, 8)}`
+        console.error(
+          `[Dispatcher] ✗ Agent FAILED | exitCode=${result.exitCode} | elapsed=${elapsed}s | run=${runId.slice(0, 8)}`
         );
+        if (result.stdout) {
+          console.log(`[Dispatcher] stdout (last 2000 chars):\n${result.stdout.slice(-2000)}`);
+        }
         if (result.stderr) {
-          console.log(`[Dispatcher] stderr: ${result.stderr.slice(0, 500)} | run=${runId.slice(0, 8)}`);
+          console.error(`[Dispatcher] stderr (last 2000 chars):\n${result.stderr.slice(-2000)}`);
         }
         sandboxSessionManager.terminateSession(projectId, currentSandboxId);
       } else {
         console.log(
-          `[Dispatcher] Agent completed successfully, keeping sandbox for reuse | run=${runId.slice(0, 8)}`
+          `[Dispatcher] ✓ Agent completed | elapsed=${elapsed}s | run=${runId.slice(0, 8)}`
         );
+        if (result.stdout) {
+          console.log(`[Dispatcher] stdout (last 500 chars): ${result.stdout.slice(-500)}`);
+        }
       }
     })
     .catch((error: unknown) => {
+      const elapsed = Math.round((Date.now() - launchTime) / 1000);
       const msg = error instanceof Error ? error.message : String(error);
-      console.error(`[Dispatcher] Agent process error: ${msg} | run=${runId.slice(0, 8)}`);
+      const stack = error instanceof Error ? error.stack : "";
+      console.error(`[Dispatcher] ✗ Agent process EXCEPTION | elapsed=${elapsed}s | run=${runId.slice(0, 8)}`);
+      console.error(`[Dispatcher] Error: ${msg}`);
+      if (stack) console.error(`[Dispatcher] Stack: ${stack}`);
       sandboxSessionManager.terminateSession(projectId, currentSandboxId);
     });
 
@@ -134,24 +148,34 @@ export async function dispatchResumeRun(
 
   const currentSandboxId = sandbox.sandboxId;
 
-  console.log(`[Dispatcher] Resuming agent | run=${runId.slice(0, 8)} | cmd=${cmd.slice(0, 80)}`);
+  console.log(`[Dispatcher] Resuming agent | run=${runId.slice(0, 8)} | sandbox=${sandbox.sandboxId} | cmd=${cmd}`);
+
+  const resumeLaunchTime = Date.now();
 
   sandbox.commands
     .run(cmd, { timeoutMs: AGENT_RUNTIME_TIMEOUT, envs })
     .then((result) => {
+      const elapsed = Math.round((Date.now() - resumeLaunchTime) / 1000);
       if (result.exitCode !== 0) {
-        console.log(`[Dispatcher] Resumed agent exited with code ${result.exitCode} | run=${runId.slice(0, 8)}`);
+        console.error(`[Dispatcher] ✗ Resumed agent FAILED | exitCode=${result.exitCode} | elapsed=${elapsed}s | run=${runId.slice(0, 8)}`);
+        if (result.stdout) {
+          console.log(`[Dispatcher] Resume stdout (last 2000 chars):\n${result.stdout.slice(-2000)}`);
+        }
         if (result.stderr) {
-          console.log(`[Dispatcher] stderr: ${result.stderr.slice(0, 500)} | run=${runId.slice(0, 8)}`);
+          console.error(`[Dispatcher] Resume stderr (last 2000 chars):\n${result.stderr.slice(-2000)}`);
         }
         sandboxSessionManager.terminateSession(projectId, currentSandboxId);
       } else {
-        console.log(`[Dispatcher] Resumed agent completed successfully | run=${runId.slice(0, 8)}`);
+        console.log(`[Dispatcher] ✓ Resumed agent completed | elapsed=${elapsed}s | run=${runId.slice(0, 8)}`);
       }
     })
     .catch((error: unknown) => {
+      const elapsed = Math.round((Date.now() - resumeLaunchTime) / 1000);
       const msg = error instanceof Error ? error.message : String(error);
-      console.error(`[Dispatcher] Resumed agent process error: ${msg} | run=${runId.slice(0, 8)}`);
+      const stack = error instanceof Error ? error.stack : "";
+      console.error(`[Dispatcher] ✗ Resumed agent EXCEPTION | elapsed=${elapsed}s | run=${runId.slice(0, 8)}`);
+      console.error(`[Dispatcher] Error: ${msg}`);
+      if (stack) console.error(`[Dispatcher] Stack: ${stack}`);
       sandboxSessionManager.terminateSession(projectId, currentSandboxId);
     });
 

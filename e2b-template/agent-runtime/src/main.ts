@@ -71,15 +71,38 @@ const SYSTEM_PROMPT = `你是一个高级全栈网站开发 Agent。用户描述
 - 所有组件都是 TypeScript，带 proper types`;
 
 async function main() {
-  const config = loadConfig();
+  console.log("[AgentBoot] === Agent Runtime Process Started ===");
+  console.log(`[AgentBoot] PID=${process.pid} | Node=${process.version} | argv=${process.argv.slice(2).join(" ")}`);
+  console.log(`[AgentBoot] CWD=${process.cwd()}`);
+
+  // 在 loadConfig 之前先检查关键环境变量
+  const criticalEnvs = ["RUN_ID", "PROJECT_ID", "USER_ID", "REDIS_URL", "LLM_API_KEY", "LLM_BASE_URL", "API_BASE_URL", "INTERNAL_API_SECRET"];
+  const envCheck = criticalEnvs.map(k => `${k}=${process.env[k] ? "✓" : "✗ MISSING"}`);
+  console.log(`[AgentBoot] Env check: ${envCheck.join(", ")}`);
+
+  let config: RuntimeConfig;
+  try {
+    config = loadConfig();
+    console.log(`[AgentBoot] Config loaded OK | mode=${config.mode} | project=${config.projectId.slice(0, 8)} | run=${config.runId.slice(0, 8)}`);
+  } catch (configErr) {
+    console.error("[AgentBoot] ✗ loadConfig() FAILED:", configErr);
+    process.exit(1);
+  }
+
   const logger = new Logger(config.runId, config.projectId);
   const eventEmitter = new EventEmitter(config);
   const redis = new Redis(config.redisUrl, { maxRetriesPerRequest: 3, lazyConnect: true });
 
   try {
     // 连接 Redis
+    console.log(`[AgentBoot] Connecting to Redis: ${config.redisUrl.replace(/\/\/.*@/, "//***@")}`);
+    const redisStart = Date.now();
     await redis.connect();
+    console.log(`[AgentBoot] Redis connected | took=${Date.now() - redisStart}ms`);
+
+    const emitterStart = Date.now();
     await eventEmitter.connect();
+    console.log(`[AgentBoot] EventEmitter connected | took=${Date.now() - emitterStart}ms`);
 
     logger.info("Agent Runtime starting", {
       runId: config.runId,
@@ -90,18 +113,26 @@ async function main() {
 
     // 发射 running 状态
     await eventEmitter.emitStatusChange("running");
+    console.log("[AgentBoot] Status 'running' emitted");
 
     // 加载 Skills
     const skillManager = new SkillManager(redis, logger, config);
+    console.log("[AgentBoot] Loading skills...");
     await skillManager.loadSkills();
+    console.log("[AgentBoot] Skills loaded");
 
     // 获取用户消息（从后端 API 或环境变量）
     const userMessage = process.env.USER_MESSAGE || "请根据项目需求继续工作";
+    console.log(`[AgentBoot] User message (first 100): ${userMessage.slice(0, 100)}`);
 
     // 模式选择
     const client = createLLMClient(config);
     const model = getModel(config);
+    console.log(`[AgentBoot] LLM client created | model=${model} | baseUrl=${config.llmBaseUrl}`);
+    console.log("[AgentBoot] Selecting mode via LLM...");
+    const modeStart = Date.now();
     const modeAnalysis = await selectMode(client, model, userMessage, config);
+    console.log(`[AgentBoot] Mode selected: ${modeAnalysis.mode} | reason=${modeAnalysis.reason} | took=${Date.now() - modeStart}ms`);
     logger.info("Mode selected", { mode: modeAnalysis.mode, reason: modeAnalysis.reason });
 
     // 构建 system prompt
@@ -117,10 +148,15 @@ async function main() {
       if (cached) {
         existingMessages = JSON.parse(cached);
         logger.info("Loaded conversation from cache", { messageCount: existingMessages.length });
+        console.log(`[AgentBoot] Conversation cache loaded | messages=${existingMessages.length}`);
+      } else {
+        console.log("[AgentBoot] No conversation cache found (iterate mode)");
       }
     }
 
     // 运行 Agent Loop
+    console.log(`[AgentBoot] Starting Agent Loop | maxSteps=${config.maxSteps}`);
+    const loopStart = Date.now();
     const result = await agentLoop({
       config,
       systemPrompt,
@@ -131,6 +167,8 @@ async function main() {
       redis,
     });
 
+    const loopElapsed = Math.round((Date.now() - loopStart) / 1000);
+    console.log(`[AgentBoot] Agent Loop finished | success=${result.success} | steps=${result.steps} | elapsed=${loopElapsed}s`);
     logger.info("Agent Loop completed", {
       success: result.success,
       steps: result.steps,
@@ -143,6 +181,7 @@ async function main() {
       900, // 15 分钟 TTL，与沙盒生命周期一致
       JSON.stringify(result.finalMessages)
     );
+    console.log("[AgentBoot] Conversation cached to Redis");
 
     // 同步文件到后端
     if (result.success) {
@@ -181,7 +220,10 @@ async function main() {
     process.exit(result.success ? 0 : 1);
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    logger.error("Agent Runtime fatal error", { error: msg });
+    const stack = error instanceof Error ? error.stack : "";
+    console.error(`[AgentBoot] ✗ FATAL ERROR: ${msg}`);
+    if (stack) console.error(`[AgentBoot] Stack: ${stack}`);
+    logger.error("Agent Runtime fatal error", { error: msg, stack });
 
     try {
       await eventEmitter.emitError(msg, "RUNTIME_ERROR");
@@ -269,6 +311,7 @@ async function collectFiles(
 }
 
 main().catch((err) => {
-  console.error("Unhandled error:", err);
+  console.error("[AgentBoot] ✗ Unhandled top-level error:");
+  console.error(err);
   process.exit(1);
 });

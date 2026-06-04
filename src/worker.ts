@@ -126,10 +126,13 @@ const worker = new Worker<AgentJobData>(
     }
 
     try {
+      console.log(`[Worker] Dispatching | run=${runId.slice(0, 8)} | project=${projectId.slice(0, 8)}`);
       await dispatchRun(runId, projectId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error(`[Worker] ✗ Dispatch failed: ${message}`);
+      const stack = error instanceof Error ? error.stack : "";
+      console.error(`[Worker] ✗ Dispatch failed | run=${runId.slice(0, 8)} | error: ${message}`);
+      if (stack) console.error(`[Worker] Stack: ${stack}`);
       await prisma.projectRun.update({
         where: { id: runId },
         data: { status: "failed", error: message, finishedAt: new Date() },
