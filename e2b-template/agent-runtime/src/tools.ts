@@ -341,29 +341,46 @@ async function executeAskUser(
   ctx.askUserCount++;
   const answerKey = `loop:${ctx.runId}:answer:${ctx.askUserCount}`;
 
+  console.log(`[AskUser] Emitting question | askCount=${ctx.askUserCount} | question=${args.question.slice(0, 80)}`);
+  console.log(`[AskUser] Options: ${JSON.stringify(args.options)}`);
+
   // 推送问题到前端
-  await ctx.eventEmitter.emitHITLQuestion(
-    args.question,
-    args.options,
-    ctx.askUserCount
-  );
+  try {
+    await ctx.eventEmitter.emitHITLQuestion(
+      args.question,
+      args.options,
+      ctx.askUserCount
+    );
+    console.log(`[AskUser] emitHITLQuestion OK`);
+  } catch (emitErr) {
+    console.error(`[AskUser] ✗ emitHITLQuestion FAILED:`, emitErr);
+    return { success: false, output: `Failed to emit question: ${emitErr}` };
+  }
 
   // 通知后端：run 进入 paused 状态
-  await callInternalAPI(ctx, "/api/internal/run/pause", {
-    runId: ctx.runId,
-    reason: "user_input",
-    askCount: ctx.askUserCount,
-  });
+  try {
+    await callInternalAPI(ctx, "/api/internal/run/pause", {
+      runId: ctx.runId,
+      reason: "user_input",
+      askCount: ctx.askUserCount,
+    });
+    console.log(`[AskUser] pause API called OK`);
+  } catch (pauseErr) {
+    console.error(`[AskUser] ✗ pause API FAILED:`, pauseErr);
+  }
 
   ctx.logger.info("Waiting for user answer...", {
     question: args.question,
     askCount: ctx.askUserCount,
   });
 
+  console.log(`[AskUser] Blocking on BRPOP | key=${answerKey} | timeout=1800s`);
+
   // Redis BRPOP 阻塞等待用户答案（30 分钟超时）
   const result = await ctx.redis.brpop(answerKey, 1800);
 
   if (!result) {
+    console.log(`[AskUser] BRPOP timeout (30min), pausing run`);
     // 超时
     await callInternalAPI(ctx, "/api/internal/run/finalize", {
       runId: ctx.runId,
@@ -379,6 +396,7 @@ async function executeAskUser(
   }
 
   const answer = result[1];
+  console.log(`[AskUser] Got answer: ${answer}`);
   ctx.logger.info("User answered", { answer, askCount: ctx.askUserCount });
 
   // 通知后端恢复

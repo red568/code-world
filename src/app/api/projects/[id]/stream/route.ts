@@ -60,6 +60,9 @@ export async function GET(
         if (receivedChannel === channel) {
           try {
             const event = JSON.parse(message);
+            if (event.type === "ask_user") {
+              console.log(`[SSE] Forwarding ask_user event | project=${id.slice(0, 8)} | question=${event.data?.question?.slice(0, 60)}`);
+            }
             controller.enqueue(
               encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`)
             );

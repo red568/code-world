@@ -364,6 +364,7 @@ export function useProjectStream(projectId: string | null) {
 
     eventSource.addEventListener("ask_user", (e) => {
       const data = JSON.parse(e.data);
+      console.log("[SSE] ask_user event received:", JSON.stringify(data).slice(0, 300));
       dispatch({ type: "ASK_USER", data });
     });
 

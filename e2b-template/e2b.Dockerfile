@@ -34,9 +34,13 @@ RUN npm prune --omit=dev
 
 WORKDIR /home/user/app
 
-# 复制模板配置文件
+# 复制模板配置文件（逐个 COPY 确保 E2B v2 构建系统正确处理）
 COPY package.json ./
-COPY index.html tsconfig.json vite.config.ts tailwind.config.js postcss.config.js ./
+COPY index.html ./
+COPY tsconfig.json ./
+COPY vite.config.ts ./
+COPY tailwind.config.js ./
+COPY postcss.config.js ./
 COPY src/ ./src/
 
 # 预装依赖
