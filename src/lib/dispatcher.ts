@@ -90,6 +90,10 @@ export async function dispatchRun(runId: string, projectId: string): Promise<voi
       console.error(`[Dispatcher] ✗ Agent process EXCEPTION | elapsed=${elapsed}s | run=${runId.slice(0, 8)}`);
       console.error(`[Dispatcher] Error: ${msg}`);
       if (stack) console.error(`[Dispatcher] Stack: ${stack}`);
+      // E2B CommandExitError 可能携带 stdout/stderr
+      const errAny = error as Record<string, unknown>;
+      if (errAny.stdout) console.log(`[Dispatcher] Exception stdout:\n${String(errAny.stdout).slice(-2000)}`);
+      if (errAny.stderr) console.error(`[Dispatcher] Exception stderr:\n${String(errAny.stderr).slice(-2000)}`);
       sandboxSessionManager.terminateSession(projectId, currentSandboxId);
     });
 
@@ -176,6 +180,9 @@ export async function dispatchResumeRun(
       console.error(`[Dispatcher] ✗ Resumed agent EXCEPTION | elapsed=${elapsed}s | run=${runId.slice(0, 8)}`);
       console.error(`[Dispatcher] Error: ${msg}`);
       if (stack) console.error(`[Dispatcher] Stack: ${stack}`);
+      const errAny = error as Record<string, unknown>;
+      if (errAny.stdout) console.log(`[Dispatcher] Resume exception stdout:\n${String(errAny.stdout).slice(-2000)}`);
+      if (errAny.stderr) console.error(`[Dispatcher] Resume exception stderr:\n${String(errAny.stderr).slice(-2000)}`);
       sandboxSessionManager.terminateSession(projectId, currentSandboxId);
     });
 
