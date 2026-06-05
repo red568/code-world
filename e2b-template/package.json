@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "e2b:build:dev": "cd ai-website-builder-v2 && npx tsx build.dev.ts",
+    "e2b:build:prod": "cd ai-website-builder-v2 && npx tsx build.prod.ts"
   },
   "dependencies": {
     "react": "^18.3.1",

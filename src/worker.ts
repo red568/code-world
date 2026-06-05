@@ -1,10 +1,11 @@
 /**
- * BullMQ Worker 入口
+ * BullMQ Worker — 沙盒架构
  *
- * 独立进程运行，消费 agent-tasks 队列中的任务。
- * 内置 Bull Board 监控面板（端口 3001）。
+ * 独立进程运行，消费 agent-tasks 队列。
+ * Worker 只负责：乐观锁 (queued→running) + 调度到沙盒 + 错误处理。
+ * Agent Loop 在 E2B 沙盒内运行，Worker 不等待完成。
  *
- * 启动命令: npx tsx src/worker.ts
+ * 启动命令: npm run worker
  */
 
 import "dotenv/config";
@@ -14,12 +15,68 @@ import { createBullBoard } from "@bull-board/api";
 import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
 import { ExpressAdapter } from "@bull-board/express";
 import { Queue } from "bullmq";
-import { redis } from "@/lib/redis";
+import { redis, redisSub } from "@/lib/redis";
 import { QUEUE_NAME, type AgentJobData } from "@/lib/queue";
-import { orchestrateRun } from "@/lib/queue/orchestrator";
-import { withProjectLock } from "@/lib/queue/lock";
-import { NonRetryableError, finalizeRun } from "@/lib/queue/run-fencing";
+import { dispatchRun } from "@/lib/dispatcher";
 import { prisma } from "@/lib/prisma";
+
+// ─── Agent 事件日志订阅 ────────────────────────────────────────────────────────
+
+function startAgentLogger() {
+  redisSub.psubscribe("project:*:events").then(() => {
+    console.log("[AgentLog] Subscribed to project:*:events");
+  });
+
+  redisSub.on("pmessage", (_pattern, channel, message) => {
+    try {
+      const projectId = channel.split(":")[1]?.slice(0, 8);
+      const event = JSON.parse(message);
+      const { type, data } = event;
+
+      switch (type) {
+        case "status_change":
+          console.log(`[Agent] ${projectId} | status → ${data.status} | ${data.message}`);
+          break;
+        case "agent_thinking":
+          console.log(`[Agent] ${projectId} | thinking | ${data.content.slice(0, 120)}`);
+          break;
+        case "tool_call":
+          console.log(`[Agent] ${projectId} | tool_call | ${data.tool} | ${JSON.stringify(data.args).slice(0, 100)}`);
+          break;
+        case "tool_result":
+          console.log(`[Agent] ${projectId} | tool_result | ${data.tool} | success=${data.success} | ${data.summary.slice(0, 80)}`);
+          break;
+        case "ask_user":
+          console.log(`[Agent] ${projectId} | ask_user | ${data.question}`);
+          break;
+        case "preview_ready":
+          console.log(`[Agent] ${projectId} | preview_ready | ${data.previewUrl}`);
+          break;
+        case "build_log":
+          console.log(`[Agent] ${projectId} | ${data.stream} | ${data.line}`);
+          break;
+        case "error":
+          console.error(`[Agent] ${projectId} | ERROR | ${data.code} | ${data.message}`);
+          break;
+        case "codegen_file_start":
+          console.log(`[Agent] ${projectId} | codegen | start ${data.path}`);
+          break;
+        case "codegen_file_done":
+          console.log(`[Agent] ${projectId} | codegen | done ${data.path}`);
+          break;
+        case "clarification_needed":
+          console.log(`[Agent] ${projectId} | clarification | clarity=${data.clarity} | questions=${data.missing_info?.length}`);
+          break;
+        default:
+          console.log(`[Agent] ${projectId} | ${type}`);
+      }
+    } catch {
+      // ignore malformed messages
+    }
+  });
+}
+
+startAgentLogger();
 
 // ─── Bull Board 监控面板 ────────────────────────────────────────────────────────
 
@@ -40,7 +97,7 @@ app.get("/health", (_req, res) => {
 
 const MONITOR_PORT = parseInt(process.env.PORT || process.env.MONITOR_PORT || "3001", 10);
 app.listen(MONITOR_PORT, () => {
-  console.log(`[Worker] Bull Board 监控面板: http://localhost:${MONITOR_PORT}/monitor`);
+  console.log(`[Worker] Bull Board: http://localhost:${MONITOR_PORT}/monitor`);
 });
 
 // ─── Worker 逻辑 ────────────────────────────────────────────────────────────────
@@ -48,71 +105,57 @@ app.listen(MONITOR_PORT, () => {
 const worker = new Worker<AgentJobData>(
   QUEUE_NAME,
   async (job) => {
-    const startTime = Date.now();
     const { runId, projectId } = job.data;
-    console.log(`[Worker] ▶ Job ${job.id} started | run=${runId.slice(0, 8)} | project=${projectId.slice(0, 8)}`);
+    console.log(`[Worker] ▶ Job ${job.id} | run=${runId.slice(0, 8)} | project=${projectId.slice(0, 8)}`);
 
-    // 防御性检查：项目可能已被删除
     const project = await prisma.project.findUnique({ where: { id: projectId } });
     if (!project) {
       console.log(`[Worker] 项目 ${projectId.slice(0, 8)} 已删除，跳过`);
       return;
     }
 
-    // 条件状态转移：queued → running
-    const updated = await prisma.projectRun.updateMany({
+    // 乐观锁：queued → running
+    const claimed = await prisma.projectRun.updateMany({
       where: { id: runId, status: "queued" },
-      data: {
-        status: "running",
-        startedAt: new Date(),
-        heartbeatAt: new Date(),
-      },
+      data: { status: "running", startedAt: new Date() },
     });
 
-    if (updated.count === 0) {
-      console.log(`[Worker] Run ${runId.slice(0, 8)} 不再是 queued，跳过（可能已被 Stop）`);
+    if (claimed.count === 0) {
+      console.log(`[Worker] Run ${runId.slice(0, 8)} 不再是 queued，跳过`);
       return;
     }
 
     try {
-      await withProjectLock(projectId, () => orchestrateRun(runId, projectId));
-      const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-      console.log(`[Worker] ✓ Job ${job.id} finished in ${duration}s`);
+      console.log(`[Worker] Dispatching | run=${runId.slice(0, 8)} | project=${projectId.slice(0, 8)}`);
+      await dispatchRun(runId, projectId);
     } catch (error) {
-      const duration = ((Date.now() - startTime) / 1000).toFixed(1);
       const message = error instanceof Error ? error.message : String(error);
-      console.error(`[Worker] ✗ Job ${job.id} threw after ${duration}s: ${message}`);
-
-      // 兜底：确保 run 不会永久卡在 running 状态
-      await finalizeRun(runId, projectId, "failed", message).catch((e: unknown) => {
-        console.error(`[Worker] finalizeRun fallback failed: ${e instanceof Error ? e.message : e}`);
-      });
-
-      if (error instanceof NonRetryableError) {
-        return;
-      }
+      const stack = error instanceof Error ? error.stack : "";
+      console.error(`[Worker] ✗ Dispatch failed | run=${runId.slice(0, 8)} | error: ${message}`);
+      if (stack) console.error(`[Worker] Stack: ${stack}`);
+      await prisma.projectRun.update({
+        where: { id: runId },
+        data: { status: "failed", error: message, finishedAt: new Date() },
+      }).catch(() => {});
       throw error;
     }
   },
   {
     connection: redis,
-    concurrency: 2,
+    concurrency: 50,
   }
 );
 
 worker.on("completed", (job) => {
-  console.log(`[Worker] Job ${job.id} completed`);
+  console.log(`[Worker] ✓ Job ${job.id} dispatched`);
 });
 
 worker.on("failed", (job, err) => {
-  console.error(`[Worker] Job ${job?.id} failed: ${err.message}`);
-  if (err.stack) {
-    console.error(`[Worker] Stack: ${err.stack.split("\n").slice(1, 4).join("\n")}`);
-  }
+  console.error(`[Worker] ✗ Job ${job?.id} failed: ${err.message}`);
 });
 
 worker.on("ready", () => {
-  console.log("[Worker] Ready and waiting for jobs...");
+  console.log("[Worker] Ready | concurrency=50");
 });
 
 // 优雅退出

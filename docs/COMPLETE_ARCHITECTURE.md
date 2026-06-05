@@ -1,0 +1,3419 @@
+# AI Website Builder - 完整架构实施方案
+
+> **版本**: v2.0  
+> **日期**: 2026-06-02  
+> **状态**: 设计阶段
+
+本文档整合了沙盒架构、SSE 实时推送、Human-in-the-Loop 和架构补充方案的完整技术设计。
+
+---
+
+## 目录
+
+- [一、架构概览](#一架构概览)
+- [二、SSE 实时状态推送](#二sse-实时状态推送)
+- [三、Human-in-the-Loop 实现](#三human-in-the-loop-实现)
+- [四、E2B Template 设计](#四e2b-template-设计)
+- [五、Agent Runtime 实现](#五agent-runtime-实现)
+- [六、后端服务改造](#六后端服务改造)
+- [七、沙盒复用策略](#七沙盒复用策略)
+- [八、文件同步策略](#八文件同步策略)
+- [九、监控和日志](#九监控和日志)
+- [十、任务终止流程](#十任务终止流程)
+- [十一、能力建设](#十一能力建设)
+- [十二、实施计划](#十二实施计划)
+
+---
+
+## 一、架构概览
+
+### 1.1 核心理念
+
+**将 Agent Loop 作为沙盒内的一等公民运行，后端服务器只负责调度和事件中转。**
+
+### 1.2 架构对比
+
+#### 新架构（完全沙盒化）
+
+```
+用户请求 → Next.js API → BullMQ → Dispatcher (轻量调度)
+                                      ↓
+                                   E2B Sandbox
+                                   ├─ Agent Runtime (Node.js)
+                                   │  ├─ Loop.ts
+                                   │  ├─ Tools.ts
+                                   │  └─ LLM Client
+                                   └─ User Project (React + Vite)
+                                      ↓
+                                   Redis Pub/Sub (事件推送)
+                                      ↓
+                                   Next.js SSE Endpoint → 前端
+```
+
+**优势**：
+- ✅ 并发度：2 → 50+（25 倍提升）
+- ✅ 停止延迟：5-10 秒 → 立即（沙盒 kill）
+- ✅ 状态机复杂度：-60%
+- ✅ 进程级隔离，互不影响
+- ✅ 水平扩展沙盒，无需扩展 Worker
+
+#### 为什么需要 BullMQ + Dispatcher？
+
+**核心问题**：既然 Agent Loop 已经在沙盒里异步运行，为什么还需要 MQ 和 Dispatcher？
+
+**方案对比**：
+
+| 方案 | API 响应时间 | 可靠性 | 并发控制 | 沙盒管理 | 停止功能 |
+|------|------------|--------|---------|---------|---------|
+| **直接调用沙盒** | 2-5秒（阻塞） | ❌ 重启丢失 | ❌ 无控制 | ❌ 无复用 | ❌ 难实现 |
+| **MQ + Dispatcher** | 200ms | ✅ 持久化 | ✅ 50并发 | ✅ 集中管理 | ✅ 通过sandboxId |
+
+**BullMQ 的价值**：
+1. **可靠性**：任务持久化到 Redis，服务器重启不丢失
+2. **用户体验**：API 立即返回（200ms），不阻塞
+3. **并发控制**：`concurrency: 50` 控制最大并发数，避免成本爆炸
+4. **监控**：Bull Board 提供实时队列监控
+5. **重试**：失败自动重试（可配置）
+6. **扩展性**：可以部署多个 Worker 实例水平扩展
+
+**Dispatcher 的价值**：
+1. **职责分离**：Worker 只负责调度（3秒），不阻塞等待沙盒完成（60秒）
+2. **沙盒会话管理**：集中管理沙盒复用逻辑，跨 Worker 共享
+3. **异步监听**：监听沙盒退出事件，负责清理资源
+4. **停止功能**：保存 sandboxId，支持用户主动停止
+
+**简化后的 Dispatcher（50 行核心代码）**：
+
+```typescript
+export async function dispatchRun(runId: string, projectId: string) {
+  // 1. 获取或创建沙盒（自动复用）
+  const { sandbox, isReused } = await sandboxSessionManager.acquireForProject(projectId);
+  
+  // 2. 启动 Agent Runtime（不等待完成）
+  const process = await sandbox.process.start({
+    cmd: `node /agent-runtime/dist/main.js --runId=${runId} --projectId=${projectId}`,
+  });
+  
+  // 3. 异步监听退出（清理沙盒）
+  process.on('exit', async (exitCode) => {
+    if (exitCode !== 0) {
+      await sandboxSessionManager.terminateSession(projectId);
+    }
+  });
+  
+  // 4. 保存 sandboxId（用于停止功能）
+  await prisma.projectRun.update({
+    where: { id: runId },
+    data: { sandboxId: sandbox.sandboxId },
+  });
+}
+```
+
+**实际场景分析**：
+
+假设 100 个用户同时发起请求：
+
+- **方案 A（MQ + Dispatcher）**：
+  - API 立即返回（200ms × 100 = 20秒）
+  - BullMQ 排队，Worker 并发处理 50 个
+  - 成本可控，用户体验好
+
+- **方案 B（直接调用）**：
+  - API 阻塞等待沙盒创建（3秒 × 100 = 300秒）
+  - 可能创建 100 个沙盒，成本爆炸
+  - 用户等待 5 分钟，体验极差
+
+**结论**：BullMQ + Dispatcher 是保证**可靠性、用户体验、成本控制**的关键架构
+
+### 1.3 关键指标对比
+
+| 指标 | 当前架构 | 新架构 | 提升 |
+|------|---------|--------|------|
+| 最大并发数 | 2 | 50+ | 25x |
+| 停止响应时间 | 5-10s | <1s | 10x |
+| 沙盒启动时间 | 15-30s | 2-5s | 6x |
+| 多轮对话成本 | $0.05 | $0.02 | 60% |
+| 代码复杂度 | 高 | 中 | -40% |
+
+---
+
+## 二、SSE 实时状态推送
+
+### 2.1 架构方案：用户级频道
+
+#### 核心理念
+
+**使用用户级 Redis 频道，单个 SSE 连接自动接收用户所有项目的实时事件**
+
+#### 方案对比
+
+| 方案 | HTTP 连接数 | Redis 订阅数 | 项目增减 | 资源占用 | 适用场景 |
+|------|-----------|------------|---------|---------|---------|
+| **多连接单频道** | N（项目数） | N | 需重建连接 | 高 | 单项目详情页 |
+| **单连接多频道** | 1 | N | 需重建连接 | 中 | 固定项目列表 |
+| **用户级频道** ⭐ | 1 | 1 | 无需重建 | 低 | Dashboard、多项目并发 |
+
+**结论**：用户级频道最适合多项目并发场景，单连接自动接收所有项目事件。
+
+#### 完整数据流
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 1. 用户打开 Dashboard                                         │
+├─────────────────────────────────────────────────────────────┤
+│ 前端：GET /api/stream/user                                   │
+│ 前端：GET /api/projects/states (获取初始状态)                 │
+└─────────────────────────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 2. Next.js 订阅用户级 Redis 频道                              │
+├─────────────────────────────────────────────────────────────┤
+│ await subscriber.subscribe('user:alice:events')             │
+└─────────────────────────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 3. 用户启动多个项目                                            │
+├─────────────────────────────────────────────────────────────┤
+│ 项目 A：POST /api/projects/A/generate                        │
+│ 项目 B：POST /api/projects/B/generate                        │
+│ 项目 C：POST /api/projects/C/iterate                         │
+└─────────────────────────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 4. Dispatcher 启动沙盒（传入 userId）                          │
+├─────────────────────────────────────────────────────────────┤
+│ sandbox.process.start({                                      │
+│   cmd: 'node /agent-runtime/dist/main.js',                  │
+│   envVars: {                                                 │
+│     USER_ID: 'alice',      // 关键：传入用户 ID               │
+│     PROJECT_ID: 'proj-A',                                    │
+│     RUN_ID: 'run-123',                                       │
+│     REDIS_URL: '...',                                        │
+│   }                                                          │
+│ })                                                           │
+└─────────────────────────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 5. 沙盒内 Agent Runtime 初始化                                │
+├─────────────────────────────────────────────────────────────┤
+│ const eventEmitter = new EventEmitter({                     │
+│   redisUrl: process.env.REDIS_URL,                          │
+│   userId: process.env.USER_ID,                              │
+│   projectId: process.env.PROJECT_ID,                        │
+│   runId: process.env.RUN_ID,                                │
+│ });                                                          │
+│                                                              │
+│ // EventEmitter 连接到 Redis (TCP)                           │
+│ this.redis = new Redis(redisUrl);                           │
+└─────────────────────────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 6. Agent Loop 执行并发送事件                                  │
+├─────────────────────────────────────────────────────────────┤
+│ await eventEmitter.emit({                                    │
+│   type: 'tool_call_start',                                   │
+│   data: { tool: 'write_file', args: {...} },                │
+│ });                                                          │
+│                                                              │
+│ // 内部实现：同时发布到两个频道                                 │
+│ const event = {                                              │
+│   projectId: 'proj-A',  // 标记项目 ID                       │
+│   userId: 'alice',                                           │
+│   type: 'tool_call_start',                                   │
+│   data: {...},                                               │
+│   timestamp: Date.now(),                                     │
+│ };                                                           │
+│                                                              │
+│ await Promise.all([                                          │
+│   redis.publish('project:proj-A:events', JSON.stringify(event)), │
+│   redis.publish('user:alice:events', JSON.stringify(event)),     │
+│ ]);                                                          │
+└─────────────────────────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 7. Redis Pub/Sub 推送                                        │
+├─────────────────────────────────────────────────────────────┤
+│ Redis 将消息推送给订阅了 'user:alice:events' 的所有客户端      │
+│ （延迟 < 10ms）                                               │
+└─────────────────────────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 8. Next.js SSE Endpoint 接收并转发                            │
+├─────────────────────────────────────────────────────────────┤
+│ subscriber.on('message', (channel, message) => {            │
+│   const event = JSON.parse(message);                        │
+│   // event.projectId = 'proj-A'                             │
+│   const sseMessage = formatSSE(event);                      │
+│   controller.enqueue(encoder.encode(sseMessage));           │
+│ });                                                          │
+└─────────────────────────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 9. 前端 EventSource 接收（HTTP SSE）                          │
+├─────────────────────────────────────────────────────────────┤
+│ eventSource.addEventListener('message', (e) => {            │
+│   const event = JSON.parse(e.data);                         │
+│   const { projectId, type, data } = event;                  │
+│                                                              │
+│   // 根据 projectId 分发到对应项目                            │
+│   setProjectStates(prev => ({                               │
+│     ...prev,                                                │
+│     [projectId]: {                                          │
+│       ...prev[projectId],                                   │
+│       lastEvent: event,                                     │
+│       status: data.status,                                  │
+│     },                                                       │
+│   }));                                                       │
+│ });                                                          │
+└─────────────────────────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 10. React 更新 UI                                            │
+├─────────────────────────────────────────────────────────────┤
+│ 项目 A 卡片：显示 "正在写入文件..."                            │
+│ 项目 B 卡片：显示 "正在调用 LLM..."                           │
+│ 项目 C 卡片：显示 "已完成"                                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 网络连接拓扑
+
+```
+E2B Sandbox (沙盒内)
+  ↓ TCP 连接 (ioredis)
+Redis Server (Railway/Upstash)
+  ↓ TCP 连接 (ioredis)
+Next.js Server (订阅者)
+  ↓ HTTP SSE (长连接)
+浏览器 (EventSource API)
+```
+
+#### 关键问题：已完成项目会发送事件吗？
+
+**答案：不会，只有正在运行的项目才发送事件**
+
+```
+用户有 4 个项目：
+- 项目 A：已完成（沙盒已销毁）→ 不发送事件 ✅
+- 项目 B：已完成（沙盒已销毁）→ 不发送事件 ✅
+- 项目 C：正在运行（沙盒活跃）→ 发送事件 ✅
+- 项目 D：正在运行（沙盒活跃）→ 发送事件 ✅
+
+结论：
+- 无信息冗余：只有活跃沙盒发送事件
+- 无带宽浪费：Redis Pub/Sub 不存储历史消息
+- 用户只接收正在运行项目的实时事件
+```
+
+#### 混合模式：初始状态 + 实时更新
+
+**问题**：用户打开 Dashboard 时，如何显示已完成项目的状态？
+
+**解决方案**：HTTP 请求获取初始状态 + SSE 接收实时更新
+
+```typescript
+// 前端：src/hooks/use-projects-with-stream.ts
+
+export function useProjectsWithStream() {
+  const [projectStates, setProjectStates] = useState<Record<string, ProjectState>>({});
+  
+  useEffect(() => {
+    // 1. 首次加载：HTTP 请求获取所有项目的当前状态
+    async function loadInitialStates() {
+      const response = await fetch('/api/projects/states');
+      const states = await response.json();
+      
+      // states = {
+      //   'proj-A': { status: 'succeeded', previewUrl: '...', finishedAt: '...' },
+      //   'proj-B': { status: 'succeeded', previewUrl: '...', finishedAt: '...' },
+      //   'proj-C': { status: 'running', currentStep: 5 },
+      //   'proj-D': { status: 'running', currentStep: 3 },
+      // }
+      
+      setProjectStates(states);
+    }
+    
+    loadInitialStates();
+    
+    // 2. 建立 SSE 连接，接收实时更新（只有正在运行的项目）
+    const eventSource = new EventSource('/api/stream/user');
+    
+    eventSource.addEventListener('message', (e) => {
+      const event: AgentEvent = JSON.parse(e.data);
+      const { projectId, type, data } = event;
+      
+      // 实时更新正在运行的项目状态
+      setProjectStates(prev => ({
+        ...prev,
+        [projectId]: {
+          ...prev[projectId],
+          ...data,
+          lastUpdate: Date.now(),
+        },
+      }));
+    });
+    
+    return () => eventSource.close();
+  }, []);
+  
+  return projectStates;
+}
+```
+
+### 2.2 为什么选择 SSE？
+
+| 方案 | 优势 | 劣势 | 适用场景 |
+|------|------|------|---------|
+| **SSE** | 简单、自动重连、单向推送 | 只支持文本、单向 | ✅ 状态推送 |
+| WebSocket | 双向通信、二进制支持 | 复杂、需要维护连接 | 实时聊天 |
+| 轮询 | 简单 | 延迟高、浪费资源 | 低频更新 |
+
+**结论**：SSE 最适合 Agent 状态推送场景（单向、高频、文本）
+
+### 2.3 用户级 SSE Endpoint 实现
+
+```typescript
+// src/app/api/stream/user/route.ts
+
+import { redis } from '@/lib/redis';
+import { getCurrentUserId } from '@/lib/auth';
+
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
+export async function GET(request: Request) {
+  // 从 session/token 获取当前用户 ID
+  const userId = await getCurrentUserId(request);
+  
+  if (!userId) {
+    return new Response('Unauthorized', { status: 401 });
+  }
+  
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(controller) {
+      // 创建 Redis 订阅者
+      const subscriber = redis.duplicate();
+      const channel = `user:${userId}:events`;
+      
+      // 订阅用户级频道
+      await subscriber.subscribe(channel);
+      
+      console.log(`[SSE] User stream connected | user=${userId.slice(0, 8)}`);
+      
+      // 发送初始连接消息
+      const connectMessage = formatSSE({
+        type: 'connected',
+        data: { userId, timestamp: Date.now() },
+      });
+      controller.enqueue(encoder.encode(connectMessage));
+      
+      // 监听 Redis 消息
+      subscriber.on('message', (ch, message) => {
+        if (ch === channel) {
+          try {
+            const event = JSON.parse(message);
+            // 事件中包含 projectId，前端可以根据 projectId 分发
+            const sseMessage = formatSSE(event);
+            controller.enqueue(encoder.encode(sseMessage));
+          } catch (error) {
+            console.error('[SSE] Failed to parse message:', error);
+          }
+        }
+      });
+      
+      // 心跳（每 30 秒）
+      const heartbeatInterval = setInterval(() => {
+        const heartbeat = formatSSE({
+          type: 'heartbeat',
+          data: { timestamp: Date.now() },
+        });
+        controller.enqueue(encoder.encode(heartbeat));
+      }, 30000);
+      
+      // 清理函数
+      request.signal.addEventListener('abort', async () => {
+        console.log(`[SSE] User stream disconnected | user=${userId.slice(0, 8)}`);
+        clearInterval(heartbeatInterval);
+        await subscriber.unsubscribe(channel);
+        await subscriber.quit();
+        controller.close();
+      });
+    },
+  });
+  
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no', // 禁用 Nginx 缓冲
+    },
+  });
+}
+
+function formatSSE(event: any): string {
+  const lines: string[] = [];
+  if (event.type) {
+    lines.push(`event: ${event.type}`);
+  }
+  const data = JSON.stringify(event);
+  lines.push(`data: ${data}`);
+  lines.push('');
+  lines.push('');
+  return lines.join('\n');
+}
+```
+
+### 2.4 获取初始状态 API
+
+```typescript
+// src/app/api/projects/states/route.ts
+
+import { prisma } from '@/lib/prisma';
+import { getCurrentUserId } from '@/lib/auth';
+
+export async function GET(request: Request) {
+  const userId = await getCurrentUserId(request);
+  
+  if (!userId) {
+    return new Response('Unauthorized', { status: 401 });
+  }
+  
+  // 查询用户的所有项目
+  const projects = await prisma.project.findMany({
+    where: { userId },
+    include: {
+      runs: {
+        orderBy: { createdAt: 'desc' },
+        take: 1, // 最新的 run
+      },
+    },
+  });
+  
+  // 构建状态对象
+  const states: Record<string, ProjectState> = {};
+  
+  for (const project of projects) {
+    const latestRun = project.runs[0];
+    
+    states[project.id] = {
+      status: latestRun?.status || 'idle',
+      previewUrl: project.previewUrl,
+      currentStep: latestRun?.status === 'running' ? latestRun.currentStep : undefined,
+      finishedAt: latestRun?.finishedAt,
+      error: latestRun?.error,
+    };
+  }
+  
+  return Response.json(states);
+}
+```
+
+### 2.5 沙盒内 EventEmitter 实现
+
+```typescript
+// agent-runtime/src/event-emitter.ts
+
+import { Redis } from 'ioredis';
+
+export interface EventEmitterConfig {
+  redisUrl: string;
+  userId: string;
+  projectId: string;
+  runId: string;
+}
+
+export class EventEmitter {
+  private redis: Redis;
+  private userId: string;
+  private projectId: string;
+  private runId: string;
+  
+  constructor(config: EventEmitterConfig) {
+    this.redis = new Redis(config.redisUrl);
+    this.userId = config.userId;
+    this.projectId = config.projectId;
+    this.runId = config.runId;
+  }
+  
+  private async emit(event: Partial<AgentEvent>) {
+    const fullEvent: AgentEvent = {
+      ...event,
+      projectId: this.projectId,
+      userId: this.userId,
+      runId: this.runId,
+      timestamp: Date.now(),
+    } as AgentEvent;
+    
+    const message = JSON.stringify(fullEvent);
+    
+    // 同时发布到两个频道
+    await Promise.all([
+      // 1. 项目频道（用于单项目订阅）
+      this.redis.publish(`project:${this.projectId}:events`, message),
+      
+      // 2. 用户频道（用于多项目订阅）
+      this.redis.publish(`user:${this.userId}:events`, message),
+    ]);
+  }
+  
+  async emitStatusChange(status: AgentStatus) {
+    await this.emit({
+      type: 'agent_status_change',
+      data: { status },
+    });
+  }
+  
+  async emitStepStart(step: number) {
+    await this.emit({
+      type: 'agent_step_start',
+      data: { step },
+    });
+  }
+  
+  async emitToolCall(tool: string, args: any) {
+    await this.emit({
+      type: 'tool_call_start',
+      data: { tool, args },
+    });
+  }
+  
+  async emitToolCallComplete(tool: string, success: boolean, result?: any) {
+    await this.emit({
+      type: 'tool_call_complete',
+      data: { tool, success, result },
+    });
+  }
+  
+  async close() {
+    await this.redis.quit();
+  }
+}
+```
+
+### 2.6 Dispatcher 传递 userId
+
+```typescript
+// src/lib/dispatcher.ts
+
+export async function dispatchRun(runId: string, projectId: string) {
+  // 获取项目的 userId
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: { userId: true },
+  });
+  
+  if (!project) throw new Error('Project not found');
+  
+  const { sandbox } = await sandboxSessionManager.acquireForProject(projectId);
+  
+  await sandbox.process.start({
+    cmd: `node /agent-runtime/dist/main.js --runId=${runId} --projectId=${projectId}`,
+    envVars: {
+      USER_ID: project.userId,  // 传入 userId
+      REDIS_URL: process.env.REDIS_URL,
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+    },
+  });
+  
+  // 保存 sandboxId
+  await prisma.projectRun.update({
+    where: { id: runId },
+    data: { sandboxId: sandbox.sandboxId },
+  });
+}
+```
+
+### 2.7 前端多项目 Hook
+
+```typescript
+// src/hooks/use-user-stream.ts
+
+import { useEffect, useState } from 'react';
+import type { AgentEvent } from '@/types/agent';
+
+export interface ProjectState {
+  status?: string;
+  currentStep?: number;
+  currentTool?: string;
+  previewUrl?: string;
+  events?: AgentEvent[];
+  lastUpdate?: number;
+  finishedAt?: string;
+  error?: string;
+}
+
+export function useUserStream() {
+  const [projectStates, setProjectStates] = useState<Record<string, ProjectState>>({});
+  const [isConnected, setIsConnected] = useState(false);
+  
+  useEffect(() => {
+    // 1. 加载初始状态
+    async function loadInitialStates() {
+      try {
+        const response = await fetch('/api/projects/states');
+        if (response.ok) {
+          const states = await response.json();
+          setProjectStates(states);
+        }
+      } catch (error) {
+        console.error('[Stream] Failed to load initial states:', error);
+      }
+    }
+    
+    loadInitialStates();
+    
+    // 2. 建立 SSE 连接
+    const eventSource = new EventSource('/api/stream/user');
+    
+    eventSource.onopen = () => {
+      setIsConnected(true);
+      console.log('[Stream] User stream connected');
+    };
+    
+    eventSource.addEventListener('message', (e) => {
+      const event: AgentEvent = JSON.parse(e.data);
+      const { projectId, type, data } = event;
+      
+      setProjectStates(prev => {
+        const projectState = prev[projectId] || {};
+        
+        // 根据事件类型更新状态
+        switch (type) {
+          case 'agent_status_change':
+            return {
+              ...prev,
+              [projectId]: {
+                ...projectState,
+                status: data.status,
+                lastUpdate: Date.now(),
+              },
+            };
+            
+          case 'tool_call_start':
+            return {
+              ...prev,
+              [projectId]: {
+                ...projectState,
+                currentTool: data.tool,
+                events: [...(projectState.events || []), event].slice(-100),
+                lastUpdate: Date.now(),
+              },
+            };
+            
+          case 'preview_ready':
+            return {
+              ...prev,
+              [projectId]: {
+                ...projectState,
+                previewUrl: data.previewUrl,
+                lastUpdate: Date.now(),
+              },
+            };
+            
+          default:
+            return {
+              ...prev,
+              [projectId]: {
+                ...projectState,
+                events: [...(projectState.events || []), event].slice(-100),
+                lastUpdate: Date.now(),
+              },
+            };
+        }
+      });
+    });
+    
+    eventSource.onerror = () => {
+      setIsConnected(false);
+      console.error('[Stream] User stream error');
+    };
+    
+    return () => eventSource.close();
+  }, []);
+  
+  return { projectStates, isConnected };
+}
+```
+
+### 2.8 Dashboard 使用示例
+
+```typescript
+// src/app/dashboard/page.tsx
+
+import { useUserStream } from '@/hooks/use-user-stream';
+import { useQuery } from '@tanstack/react-query';
+
+export default function Dashboard() {
+  const { projectStates, isConnected } = useUserStream();
+  const { data: projects } = useQuery({
+    queryKey: ['user-projects'],
+    queryFn: () => fetch('/api/projects').then(r => r.json()),
+  });
+  
+  return (
+    <div className="container mx-auto p-4">
+      {/* 连接状态 */}
+      <div className="mb-4">
+        <Badge variant={isConnected ? 'success' : 'destructive'}>
+          {isConnected ? '实时连接' : '未连接'}
+        </Badge>
+      </div>
+      
+      {/* 项目列表 */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        {projects?.map((project: Project) => (
+          <ProjectCard
+            key={project.id}
+            project={project}
+            state={projectStates[project.id]}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ProjectCard({ project, state }: { project: Project; state?: ProjectState }) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{project.name}</CardTitle>
+        <CardDescription>
+          {state?.status && <StatusBadge status={state.status} />}
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {state?.currentTool && (
+          <div className="text-sm text-muted-foreground">
+            正在执行: {state.currentTool}
+          </div>
+        )}
+        {state?.previewUrl && (
+          <Button asChild>
+            <a href={state.previewUrl} target="_blank">查看预览</a>
+          </Button>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+```
+
+### 2.9 事件消息格式
+
+```typescript
+// 事件消息结构
+interface AgentEvent {
+  // 标识信息
+  projectId: string;    // 'proj-A'
+  userId: string;       // 'alice'
+  runId: string;        // 'run-123'
+  
+  // 事件信息
+  type: string;         // 'tool_call_start'
+  data: any;            // { tool: 'write_file', args: {...} }
+  
+  // 元数据
+  timestamp: number;    // 1234567890
+  step?: number;        // 5
+}
+
+// SSE 格式示例
+event: tool_call_start
+data: {"projectId":"proj-A","userId":"alice","type":"tool_call_start","data":{"tool":"write_file"},"timestamp":1234567890}
+
+```
+
+### 2.10 性能指标
+
+| 指标 | 数值 | 说明 |
+|------|------|------|
+| 端到端延迟 | < 100ms | 沙盒发送 → 前端接收 |
+| Redis Pub/Sub 延迟 | < 10ms | 发布 → 订阅者接收 |
+| SSE 推送延迟 | < 50ms | Next.js → 浏览器 |
+| 并发连接数 | 10,000+ | 单个 Redis 支持 |
+| 内存占用 | ~1MB/连接 | SSE 连接 |
+| CPU 占用 | < 1% | 事件推送 |
+
+### 2.11 单项目详情页实现（可选）
+
+```typescript
+// src/app/api/projects/[id]/stream/route.ts
+
+import { prisma } from '@/lib/prisma';
+import { redis } from '@/lib/redis';
+
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
+export async function GET(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id: projectId } = await params;
+  
+  // 验证项目存在
+  const project = await prisma.project.findUnique({ where: { id: projectId } });
+  if (!project) {
+    return new Response('Project not found', { status: 404 });
+  }
+  
+  // 创建 SSE 流
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(controller) {
+      // 订阅 Redis 频道
+      const subscriber = redis.duplicate();
+      const channel = `project:${projectId}:events`;
+      
+      await subscriber.subscribe(channel);
+      
+      console.log(`[SSE] Client connected | project=${projectId.slice(0, 8)}`);
+      
+      // 发送初始连接消息
+      const connectMessage = formatSSE({
+        type: 'connected',
+        data: { projectId, timestamp: Date.now() },
+      });
+      controller.enqueue(encoder.encode(connectMessage));
+      
+      // 监听 Redis 消息
+      subscriber.on('message', (ch, message) => {
+        if (ch === channel) {
+          try {
+            const event = JSON.parse(message);
+            const sseMessage = formatSSE(event);
+            controller.enqueue(encoder.encode(sseMessage));
+          } catch (error) {
+            console.error('[SSE] Failed to parse message:', error);
+          }
+        }
+      });
+      
+      // 心跳（每 30 秒）
+      const heartbeatInterval = setInterval(() => {
+        const heartbeat = formatSSE({
+          type: 'heartbeat',
+          data: { timestamp: Date.now() },
+        });
+        controller.enqueue(encoder.encode(heartbeat));
+      }, 30000);
+      
+      // 清理函数
+      request.signal.addEventListener('abort', async () => {
+        console.log(`[SSE] Client disconnected | project=${projectId.slice(0, 8)}`);
+        clearInterval(heartbeatInterval);
+        await subscriber.unsubscribe(channel);
+        await subscriber.quit();
+        controller.close();
+      });
+    },
+  });
+  
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no', // 禁用 Nginx 缓冲
+    },
+  });
+}
+
+function formatSSE(event: any): string {
+  const lines: string[] = [];
+  if (event.type) {
+    lines.push(`event: ${event.type}`);
+  }
+  const data = JSON.stringify(event);
+  lines.push(`data: ${data}`);
+  lines.push('');
+  lines.push('');
+  return lines.join('\n');
+}
+```
+
+### 2.4 前端 SSE Hook
+
+```typescript
+// src/hooks/use-agent-stream.ts
+
+import { useEffect, useState, useRef } from 'react';
+import type { AgentEvent, AgentStatus } from '@/types/agent';
+
+export function useAgentStream(projectId: string) {
+  const [status, setStatus] = useState<AgentStatus>('INITIALIZING');
+  const [currentStep, setCurrentStep] = useState(0);
+  const [events, setEvents] = useState<AgentEvent[]>([]);
+  const [isConnected, setIsConnected] = useState(false);
+  const [lastHeartbeat, setLastHeartbeat] = useState(Date.now());
+  
+  const eventSourceRef = useRef<EventSource | null>(null);
+  
+  useEffect(() => {
+    const eventSource = new EventSource(`/api/projects/${projectId}/stream`);
+    eventSourceRef.current = eventSource;
+    
+    eventSource.addEventListener('connected', (e) => {
+      console.log('[SSE] Connected', e.data);
+      setIsConnected(true);
+    });
+    
+    eventSource.addEventListener('heartbeat', (e) => {
+      setLastHeartbeat(Date.now());
+    });
+    
+    eventSource.addEventListener('agent_status_change', (e) => {
+      const event: AgentEvent = JSON.parse(e.data);
+      setStatus(event.data.status);
+      setEvents(prev => [...prev, event].slice(-100));
+    });
+    
+    eventSource.addEventListener('agent_step_start', (e) => {
+      const event: AgentEvent = JSON.parse(e.data);
+      setCurrentStep(event.data.step);
+      setEvents(prev => [...prev, event].slice(-100));
+    });
+    
+    eventSource.addEventListener('tool_call_start', (e) => {
+      const event: AgentEvent = JSON.parse(e.data);
+      setEvents(prev => [...prev, event].slice(-100));
+    });
+    
+    eventSource.onerror = (error) => {
+      console.error('[SSE] Connection error:', error);
+      setIsConnected(false);
+    };
+    
+    return () => {
+      eventSource.close();
+      eventSourceRef.current = null;
+    };
+  }, [projectId]);
+  
+  return {
+    status,
+    currentStep,
+    events,
+    isConnected,
+    lastHeartbeat,
+  };
+}
+```
+
+---
+
+## 三、Human-in-the-Loop 实现
+
+### 3.1 设计理念：克制的交互
+
+**核心原则**：尽量减少对用户的打断，只在真正需要时才提问。
+
+#### 克制原则
+
+1. **提问次数限制**：每个 Run 最多 3 次提问，避免频繁打断
+2. **智能判断**：Agent 应尽量自主决策，只在关键分歧点提问
+3. **非阻塞 UI**：问题以通知形式出现，不强制打断用户当前操作
+4. **超时自动处理**：30 分钟无响应自动暂停，支持快速恢复
+5. **防重复提交**：前端防抖 + 后端幂等性，避免双击问题
+
+#### 适合提问的场景
+
+✅ **应该提问**：
+- 关键功能取舍（需要登录功能吗？）
+- 不明确的需求（首页应该展示什么内容？）
+
+❌ **不应该提问**：
+- 代码实现细节（用 useState 还是 useReducer？）
+- 文件命名（组件叫 Button 还是 Btn？）
+- 样式调整（padding 用 16px 还是 20px？）
+
+### 3.2 简化架构：无需沙盒退出
+
+**核心决策**：沙盒保持运行，使用 Redis 阻塞等待用户答案。
+
+#### 为什么不退出沙盒？
+
+| 维度 | 退出沙盒 | 保持运行（推荐） |
+|------|---------|----------------|
+| 资源成本 | 节省（但重启成本高） | 低（空闲时 CPU 接近 0） |
+| 恢复延迟 | 2-5 秒 | 0 秒（即时） |
+| 状态管理 | 需要 LoopState 数据库表 | 无需（内存保持） |
+| 实现复杂度 | 高（持久化 + 恢复逻辑） | 低（Redis BRPOP） |
+| 用户体验 | 差（重启打断） | 好（无感恢复） |
+
+**结论**：保持沙盒运行，符合"克制、不打断"的设计理念。
+
+### 3.3 状态机
+
+```
+running
+  ↓ (调用 ask_user 工具)
+waiting_for_user (沙盒保持运行，Redis BRPOP 阻塞等待)
+  ↓ (用户回答 → Redis LPUSH)
+running (立即恢复，无需重启)
+  ↓ (继续执行)
+succeeded / failed
+```
+
+### 3.4 数据模型
+
+**无需 LoopState 表**，只需更新 ProjectRun 状态：
+
+```prisma
+// prisma/schema.prisma
+
+enum ProjectRunStatus {
+  queued
+  running
+  paused           // 新增：等待用户回答或超时暂停
+  succeeded
+  failed
+  cancelled
+}
+
+model ProjectRun {
+  // ... 现有字段
+  
+  status          ProjectRunStatus @default(queued)
+  currentAskCount Int?             @default(0)  // 当前提问序号（用于防冲突）
+  pausedAt        DateTime?                     // 暂停时间
+  pauseReason     String?                       // 暂停原因：'user_input' | 'timeout'
+}
+```
+
+**Redis 键设计**：
+
+```typescript
+// 答案队列（用户提交答案后推入）
+// 🔑 关键：包含 askCount，避免多次提问时 Key 冲突
+`loop:${runId}:answer:${askCount}`  // TTL: 60 秒（Agent 立即消费）
+
+// 恢复快照（超时前保存，用于恢复）
+`loop:${runId}:snapshot`  // TTL: 24 小时
+```
+
+### 3.5 ask_user 工具实现
+
+```typescript
+// agent-runtime/src/tools.ts
+
+case 'ask_user': {
+  const { question, options } = args as {
+    question: string;
+    options: Array<{ label: string; description: string; value: string }>;
+  };
+  
+  // 检查提问次数限制
+  if (toolContext.askUserCount >= 3) {
+    return {
+      success: false,
+      output: '系统限制：已达到最大提问次数（3 次），请自行判断',
+    };
+  }
+  
+  toolContext.askUserCount++;
+  
+  // 🔑 构造带序号的 Key（避免多次提问冲突）
+  const answerKey = `loop:${toolContext.runId}:answer:${toolContext.askUserCount}`;
+  
+  // 推送问题到前端（包含 askCount）
+  await toolContext.eventEmitter.emit({
+    type: 'HITL_QUESTION',
+    data: { 
+      question, 
+      options,
+      askCount: toolContext.askUserCount, // 🔑 传递序号
+    },
+  });
+  
+  // 更新 Run 状态为 paused
+  await fetch(`${process.env.API_BASE_URL}/api/runs/${toolContext.runId}/pause`, {
+    method: 'POST',
+    body: JSON.stringify({ 
+      reason: 'user_input',
+      askCount: toolContext.askUserCount, // 🔑 保存到数据库
+    }),
+  });
+  
+  toolContext.logger.info('Waiting for user answer...', { 
+    question,
+    askCount: toolContext.askUserCount,
+  });
+  
+  // 🔑 阻塞等待用户答案（30 分钟超时）
+  const result = await redis.brpop(answerKey, 1800);
+  
+  if (!result) {
+    // 超时：保存快照
+    await this.saveSnapshot();
+    
+    // 通知后端超时
+    await fetch(`${process.env.API_BASE_URL}/api/runs/${toolContext.runId}/timeout`, {
+      method: 'POST',
+    });
+    
+    throw new TimeoutError('User did not respond within 30 minutes');
+  }
+  
+  const answer = result[1]; // BRPOP 返回 [key, value]
+  
+  toolContext.logger.info('User answered', { answer });
+  
+  // 恢复 running 状态
+  await fetch(`${process.env.API_BASE_URL}/api/runs/${toolContext.runId}/resume`, {
+    method: 'POST',
+  });
+  
+  return {
+    success: true,
+    output: answer,
+  };
+}
+```
+    success: true,
+    output: answer,
+  };
+}
+```
+
+### 3.6 快照保存（用于超时恢复）
+
+```typescript
+// agent-runtime/src/loop.ts
+
+async saveSnapshot() {
+  const snapshot = {
+    question: this.currentQuestion,
+    conversationHistory: this.messages,
+    currentStep: this.currentStep,
+    fileStates: await this.getModifiedFiles(),
+    askUserCount: this.askUserCount,
+    timestamp: Date.now(),
+  };
+  
+  await redis.setex(
+    `loop:${this.runId}:snapshot`,
+    86400, // 24 小时过期
+    JSON.stringify(snapshot)
+  );
+  
+  this.logger.info('Snapshot saved for recovery', { 
+    snapshotSize: JSON.stringify(snapshot).length 
+  });
+}
+
+async loadSnapshot(): Promise<Snapshot | null> {
+  const data = await redis.get(`loop:${this.runId}:snapshot`);
+  if (!data) return null;
+  
+  return JSON.parse(data);
+}
+```
+
+### 3.7 提交答案 API（防双击核心实现）
+
+```typescript
+// src/app/api/runs/[runId]/answer/route.ts
+
+import { redis } from '@/lib/redis';
+import { prisma } from '@/lib/prisma';
+
+export async function POST(
+  req: Request,
+  { params }: { params: Promise<{ runId: string }> }
+) {
+  const { runId } = await params;
+  const { answer, askCount } = await req.json(); // 🔑 接收 askCount
+  
+  // 1. 验证 Run 状态
+  const run = await prisma.projectRun.findUnique({
+    where: { id: runId },
+  });
+  
+  if (!run || run.status !== 'paused') {
+    return Response.json({ 
+      error: 'Run is not waiting for answer' 
+    }, { status: 400 });
+  }
+  
+  // 🔑 2. 验证 askCount 是否匹配（防止回答错误的问题）
+  if (askCount !== run.currentAskCount) {
+    return Response.json({ 
+      error: 'Invalid askCount, question may have changed',
+      expectedAskCount: run.currentAskCount,
+    }, { status: 409 });
+  }
+  
+  // 🔑 3. 构造带序号的 Key
+  const answerKey = `loop:${runId}:answer:${askCount}`;
+  
+  // 🔒 4. 原子性防双击：使用 SET NX（只在 key 不存在时设置）
+  const result = await redis.set(
+    answerKey,
+    answer,
+    'EX', 60,  // 60 秒过期（Agent 会立即消费）
+    'NX'       // 只在不存在时设置
+  );
+  
+  if (result === null) {
+    // Key 已存在，说明已经提交过
+    return Response.json({ 
+      success: true,
+      message: 'Answer already submitted',
+      alreadyAnswered: true,
+    });
+  }
+  
+  // 🔑 5. 推送答案到队列（Agent 正在 BRPOP 等待）
+  await redis.lpush(answerKey, answer);
+  
+  console.log(`[Answer] User answered | runId=${runId.slice(0, 8)} | askCount=${askCount} | answer=${answer}`);
+  
+  return Response.json({ success: true });
+}
+```
+
+**防双击机制说明**：
+
+| 防护层 | 技术手段 | 防护场景 |
+|--------|---------|---------|
+| **前端** | `isSubmitting` 状态 | 同标签页快速双击 |
+| **后端** | Redis `SET NX` 原子操作 | 多标签页、前端失效、恶意请求 |
+| **队列** | `BRPOP` 单次消费 | 所有场景兜底 |
+| **askCount** | 数据库序号验证 | 防止回答错误的问题 |
+
+**为什么使用 `SET NX` 而不是 `EXISTS + LPUSH`？**
+
+```typescript
+// ❌ 不推荐：EXISTS + LPUSH（有并发问题）
+const exists = await redis.exists(answerKey);
+if (exists) return; // 🚨 问题：两个请求可能同时通过检查
+await redis.lpush(answerKey, answer);
+
+// ✅ 推荐：SET NX（原子操作）
+const result = await redis.set(answerKey, answer, 'EX', 60, 'NX');
+// Redis 单线程模型保证原子性，即使极端并发也只有一个成功
+```
+
+### 3.8 超时处理 API
+
+```typescript
+// src/app/api/runs/[runId]/timeout/route.ts
+
+export async function POST(
+  req: Request,
+  { params }: { params: Promise<{ runId: string }> }
+) {
+  const { runId } = await params;
+  
+  await prisma.projectRun.update({
+    where: { id: runId },
+    data: { 
+      status: 'paused',
+      pausedAt: new Date(),
+      pauseReason: 'User response timeout',
+    },
+  });
+  
+  // 获取项目信息
+  const run = await prisma.projectRun.findUnique({
+    where: { id: runId },
+    include: { project: true },
+  });
+  
+  // 发布暂停事件到前端
+  await redis.publish(`user:${run.project.userId}:events`, JSON.stringify({
+    type: 'RUN_PAUSED',
+    projectId: run.projectId,
+    runId,
+    data: {
+      reason: 'timeout',
+      canResume: true,
+      message: '任务已暂停（超时），点击"恢复"按钮继续',
+    },
+    timestamp: Date.now(),
+  }));
+  
+  return Response.json({ success: true });
+}
+```
+
+### 3.9 恢复任务 API
+
+```typescript
+// src/app/api/runs/[runId]/resume/route.ts
+
+export async function POST(
+  req: Request,
+  { params }: { params: Promise<{ runId: string }> }
+) {
+  const { runId } = await params;
+  
+  // 检查快照是否存在
+  const snapshotKey = `loop:${runId}:snapshot`;
+  const snapshot = await redis.get(snapshotKey);
+  
+  if (!snapshot) {
+    return Response.json({ 
+      error: 'Snapshot expired (24h), cannot resume. Please start a new run.' 
+    }, { status: 410 });
+  }
+  
+  const run = await prisma.projectRun.findUnique({
+    where: { id: runId },
+  });
+  
+  if (!run || run.status !== 'paused') {
+    return Response.json({ 
+      error: 'Run is not paused' 
+    }, { status: 400 });
+  }
+  
+  // 更新 Run 状态
+  await prisma.projectRun.update({
+    where: { id: runId },
+    data: { 
+      status: 'running',
+      pausedAt: null,
+      pauseReason: null,
+    },
+  });
+  
+  // 重新调度任务（通过 BullMQ）
+  await taskQueue.add('resume-run', {
+    runId,
+    projectId: run.projectId,
+    snapshot,
+  });
+  
+  return Response.json({ success: true });
+}
+```
+
+### 3.10 Dispatcher：从快照恢复
+
+```typescript
+// src/lib/dispatcher.ts
+
+export async function dispatchResumeRun(
+  runId: string, 
+  projectId: string, 
+  snapshot: string
+) {
+  const { sandbox } = await sandboxSessionManager.acquireForProject(projectId);
+  
+  // 启动 Agent，传入恢复参数
+  const process = await sandbox.process.start({
+    cmd: `node /agent-runtime/dist/main.js \
+      --runId=${runId} \
+      --projectId=${projectId} \
+      --resume=true`,
+    envVars: {
+      RESUME_SNAPSHOT: snapshot,
+      REDIS_URL: process.env.REDIS_URL,
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+    },
+  });
+  
+  // 监听进程退出
+  process.on('exit', async (exitCode) => {
+    if (exitCode !== 0) {
+      await sandboxSessionManager.terminateSession(projectId);
+    }
+  });
+}
+```
+
+### 3.11 Agent Runtime：恢复逻辑
+
+```typescript
+// agent-runtime/src/main.ts
+
+async function main() {
+  const args = parseArgs(process.argv);
+  const resumeSnapshot = process.env.RESUME_SNAPSHOT;
+  
+  if (args.resume && resumeSnapshot) {
+    const snapshot = JSON.parse(resumeSnapshot);
+    
+    console.log('[Agent] Resuming from snapshot', {
+      step: snapshot.currentStep,
+      question: snapshot.question,
+    });
+    
+    // 恢复状态
+    loop.messages = snapshot.conversationHistory;
+    loop.currentStep = snapshot.currentStep;
+    loop.askUserCount = snapshot.askUserCount;
+    
+    // 重新询问用户（从断点继续）
+    const answer = await loop.askUser(snapshot.question, snapshot.options);
+    
+    // 继续执行后续步骤
+    await loop.continueFromStep(snapshot.currentStep, answer);
+  } else {
+    // 正常启动
+    await loop.run();
+  }
+}
+
+main().catch(console.error);
+```
+
+### 3.12 前端问答对话框
+
+```typescript
+// src/components/ask-user-dialog.tsx
+
+interface AskUserDialogProps {
+  runId: string;
+  question: string;
+  options: Array<{ label: string; description: string; value: string }>;
+  askCount: number; // 🔑 新增：提问序号
+  onAnswer: () => void;
+}
+
+export function AskUserDialog({
+  runId,
+  question,
+  options,
+  askCount, // 🔑 接收序号
+  onAnswer,
+}: AskUserDialogProps) {
+  const [selectedValue, setSelectedValue] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  
+  const handleSubmit = async () => {
+    if (!selectedValue || isSubmitting) return; // 🔒 防止双击
+    
+    setIsSubmitting(true);
+    
+    try {
+      const response = await fetch(`/api/runs/${runId}/answer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          answer: selectedValue,
+          askCount, // 🔑 传递序号
+        }),
+      });
+      
+      const result = await response.json();
+      
+      if (result.success) {
+        if (result.alreadyAnswered) {
+          toast.info('答案已提交过，Agent 正在处理');
+        } else {
+          toast.success('答案已提交，Agent 继续执行');
+        }
+        onAnswer();
+      } else if (response.status === 409) {
+        toast.error('问题已更新，请刷新页面');
+      } else {
+        toast.error('提交失败，请重试');
+      }
+    } catch (error) {
+      toast.error('网络错误');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+  
+  return (
+    <Dialog open={true}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Agent 需要你的帮助 ({askCount}/3)</DialogTitle>
+          <DialogDescription>{question}</DialogDescription>
+        </DialogHeader>
+        
+        <RadioGroup value={selectedValue} onValueChange={setSelectedValue}>
+          {options.map((option) => (
+            <div key={option.value} className="flex items-start space-x-3 p-3 border rounded">
+              <RadioGroupItem value={option.value} id={option.value} />
+              <Label htmlFor={option.value} className="flex-1 cursor-pointer">
+                <div className="font-medium">{option.label}</div>
+                <div className="text-sm text-muted-foreground">
+                  {option.description}
+                </div>
+              </Label>
+            </div>
+          ))}
+        </RadioGroup>
+        
+        <DialogFooter>
+          <Button
+            onClick={handleSubmit}
+            disabled={!selectedValue || isSubmitting}
+          >
+            {isSubmitting ? '提交中...' : '提交答案'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+```
+
+### 3.13 前端监听 HITL 事件
+
+```typescript
+// src/hooks/use-user-stream.ts (扩展)
+
+eventSource.addEventListener('message', (e) => {
+  const event: AgentEvent = JSON.parse(e.data);
+  const { projectId, type, data } = event;
+  
+  switch (type) {
+    case 'HITL_QUESTION':
+      // 🔑 显示问答对话框（包含 askCount）
+      setActiveQuestion({
+        runId: event.runId,
+        projectId,
+        question: data.question,
+        options: data.options,
+        askCount: data.askCount, // 🔑 传递序号
+      });
+      break;
+      
+    case 'RUN_PAUSED':
+      // 显示恢复按钮
+      setProjectStates(prev => ({
+        ...prev,
+        [projectId]: {
+          ...prev[projectId],
+          status: 'paused',
+          pauseReason: data.reason,
+          canResume: data.canResume,
+        },
+      }));
+      
+      if (data.reason === 'timeout') {
+        toast.info(data.message);
+      }
+      break;
+      
+    // ... 其他事件
+  }
+});
+```
+
+### 3.14 恢复按钮组件
+
+```typescript
+// src/components/resume-button.tsx
+
+interface ResumeButtonProps {
+  runId: string;
+  projectId: string;
+}
+
+export function ResumeButton({ runId, projectId }: ResumeButtonProps) {
+  const [isResuming, setIsResuming] = useState(false);
+  
+  const handleResume = async () => {
+    setIsResuming(true);
+    
+    try {
+      const response = await fetch(`/api/runs/${runId}/resume`, {
+        method: 'POST',
+      });
+      
+      const result = await response.json();
+      
+      if (result.success) {
+        toast.success('任务已恢复，Agent 继续执行');
+      } else if (response.status === 410) {
+        toast.error('快照已过期（24小时），请重新开始任务');
+      } else {
+        toast.error('恢复失败，请重试');
+      }
+    } catch (error) {
+      toast.error('网络错误');
+    } finally {
+      setIsResuming(false);
+    }
+  };
+  
+  return (
+    <Button 
+      onClick={handleResume}
+      disabled={isResuming}
+      variant="outline"
+    >
+      {isResuming ? '恢复中...' : '恢复任务'}
+    </Button>
+  );
+}
+```
+
+### 3.15 用户体验流程
+
+```
+用户视角：
+1. [Agent 询问] "是否要添加深色模式？"
+2. [用户离开 35 分钟]
+3. [回来后看到] "任务已暂停（超时）- 点击恢复按钮继续"
+4. [点击恢复]
+5. [2秒后] Agent 重新出现，继续询问 "是否要添加深色模式？"
+6. [用户回答] "是的"
+7. [Agent 立即恢复] 从断点继续，无需重跑之前的步骤
+```
+
+### 3.16 方案对比总结
+
+| 维度 | 原方案（退出 + LoopState） | 简化方案（阻塞等待） |
+|------|--------------------------|---------------------|
+| 数据库表 | 需要 LoopState 表 | 不需要 |
+| Redis 键 | 需要持久化状态 | 只需临时队列 + 快照 |
+| 沙盒操作 | 退出 → 重启 | 保持运行 |
+| 恢复延迟 | 2-5 秒 | 0 秒（即时） |
+| 代码行数 | ~150 行 | ~80 行 |
+| 超时处理 | Cron 清理 LoopState | Redis TTL 自动过期 |
+| 超时后恢复 | 需要完整状态恢复 | 轻量级快照恢复 |
+| 符合"克制"原则 | 否（重启打断状态） | **是** |
+
+### 3.17 防双击完整流程说明
+
+#### 多次提问场景示例
+
+```
+一个 Run 中提问 3 次的完整流程：
+
+T0: Agent 启动，askUserCount = 0
+
+T1: 第 1 次提问（Step 5）
+    → askUserCount = 1
+    → Redis Key: `loop:run_abc:answer:1`
+    → 数据库: currentAskCount = 1
+    → Agent 执行 BRPOP(`loop:run_abc:answer:1`, 1800)
+    
+T2: 用户回答 "是的"
+    → 前端发送: { answer: "是的", askCount: 1 }
+    → 后端验证: askCount === run.currentAskCount ✅
+    → Redis SET NX: `loop:run_abc:answer:1` = "是的" ✅
+    → Redis LPUSH: 推送到队列
+    → Agent BRPOP 立即返回，Key 被删除
+    
+T3: Agent 继续执行...
+
+T4: 第 2 次提问（Step 12）
+    → askUserCount = 2
+    → Redis Key: `loop:run_abc:answer:2`  // ✅ 不同的 Key
+    → 数据库: currentAskCount = 2
+    → Agent 执行 BRPOP(`loop:run_abc:answer:2`, 1800)
+    
+T5: 用户回答 "不需要"
+    → 前端发送: { answer: "不需要", askCount: 2 }
+    → 后端验证: askCount === run.currentAskCount ✅
+    → Redis SET NX: `loop:run_abc:answer:2` = "不需要" ✅
+    → Agent BRPOP 立即返回，Key 被删除
+    
+T6: Agent 继续执行...
+
+T7: 第 3 次提问（Step 20）
+    → askUserCount = 3
+    → Redis Key: `loop:run_abc:answer:3`  // ✅ 又是不同的 Key
+    → 数据库: currentAskCount = 3
+    → Agent 执行 BRPOP(`loop:run_abc:answer:3`, 1800)
+    
+T8: 用户回答 "需要"
+    → Redis SET NX: `loop:run_abc:answer:3` = "需要" ✅
+    → Agent BRPOP 立即返回，Key 被删除
+    
+T9: Agent 完成任务
+```
+
+#### 防双击的四层防护
+
+```typescript
+// 第 1 层：前端状态防护
+const [isSubmitting, setIsSubmitting] = useState(false);
+if (isSubmitting) return; // 阻止同标签页快速双击
+
+// 第 2 层：askCount 验证
+if (askCount !== run.currentAskCount) {
+  return Response.json({ error: 'Invalid askCount' }, { status: 409 });
+}
+// 防止回答错误的问题（例如用户打开了旧问题的对话框）
+
+// 第 3 层：Redis SET NX 原子操作
+const result = await redis.set(answerKey, answer, 'EX', 60, 'NX');
+if (result === null) {
+  return Response.json({ alreadyAnswered: true });
+}
+// 防止多标签页、极端并发、恶意请求
+
+// 第 4 层：BRPOP 单次消费
+const result = await redis.brpop(answerKey, 1800);
+// 即使多个答案被写入队列，也只取第一个
+```
+
+#### 边界情况处理
+
+**情况 1：用户回答了旧问题**
+
+```
+场景：
+1. Agent 第 1 次提问（askCount=1）
+2. 用户打开对话框，但没有立即回答
+3. Agent 超时，继续执行，又提了第 2 次问题（askCount=2）
+4. 用户回答了第 1 次的问题
+
+处理：
+→ 后端检查: run.currentAskCount === 2
+→ 用户提交: askCount === 1
+→ 返回 409 错误: "问题已更新，请刷新页面"
+```
+
+**情况 2：极端并发（两个请求同时到达）**
+
+```
+时间轴：
+T0.000: 请求 1 和请求 2 同时到达
+        runId = "run_abc", askCount = 1
+        
+T0.001: 请求 1 执行 redis.set(..., 'NX')
+        → 返回 "OK"（成功）
+        
+T0.002: 请求 2 执行 redis.set(..., 'NX')
+        → 返回 null（失败，Key 已存在）
+        → 返回 alreadyAnswered: true
+        
+T0.003: 请求 1 执行 redis.lpush(...)
+        → Agent BRPOP 取到答案
+        
+结论：✅ Redis 单线程模型保证原子性，只有一个请求成功
+```
+
+#### TTL 设置策略
+
+| Redis Key | TTL | 理由 |
+|-----------|-----|------|
+| `loop:${runId}:answer:${askCount}` | 60 秒 | Agent BRPOP 会立即消费，60 秒足够处理网络延迟 |
+| `loop:${runId}:snapshot` | 24 小时 | 用户可能第二天才回来恢复任务 |
+
+**为什么答案队列只需 60 秒？**
+
+- Agent 正在 BRPOP 阻塞等待，用户提交后立即消费
+- BRPOP 消费后 Key 自动删除，TTL 只是兜底保护
+- 即使 Agent 崩溃，60 秒后 Key 自动过期，不会污染 Redis
+
+---
+
+## 四、E2B Template 设计
+
+### 4.1 目录结构
+
+```
+e2b-template/
+├── agent-runtime/              # Agent 运行时（新增）
+│   ├── package.json
+│   ├── tsconfig.json
+│   ├── src/
+│   │   ├── main.ts             # 入口
+│   │   ├── loop.ts             # Agent Loop 核心
+│   │   ├── tools.ts            # 工具执行器
+│   │   ├── llm-client.ts       # LLM 调用封装
+│   │   ├── event-emitter.ts    # 事件推送
+│   │   ├── state-manager.ts    # 状态持久化
+│   │   ├── logger.ts           # 日志
+│   │   └── types.ts
+│   ├── dist/                   # 预编译 JS（加速启动）
+│   │   └── main.js
+│   └── node_modules/           # 预装依赖
+├── user-project/               # 用户项目模板（现有）
+│   ├── package.json
+│   ├── vite.config.ts
+│   └── src/
+└── Dockerfile
+```
+
+### 4.2 Dockerfile
+
+```dockerfile
+FROM node:20-slim
+
+# 安装系统依赖
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /agent-runtime
+
+# 复制并安装 agent-runtime 依赖
+COPY agent-runtime/package*.json ./
+RUN npm ci --production
+
+# 复制源码并预编译
+COPY agent-runtime/src ./src
+COPY agent-runtime/tsconfig.json ./
+RUN npm run build
+
+# 复制用户项目模板
+WORKDIR /home/user/app
+COPY user-project/package*.json ./
+RUN npm ci
+
+COPY user-project/ ./
+
+# 设置工作目录
+WORKDIR /home/user
+
+# 默认命令（会被 dispatcher 覆盖）
+CMD ["node", "/agent-runtime/dist/main.js"]
+```
+
+**预期启动时间**：
+- 当前（需要 npm install）：15-30 秒
+- 优化后（预装依赖）：2-5 秒
+
+---
+
+## 五、Agent Runtime 实现
+
+### 5.1 整体架构概览
+
+**核心理念**：Agent Runtime 是沙盒内的一等公民，负责执行 Agent Loop、管理 Skills、处理上下文压缩。
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Agent Runtime                            │
+├─────────────────────────────────────────────────────────────┤
+│  main.ts (入口)                                              │
+│    ↓                                                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
+│  │ SkillManager │  │MemoryManager │  │  MCPManager  │      │
+│  │  (实现)      │  │  (预留)      │  │  (预留)      │      │
+│  └──────────────┘  └──────────────┘  └──────────────┘      │
+│    ↓                                                         │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │              Agent Loop (核心)                        │  │
+│  │  - 简单任务: ReAct                                    │  │
+│  │  - 复杂任务: Plan + ReAct                            │  │
+│  │  - 上下文压缩: 三层压缩策略                            │  │
+│  └──────────────────────────────────────────────────────┘  │
+│    ↓                                                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
+│  │ Built-in     │  │  Skills      │  │  MCP Tools   │      │
+│  │ Tools        │  │  (DB)        │  │  (预留)      │      │
+│  └──────────────┘  └──────────────┘  └──────────────┘      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 Skill 管理系统
+
+#### 5.2.1 核心设计
+
+**参考 Claude Code 的 Skill 协议**，实现用户级和项目级的 Skill 持久化与动态加载。
+
+**Skill 类型**：
+- `builtin`：代码实现（如 `write_file`、`read_file`）
+- `composite`：组合多个工具调用（如 `create_component` = write_file + write_file）
+- `mcp`：调用外部 MCP 服务（如 `github.create_pr`）
+
+**数据模型**：
+
+```prisma
+// prisma/schema.prisma
+
+model Skill {
+  id          String   @id @default(cuid())
+  name        String   // 'create_component', 'setup_routing'
+  displayName String   // '创建组件', '设置路由'
+  description String   @db.Text
+  category    String   // 'component', 'api', 'styling', 'testing'
+  
+  // Skill 定义（JSON Schema）
+  schema      Json     // { parameters: {...}, returns: {...} }
+  
+  // 实现方式
+  type        SkillType // 'builtin' | 'composite' | 'mcp'
+  
+  // 对于 composite 类型：工具调用序列
+  implementation Json?  // [{ tool: 'write_file', args: {...} }, ...]
+  
+  // 对于 mcp 类型：MCP 服务器配置
+  mcpConfig   Json?    // { server: 'github', method: 'create_pr' }
+  
+  // 作用域
+  scope       SkillScope // 'global' | 'user' | 'project'
+  
+  // 关联
+  userId      String?
+  user        User?    @relation(fields: [userId], references: [id])
+  projectId   String?
+  project     Project? @relation(fields: [projectId], references: [id])
+  
+  // 元数据
+  version     Int      @default(1)
+  enabled     Boolean  @default(true)
+  usageCount  Int      @default(0)
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  @@unique([name, scope, userId, projectId])
+  @@index([userId, scope])
+  @@index([projectId, scope])
+}
+
+enum SkillType {
+  builtin    // 内置实现（代码）
+  composite  // 组合多个工具
+  mcp        // MCP 外部服务
+}
+
+enum SkillScope {
+  global     // 全局可用
+  user       // 用户级别
+  project    // 项目级别
+}
+```
+
+#### 5.2.2 Skill 加载机制
+
+**加载优先级**：Project > User > Global（同名覆盖）
+
+```typescript
+// agent-runtime/src/skill-manager.ts
+
+class SkillManager {
+  /**
+   * 加载 Skills（按优先级）
+   */
+  async loadSkills(userId?: string, projectId?: string): Promise<SkillDefinition[]> {
+    const cacheKey = `skills:${projectId || userId || 'global'}`;
+    
+    // 1. 尝试从 Redis 缓存读取（5 分钟）
+    const cached = await this.redis.get(cacheKey);
+    if (cached) return JSON.parse(cached);
+    
+    // 2. 从数据库加载（按优先级）
+    const skills = await this.prisma.skill.findMany({
+      where: {
+        enabled: true,
+        OR: [
+          { scope: 'global' },
+          { scope: 'user', userId },
+          { scope: 'project', projectId },
+        ],
+      },
+      orderBy: [
+        { scope: 'desc' }, // project > user > global
+        { name: 'asc' },
+      ],
+    });
+    
+    // 3. 去重（项目级覆盖用户级，用户级覆盖全局）
+    const uniqueSkills = new Map<string, SkillDefinition>();
+    for (const skill of skills) {
+      if (!uniqueSkills.has(skill.name)) {
+        uniqueSkills.set(skill.name, this.toSkillDefinition(skill));
+      }
+    }
+    
+    const result = Array.from(uniqueSkills.values());
+    
+    // 4. 缓存到 Redis
+    await this.redis.setex(cacheKey, 300, JSON.stringify(result));
+    
+    return result;
+  }
+}
+```
+
+#### 5.2.3 Skill 执行机制
+
+```typescript
+// agent-runtime/src/skill-manager.ts
+
+class SkillManager {
+  /**
+   * 执行 Skill（根据类型分发）
+   */
+  async executeSkill(
+    skillName: string,
+    args: any,
+    context: ToolContext
+  ): Promise<ToolResult> {
+    const skill = this.loadedSkills.get(skillName);
+    if (!skill) throw new Error(`Skill '${skillName}' not found`);
+
+    switch (skill.type) {
+      case 'builtin':
+        return this.executeBuiltinSkill(skill, args, context);
+      case 'composite':
+        return this.executeCompositeSkill(skill, args, context);
+      case 'mcp':
+        return this.executeMCPSkill(skill, args, context);
+    }
+  }
+
+  /**
+   * 执行组合 Skill（多个工具调用序列）
+   * 支持变量替换：${args.name}, ${outputs.step1}
+   */
+  private async executeCompositeSkill(
+    skill: SkillDefinition,
+    args: any,
+    context: ToolContext
+  ): Promise<ToolResult> {
+    const steps = skill.implementation as CompositeStep[];
+    const outputs: Record<string, any> = {};
+
+    for (const step of steps) {
+      const resolvedArgs = this.resolveVariables(step.args, { args, outputs });
+      const result = await context.executeTool(step.tool, resolvedArgs);
+
+      if (!result.success) {
+        return {
+          success: false,
+          output: `Skill '${skill.name}' failed at step '${step.tool}': ${result.output}`,
+        };
+      }
+
+      if (step.outputVar) {
+        outputs[step.outputVar] = result.output;
+      }
+    }
+
+    return { success: true, output: `Skill '${skill.name}' completed`, artifacts: outputs };
+  }
+}
+```
+
+**关键设计点**：
+1. **缓存策略**：Redis 缓存 5 分钟，避免每次查数据库
+2. **版本管理**：Skill 有版本号，支持升级和回滚
+3. **权限控制**：用户只能修改自己的 User/Project Skills
+4. **热更新**：修改 Skill 后，下次 Run 自动生效（无需重启）
+
+### 5.3 Memory 管理系统（预留接口）
+
+**核心问题**：如何设计 Memory 系统，既不影响当前开发，又为未来扩展留好接口？
+
+**当前阶段**：只定义接口 + 空实现，不创建数据库表。
+
+**Memory 类型（参考 Claude Code）**：
+- `user`：用户角色、偏好、知识背景
+- `feedback`：用户反馈、纠正（"不要用 X，用 Y"）
+- `project`：项目上下文、架构决策（"我们用 Tailwind 不用 CSS Modules"）
+- `reference`：外部资源引用（"API 文档在 xxx"）
+
+```typescript
+// agent-runtime/src/memory-manager.ts
+
+export interface IMemoryManager {
+  save(entry: MemoryEntry): Promise<string>;
+  retrieve(query: string, type?: MemoryType, limit?: number): Promise<MemoryEntry[]>;
+  update(id: string, updates: Partial<MemoryEntry>): Promise<void>;
+  delete(id: string): Promise<void>;
+  list(type?: MemoryType): Promise<MemoryEntry[]>;
+}
+
+// 占位实现（暂不实现，只预留接口）
+export class MemoryManager implements IMemoryManager {
+  async save(entry: MemoryEntry): Promise<string> {
+    console.warn('[MemoryManager] save() not implemented yet');
+    return 'placeholder-id';
+  }
+  async retrieve(query: string): Promise<MemoryEntry[]> {
+    return [];
+  }
+  async update(id: string, updates: Partial<MemoryEntry>): Promise<void> {}
+  async delete(id: string): Promise<void> {}
+  async list(): Promise<MemoryEntry[]> { return []; }
+}
+```
+
+**未来扩展路径**：
+1. **Phase 1**：简单 KV 存储（Redis/数据库）
+2. **Phase 2**：向量搜索（pgvector + Embeddings）
+3. **Phase 3**：自动记忆提取（LLM 分析对话，自动保存关键信息）
+
+### 5.4 Plan + ReAct 混合架构
+
+#### 5.4.1 架构模式选择机制
+
+**核心问题**：不能单纯根据步数判断用什么架构，需要多维度分析。
+
+**决策维度**：
+
+```
+任务分析维度：
+├── 1. 任务类型识别
+│   ├── 单一操作型（"修改按钮颜色"）→ ReAct
+│   ├── 多功能组合型（"添加登录 + 注册 + 找回密码"）→ Plan
+│   └── 探索型（"优化性能"）→ ReAct（边做边调整）
+│
+├── 2. 依赖关系分析
+│   ├── 无依赖/弱依赖 → ReAct
+│   └── 强依赖链（A→B→C）→ Plan
+│
+├── 3. 用户明确性
+│   ├── 需求明确 → Plan（可预先规划）
+│   └── 需求模糊 → ReAct（边做边问）
+│
+└── 4. 用户偏好
+    ├── 用户要求看计划 → 强制 Plan
+    └── 用户要求快速开始 → ReAct
+```
+
+**决策流程**：
+
+```typescript
+// agent-runtime/src/mode-selector.ts
+
+async function selectMode(prompt: string, userPreference?: string): Promise<'plan' | 'react'> {
+  // 1. 用户明确指定
+  if (userPreference === 'plan') return 'plan';
+  if (userPreference === 'react') return 'react';
+
+  // 2. LLM 分析任务特征
+  const analysis = await analyzeLLM(prompt, {
+    dimensions: ['task_type', 'dependencies', 'clarity', 'estimated_steps']
+  });
+
+  // 3. 决策规则
+  if (analysis.task_type === 'single') return 'react';
+  if (analysis.dependencies === 'strong' && analysis.estimated_steps > 3) return 'plan';
+  if (analysis.clarity === 'ambiguous') return 'react';
+
+  // 4. 默认：多步骤用 Plan
+  return analysis.estimated_steps > 5 ? 'plan' : 'react';
+}
+```
+
+**关键改进**：
+- 多维度分析，不只看步数
+- 支持用户偏好（可在设置中配置默认模式）
+- LLM 辅助决策（而不是硬编码规则）
+
+#### 5.4.2 Plan 的工具化管理
+
+**核心问题**：Plan 的状态维护不能单纯依靠 Prompt，需要专门的工具化方式。并且这里要求大模型完成对应的 Plan 任务之后，需要更新 Plan 的状态。为了避免大模型遗漏更新状态，如果连续三次都没有调用这个更新状态，系统将进行强制提醒。
+
+**Plan 管理工具集**：
+
+```typescript
+// agent-runtime/src/plan-tools.ts
+
+const planTools = [
+  {
+    name: 'create_plan',
+    description: '创建任务执行计划',
+    parameters: {
+      title: { type: 'string' },
+      steps: {
+        type: 'array',
+        items: {
+          title: { type: 'string' },
+          description: { type: 'string' },
+          dependencies: { type: 'array', items: { type: 'number' } },
+          estimatedTime: { type: 'string' },
+        },
+      },
+    },
+  },
+  {
+    name: 'update_plan_step',
+    description: '更新计划步骤状态',
+    parameters: {
+      stepId: { type: 'number' },
+      status: { enum: ['pending', 'running', 'completed', 'failed', 'skipped'] },
+      result: { type: 'string', optional: true },
+    },
+  },
+  {
+    name: 'add_plan_step',
+    description: '在计划中插入新步骤（发现遗漏时）',
+    parameters: {
+      afterStepId: { type: 'number' },
+      step: { title: 'string', description: 'string' },
+    },
+  },
+  {
+    name: 'replan_from_step',
+    description: '从某个步骤重新规划后续步骤',
+    parameters: {
+      fromStepId: { type: 'number' },
+      reason: { type: 'string' },
+      newSteps: { type: 'array' },
+    },
+  },
+  {
+    name: 'get_plan_status',
+    description: '获取当前计划执行状态',
+    parameters: {},
+  },
+];
+```
+
+**Plan 状态管理器**：
+
+```typescript
+// agent-runtime/src/plan-state-manager.ts
+
+class PlanStateManager {
+  private currentPlan: Plan | null = null;
+
+  async createPlan(data: CreatePlanInput): Promise<Plan> {
+    this.currentPlan = {
+      id: generateId(),
+      title: data.title,
+      steps: data.steps.map((s, i) => ({
+        id: i + 1,
+        ...s,
+        status: 'pending',
+        startedAt: null,
+        completedAt: null,
+      })),
+      version: 1,
+      createdAt: Date.now(),
+    };
+
+    // 持久化到 Redis（支持恢复）
+    await redis.set(`plan:${runId}`, JSON.stringify(this.currentPlan), 'EX', 3600);
+
+    // 推送到前端展示
+    await eventEmitter.emit({ type: 'plan_created', data: this.currentPlan });
+
+    return this.currentPlan;
+  }
+
+  async updateStepStatus(stepId: number, status: StepStatus, result?: string) {
+    const step = this.currentPlan.steps.find(s => s.id === stepId);
+    if (!step) throw new Error(`Step ${stepId} not found`);
+
+    step.status = status;
+    if (status === 'running') step.startedAt = Date.now();
+    if (status === 'completed' || status === 'failed') {
+      step.completedAt = Date.now();
+      step.result = result;
+    }
+
+    // 持久化 + 推送
+    await redis.set(`plan:${runId}`, JSON.stringify(this.currentPlan));
+    await eventEmitter.emit({ type: 'plan_step_updated', data: { stepId, status, result } });
+  }
+
+  async addStep(afterStepId: number, newStep: StepInput) {
+    const index = this.currentPlan.steps.findIndex(s => s.id === afterStepId);
+    const insertedStep = { ...newStep, id: this.nextStepId(), status: 'pending' };
+    this.currentPlan.steps.splice(index + 1, 0, insertedStep);
+    this.currentPlan.version++;
+
+    await redis.set(`plan:${runId}`, JSON.stringify(this.currentPlan));
+    await eventEmitter.emit({ type: 'plan_step_added', data: { afterStepId, newStep: insertedStep } });
+  }
+
+  async replanFromStep(fromStepId: number, reason: string, newSteps: StepInput[]) {
+    const index = this.currentPlan.steps.findIndex(s => s.id === fromStepId);
+    // 保留已完成的步骤，替换后续步骤
+    this.currentPlan.steps = [
+      ...this.currentPlan.steps.slice(0, index),
+      ...newSteps.map((s, i) => ({ ...s, id: this.nextStepId() + i, status: 'pending' })),
+    ];
+    this.currentPlan.version++;
+
+    await redis.set(`plan:${runId}`, JSON.stringify(this.currentPlan));
+    await eventEmitter.emit({ type: 'plan_replanned', data: { fromStepId, reason, newSteps } });
+  }
+}
+```
+
+**关键改进**：
+- Plan 状态独立管理，不依赖 Prompt 记忆
+- 工具化操作，LLM 通过工具调用更新状态
+- 持久化到 Redis，支持崩溃恢复
+- 版本管理，每次调整自动递增版本号
+
+#### 5.4.3 Plan 生成与用户确认流程
+
+**核心问题**：Plan 生成后需要用户确认，并实时展示执行进度。
+
+**三阶段流程**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Phase 1: Plan 生成                                           │
+├─────────────────────────────────────────────────────────────┤
+│ Agent 分析任务 → 调用 create_plan 工具                        │
+│ PlanStateManager 创建 Plan → 推送到前端展示                   │
+│ Agent 调用 ask_user（类型：plan_approval）→ 阻塞等待确认      │
+└─────────────────────────────────────────────────────────────┘
+         ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Phase 2: 用户交互                                            │
+├─────────────────────────────────────────────────────────────┤
+│ 前端展示 Plan 编辑器：                                        │
+│ - 用户可查看每个步骤的详细描述                                 │
+│ - 用户可调整步骤顺序（拖拽）                                  │
+│ - 用户可修改步骤描述 / 添加 / 删除步骤                        │
+│ - 用户选择：[开始执行] / [修改计划] / [取消]                  │
+└─────────────────────────────────────────────────────────────┘
+         ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Phase 3: 执行与进度展示                                      │
+├─────────────────────────────────────────────────────────────┤
+│ Agent 恢复执行 → 按顺序执行每个步骤（ReAct 模式）             │
+│ 每步骤：update_plan_step(running) → 执行 → update(completed) │
+│ 前端实时展示：进度条 + 当前步骤 + 工具调用详情                 │
+│ 支持暂停/恢复（复用 HITL 机制）                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**前端进度展示**：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ 🔄 正在执行 (步骤 2/5)                                   │
+│                                                          │
+│ ✅ 步骤 1: 创建用户模型              [已完成 - 2m 15s]   │
+│ 🔄 步骤 2: 实现注册 API              [进行中 - 1m 30s]   │
+│    └─ 正在写入文件: api/register.ts                     │
+│ ⏳ 步骤 3: 实现登录 API              [等待中]            │
+│ ⏳ 步骤 4: 添加 JWT 中间件           [等待中]            │
+│ ⏳ 步骤 5: 前端登录页面              [等待中]            │
+│                                                          │
+│ 进度: ████████░░░░░░░░░░ 40%                            │
+│                                                          │
+│ [⏸️ 暂停]  [⏹️ 停止]                                    │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### 5.4.4 Plan 动态调整机制
+
+**场景**：执行过程中发现问题，需要调整计划。
+
+```typescript
+// 场景 1：发现遗漏的步骤
+await executeTool('add_plan_step', {
+  afterStepId: 2,
+  step: {
+    title: '配置数据库连接',
+    description: '发现需要先配置数据库才能创建 API',
+  }
+});
+// → 前端通知："计划已更新，新增步骤"
+
+// 场景 2：步骤失败，需要重新规划
+await executeTool('replan_from_step', {
+  fromStepId: 3,
+  reason: '原方案使用 Prisma 失败，改用 Drizzle ORM',
+  newSteps: [
+    { title: '安装 Drizzle ORM', description: '...' },
+    { title: '重新实现注册 API（使用 Drizzle）', description: '...' },
+  ]
+});
+// → 前端显示："计划已调整，请确认新方案"
+// → 用户确认后继续执行
+```
+
+**调整策略**：
+
+| 调整类型 | 是否需要用户确认 | 说明 |
+|---------|---------------|------|
+| 新增步骤（小改动） | 否，通知即可 | 例如补充一个配置文件 |
+| 删除步骤 | 否，通知即可 | 发现某步骤不需要了 |
+| 重新规划（大改动） | **是** | 例如更换技术方案 |
+| 失败后重试 | 否，自动重试 | 同一步骤重试 ≤ 2 次 |
+
+#### 5.4.5 完整执行流程
+
+```
+1. 任务开始
+   ↓
+2. 多维度分析 → 选择模式（Plan / ReAct）
+   ↓
+3-A. ReAct 模式（简单任务）：
+   └─ 直接执行 Thought → Action → Observe 循环
+   ↓
+3-B. Plan 模式（复杂任务）：
+   ├─ Agent 调用 create_plan 工具
+   ├─ PlanStateManager 创建 Plan → 推送前端
+   ├─ Agent 调用 ask_user（等待用户确认）
+   ├─ 用户查看/编辑 Plan → 点击"开始执行"
+   └─ 按步骤执行（每步 ReAct 模式）：
+       ├─ update_plan_step(running)
+       ├─ 执行工具调用（ReAct 循环）
+       ├─ 如果发现问题：add_plan_step / replan_from_step
+       └─ update_plan_step(completed)
+   ↓
+4. 任务完成
+```
+
+### 5.5 上下文管理机制
+
+#### 5.5.1 核心设计理念
+
+**不持久化压缩后的对话，而是用项目级 Memory + Redis 缓存解决多轮对话问题。**
+
+```
+核心思路：
+├── 沙盒存活期间（15 分钟内）
+│   → 对话历史在 Redis 缓存中，多轮 iterate 直接读取
+│   → 零成本，无需持久化
+│
+├── Run 完成时
+│   → 提取关键信息 → 写入项目级 Memory
+│   → 例如："用户选择 JWT 认证"、"首页有 3 个 section"
+│
+└── 新沙盒启动时（iterate）
+    → 加载项目级 Memory（结构化摘要，几百字）
+    → 加载代码文件（文件系统恢复）
+    → 新的用户 Prompt
+    → Agent 有足够上下文继续工作
+```
+
+**为什么不持久化压缩后的对话？**
+
+| 方案 | 问题 |
+|------|------|
+| 持久化完整对话 | 存储成本高，加载慢 |
+| 持久化 LLM 摘要 | 摘要有信息损失，且"摘要的摘要"会失真 |
+| **项目级 Memory + 代码文件** | Memory 是结构化知识，代码即最新状态，零失真 |
+
+#### 5.5.2 多轮对话上下文衔接
+
+**Run ID 关系**：每次请求创建新 Run，但多个 Run 共享同一沙盒。
+
+```
+Run A (runId: "run-001", generate):
+  → 创建沙盒 → Agent Loop → 完成
+  → 对话历史写入 Redis 缓存（key: conversation:{projectId}）
+  → 提取 Memory → 沙盒保留 15 分钟
+
+Run B (runId: "run-002", iterate):  ← 新的 Run ID，复用沙盒
+  → 从 Redis 缓存加载 Run A 的对话历史
+  → 追加新用户消息
+  → Agent 基于完整上下文继续工作
+  → 完成 → 更新缓存 + 更新 Memory
+
+Run C (runId: "run-003", iterate):  ← 沙盒已过期，新沙盒
+  → Redis 缓存已过期
+  → 从数据库加载项目级 Memory + 代码文件
+  → Agent 基于 Memory + 当前代码状态工作
+```
+
+**Redis 缓存设计**：
+
+```typescript
+// 对话历史缓存（TTL = 沙盒生命周期）
+key: `conversation:${projectId}`
+value: JSON.stringify(messages)
+TTL: 900 (15 分钟，与沙盒 TTL 一致)
+```
+
+#### 5.5.3 运行时压缩（L1: In-Loop Compression）
+
+**目标**：防止单次 Run 内对话过长（仍然需要）。
+
+**核心策略**：按 Tool 重要性分级，选择性丢弃。
+
+**Tool 重要性分级**：
+
+| 分级 | Tool 类型 | 处理方式 | 原因 |
+|------|----------|---------|------|
+| **可丢弃** | `read_file` | 完全丢弃 | 文件随时可重新读取 |
+| **可丢弃** | `run_shell`（成功） | 丢弃输出，保留命令 | npm install 日志无价值 |
+| **可丢弃** | `get_preview_url` | 完全丢弃 | URL 是临时的 |
+| **可丢弃** | `write_file`（被覆盖） | 丢弃旧版本 | 中间版本无意义 |
+| **压缩保留** | `write_file`（最终版本） | 保留路径 + 摘要 | 代表当前项目状态 |
+| **压缩保留** | `run_shell`（失败） | 保留错误信息 | Agent 需避免重蹈覆辙 |
+| **必须保留** | `ask_user` | 完整保留 | 用户决策，不可重现 |
+| **必须保留** | 导致错误的调用 | 完整保留 | 上下文关键信息 |
+
+**实现方案**：
+
+```typescript
+// agent-runtime/src/context-compressor.ts
+
+interface CompressorConfig {
+  checkInterval: number;      // 每 N 步检查一次（默认 10）
+  maxTokens: number;          // token 上限（默认 60K）
+  recentRoundsToKeep: number; // 保留最近 N 轮完整（默认 5）
+}
+
+class InLoopCompressor {
+  private config: CompressorConfig = {
+    checkInterval: 10,
+    maxTokens: 60000,
+    recentRoundsToKeep: 5,
+  };
+
+  // 可安全丢弃的 Tool 类型
+  private discardableTools = new Set([
+    'read_file',
+    'get_preview_url',
+  ]);
+
+  // 可压缩的 Tool 类型（保留摘要）
+  private compressibleTools = new Set([
+    'write_file',
+    'run_shell',
+  ]);
+
+  // 必须保留的 Tool 类型
+  private criticalTools = new Set([
+    'ask_user',
+  ]);
+
+  shouldCompress(messages: Message[], currentStep: number): boolean {
+    if (currentStep % this.config.checkInterval !== 0) return false;
+    return this.estimateTokens(messages) > this.config.maxTokens;
+  }
+
+  compress(messages: Message[]): Message[] {
+    if (messages.length < 6) return messages;
+
+    const systemMsg = messages[0];
+    const recentStart = this.findRecentRoundsStart(
+      messages,
+      this.config.recentRoundsToKeep
+    );
+
+    const compressed: Message[] = [systemMsg];
+
+    // 早期轮次：按 Tool 重要性过滤
+    for (let i = 1; i < recentStart; i++) {
+      const msg = messages[i];
+
+      if (msg.role === 'user' && typeof msg.content === 'string') {
+        // 用户消息：始终保留（截断）
+        compressed.push({
+          role: 'user',
+          content: msg.content.slice(0, 500),
+        });
+        continue;
+      }
+
+      if (msg.role === 'assistant') {
+        // Assistant 消息：保留文本思考，按规则处理 tool_use
+        const filtered = this.filterAssistantContent(msg);
+        if (filtered) compressed.push(filtered);
+        continue;
+      }
+
+      if (msg.role === 'tool') {
+        // Tool 结果：按重要性决定保留/压缩/丢弃
+        const processed = this.processToolResult(msg);
+        if (processed) compressed.push(processed);
+        continue;
+      }
+    }
+
+    // 最近 N 轮：完整保留
+    compressed.push(...messages.slice(recentStart));
+    return compressed;
+  }
+
+  private processToolResult(msg: ToolMessage): Message | null {
+    const toolName = msg.name;
+
+    // 1. 可丢弃：直接跳过
+    if (this.discardableTools.has(toolName)) {
+      return null;
+    }
+
+    // 2. 必须保留：完整保留
+    if (this.criticalTools.has(toolName)) {
+      return msg;
+    }
+
+    // 3. 失败的调用：保留错误信息
+    if (msg.isError || msg.content?.includes('Error')) {
+      return {
+        ...msg,
+        content: `[ERROR] ${msg.content.slice(0, 300)}`,
+      };
+    }
+
+    // 4. write_file：保留路径，丢弃完整内容
+    if (toolName === 'write_file') {
+      return {
+        ...msg,
+        content: `[已写入文件: ${msg.filePath}]`,
+      };
+    }
+
+    // 5. run_shell（成功）：只保留命令
+    if (toolName === 'run_shell') {
+      return {
+        ...msg,
+        content: `[已执行: ${msg.command}] → 成功`,
+      };
+    }
+
+    // 6. 其他：截断
+    return {
+      ...msg,
+      content: msg.content.slice(0, 200) + '...',
+    };
+  }
+}
+```
+
+**在 Agent Loop 中使用**：
+
+```typescript
+// agent-runtime/src/loop.ts
+
+for (let step = 1; step <= maxSteps; step++) {
+  // ... LLM 调用、工具执行 ...
+
+  if (compressor.shouldCompress(messages, step)) {
+    const before = messages.length;
+    messages = compressor.compress(messages);
+    logger.info('Context compressed', {
+      step,
+      messages: `${before} → ${messages.length}`,
+    });
+    await eventEmitter.emit({ type: 'context_compressed', data: { step } });
+  }
+}
+```
+
+#### 5.5.4 项目级 Memory 提取（替代 L2/L3 压缩）
+
+**Run 完成时，自动提取关键信息写入项目级 Memory**：
+
+```typescript
+// agent-runtime/src/memory-extractor.ts
+
+class MemoryExtractor {
+  /**
+   * Run 完成后，从对话历史中提取项目级 Memory
+   */
+  async extractAndSave(
+    projectId: string,
+    messages: Message[],
+    memoryManager: IMemoryManager
+  ) {
+    // 1. 提取用户决策（从 ask_user 工具的问答中）
+    const decisions = this.extractUserDecisions(messages);
+
+    // 2. 提取技术选型（从 write_file、run_shell 中推断）
+    const techStack = this.extractTechStack(messages);
+
+    // 3. 提取项目结构（从文件操作中）
+    const structure = this.extractProjectStructure(messages);
+
+    // 4. 保存到项目级 Memory
+    await memoryManager.save({
+      type: 'project',
+      name: `run-summary-${Date.now()}`,
+      content: JSON.stringify({ decisions, techStack, structure }),
+      projectId,
+    });
+  }
+
+  private extractUserDecisions(messages: Message[]): string[] {
+    // 从 ask_user 的问答对中提取
+    const decisions: string[] = [];
+    for (const msg of messages) {
+      if (msg.role === 'tool' && msg.name === 'ask_user') {
+        decisions.push(msg.content); // 用户的回答
+      }
+    }
+    return decisions;
+  }
+
+  private extractTechStack(messages: Message[]): Record<string, string> {
+    // 从 package.json 写入、npm install 等推断
+    const stack: Record<string, string> = {};
+    for (const msg of messages) {
+      if (msg.role === 'tool' && msg.name === 'write_file') {
+        if (msg.filePath === 'package.json') {
+          // 解析依赖
+          try {
+            const pkg = JSON.parse(msg.content);
+            Object.assign(stack, pkg.dependencies || {});
+          } catch {}
+        }
+      }
+    }
+    return stack;
+  }
+}
+```
+
+#### 5.5.5 完整上下文管理流程
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 1. Run 开始                                                  │
+│    沙盒复用？ → 从 Redis 缓存读取对话历史                     │
+│    新沙盒？  → 加载项目级 Memory + 恢复代码文件               │
+├─────────────────────────────────────────────────────────────┤
+│ 2. 执行过程中                                                │
+│    每 10 步检查 token 数                                     │
+│    超过 60K → 触发 L1 运行时压缩                             │
+│    按 Tool 重要性分级：丢弃/压缩/保留                         │
+├─────────────────────────────────────────────────────────────┤
+│ 3. Run 完成                                                  │
+│    对话历史 → Redis 缓存（TTL 15 分钟，供复用）               │
+│    提取关键信息 → 写入项目级 Memory                           │
+│    代码文件 → 同步到数据库                                    │
+├─────────────────────────────────────────────────────────────┤
+│ 4. 下次 iterate                                              │
+│    沙盒还在 → 读缓存（完整对话，零损失）                      │
+│    沙盒过期 → Memory + 代码文件（结构化知识，无失真）          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**与旧方案对比**：
+
+| 维度 | 旧方案（三层压缩） | 新方案（Memory + 缓存） |
+|------|-------------------|----------------------|
+| 多轮对话 | 持久化压缩对话 → 加载 → 再压缩 | 缓存命中直接用，否则 Memory + 代码 |
+| 信息损失 | 摘要会逐步失真 | Memory 是结构化知识，零失真 |
+| 存储成本 | ~200KB/项目（压缩后对话） | ~5KB/项目（Memory 条目） |
+| 实现复杂度 | 高（三层压缩器 + LLM 摘要） | 低（一层 L1 + Memory 提取） |
+| LLM 额外调用 | 每次保存/加载都要摘要 | 只在提取 Memory 时调用一次 |
+
+### 5.6 MCP 和 CLI 扩展能力（预留）
+
+**当前阶段**：只预留接口和配置模型，不实现具体逻辑。
+
+#### 5.6.1 能力架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Agent 能力层                              │
+├─────────────────────────────────────────────────────────────┤
+│ L1: 内置工具（Built-in Tools）                                │
+│   - write_file, read_file, run_shell, get_preview_url       │
+│   - 直接在 tools.ts 中实现                                    │
+├─────────────────────────────────────────────────────────────┤
+│ L2: Skill（可组合的高级能力）                                 │
+│   - 由多个内置工具组合而成                                     │
+│   - 用户级 / 项目级持久化                                     │
+├─────────────────────────────────────────────────────────────┤
+│ L3: MCP（Model Context Protocol）[预留]                      │
+│   - 连接外部服务：GitHub, Figma, Database                    │
+│   - 通过 MCP Server 提供标准化接口                            │
+│   - 区分用户级 / 项目级 MCP Server 配置                       │
+├─────────────────────────────────────────────────────────────┤
+│ L4: CLI（命令行工具）[预留]                                   │
+│   - 在沙盒内执行任意 CLI 命令                                 │
+│   - 命令白名单 + 超时控制                                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 5.6.2 预留接口设计
+
+```typescript
+// agent-runtime/src/mcp-manager.ts
+
+export interface IMCPManager {
+  listServers(): Promise<MCPServerConfig[]>;
+  callTool(server: string, method: string, args: any): Promise<any>;
+  connect(serverConfig: MCPServerConfig): Promise<void>;
+  disconnect(serverName: string): Promise<void>;
+}
+
+// 占位实现
+export class MCPManager implements IMCPManager {
+  async listServers(): Promise<MCPServerConfig[]> {
+    console.warn('[MCPManager] not implemented yet');
+    return [];
+  }
+  async callTool(server: string, method: string, args: any): Promise<any> {
+    throw new Error('MCP not implemented yet');
+  }
+  async connect(config: MCPServerConfig): Promise<void> {}
+  async disconnect(name: string): Promise<void> {}
+}
+
+// 数据模型（预留）
+interface MCPServerConfig {
+  name: string;           // 'github', 'figma'
+  command: string;        // 启动命令
+  args: string[];         // 启动参数
+  scope: 'global' | 'user' | 'project';
+  userId?: string;
+  projectId?: string;
+  env?: Record<string, string>;  // 环境变量（Token 等）
+}
+```
+
+#### 5.6.3 安全考虑
+
+- **沙盒隔离**：CLI 命令只能在沙盒内执行，无法访问宿主机
+- **命令白名单**：可配置允许的命令列表
+- **超时控制**：命令执行超过 30 秒自动终止
+- **MCP Token 管理**：用户级 Token 加密存储，运行时注入环境变量
+
+### 5.7 实施优先级
+
+| 优先级 | 模块 | 说明 |
+|--------|------|------|
+| **P0（当前实现）** | SkillManager + ReAct 模式 + L1 压缩 | 最小可用版本 |
+| **P1（下个版本）** | Plan + ReAct 混合模式 + L2/L3 压缩 | 复杂任务支持 |
+| **P2（未来）** | Memory 系统（向量搜索） | 长期记忆 |
+| **P3（未来）** | MCP + CLI 集成 | 外部能力扩展 |
+
+---
+
+## 六、后端服务改造
+
+### 6.1 沙盒会话管理器
+
+```typescript
+// src/lib/sandbox-session.ts
+
+import { prisma } from '@/lib/prisma';
+import { Sandbox } from '@e2b/code-interpreter';
+
+const SESSION_TTL = 15 * 60 * 1000; // 15 分钟
+
+export class SandboxSessionManager {
+  /**
+   * 获取或创建沙盒（自动复用）
+   */
+  async acquireForProject(projectId: string): Promise<{
+    sandbox: Sandbox;
+    isReused: boolean;
+  }> {
+    // 1. 查询数据库中的活跃会话
+    const session = await prisma.sandboxSession.findUnique({
+      where: { projectId },
+    });
+    
+    // 2. 尝试复用
+    if (session && session.status === 'running' && session.expiresAt && session.expiresAt > new Date()) {
+      try {
+        const sandbox = await Sandbox.connect(session.sandboxId);
+        
+        // 更新过期时间
+        await prisma.sandboxSession.update({
+          where: { projectId },
+          data: { expiresAt: new Date(Date.now() + SESSION_TTL) },
+        });
+        
+        return { sandbox, isReused: true };
+      } catch (error) {
+        await prisma.sandboxSession.update({
+          where: { projectId },
+          data: { status: 'expired' },
+        });
+      }
+    }
+    
+    // 3. 创建新沙盒
+    const sandbox = await Sandbox.create({
+      template: 'ai-website-builder-v2',
+      timeoutMs: SESSION_TTL,
+      envVars: {
+        DATABASE_URL: process.env.DATABASE_URL!,
+        REDIS_URL: process.env.REDIS_URL!,
+        LLM_API_KEY: process.env.LLM_API_KEY!,
+        LLM_BASE_URL: process.env.LLM_BASE_URL!,
+        LLM_MODEL: process.env.LLM_MODEL!,
+        AXIOM_TOKEN: process.env.AXIOM_TOKEN!,
+      },
+    });
+    
+    // 4. 保存到数据库
+    await prisma.sandboxSession.upsert({
+      where: { projectId },
+      create: {
+        projectId,
+        sandboxId: sandbox.sandboxId,
+        provider: 'e2b',
+        status: 'running',
+        startedAt: new Date(),
+        expiresAt: new Date(Date.now() + SESSION_TTL),
+      },
+      update: {
+        sandboxId: sandbox.sandboxId,
+        status: 'running',
+        startedAt: new Date(),
+        expiresAt: new Date(Date.now() + SESSION_TTL),
+        stoppedAt: null,
+      },
+    });
+    
+    return { sandbox, isReused: false };
+  }
+  
+  /**
+   * 主动终止会话
+   */
+  async terminateSession(projectId: string) {
+    const session = await prisma.sandboxSession.findUnique({
+      where: { projectId },
+    });
+    
+    if (!session) return;
+    
+    try {
+      const sandbox = await Sandbox.connect(session.sandboxId);
+      await sandbox.kill();
+    } catch (error) {
+      console.warn(`[Session] Failed to kill sandbox:`, error);
+    }
+    
+    await prisma.sandboxSession.update({
+      where: { projectId },
+      data: { status: 'stopped', stoppedAt: new Date() },
+    });
+  }
+}
+
+export const sandboxSessionManager = new SandboxSessionManager();
+```
+
+### 6.2 Dispatcher（轻量调度器）
+
+```typescript
+// src/lib/dispatcher.ts
+
+import { prisma } from '@/lib/prisma';
+import { sandboxSessionManager } from './sandbox-session';
+
+export async function dispatchRun(runId: string, projectId: string) {
+  const run = await prisma.projectRun.findUnique({ where: { id: runId } });
+  if (!run) throw new Error(`Run ${runId} not found`);
+  
+  // 1. 确定运行模式
+  const mode = run.type === 'generate' ? 'generate' : 'iterate';
+  
+  // 2. 获取或创建沙盒（自动复用）
+  const { sandbox, isReused } = await sandboxSessionManager.acquireForProject(projectId);
+  
+  // 3. 如果是复用且是 iterate 模式，跳过文件恢复
+  const skipFileRestore = isReused && mode === 'iterate';
+  
+  // 4. 执行 Agent Runtime
+  const process = await sandbox.process.start({
+    cmd: `node /agent-runtime/dist/main.js --runId=${runId} --projectId=${projectId} --mode=${mode} --skipFileRestore=${skipFileRestore}`,
+  });
+  
+  // 5. 监听退出
+  process.on('exit', async (exitCode) => {
+    if (exitCode === 0) {
+      console.log(`[Dispatcher] Keeping sandbox for reuse`);
+    } else {
+      await sandboxSessionManager.terminateSession(projectId);
+    }
+  });
+  
+  // 6. 保存 sandboxId（用于停止）
+  await prisma.projectRun.update({
+    where: { id: runId },
+    data: { sandboxId: sandbox.sandboxId },
+  });
+}
+```
+
+### 6.3 Worker 简化
+
+```typescript
+// src/worker.ts
+
+import { Worker } from "bullmq";
+import { redis } from "@/lib/redis";
+import { QUEUE_NAME, type AgentJobData } from "@/lib/queue";
+import { dispatchRun } from "@/lib/dispatcher";
+import { prisma } from "@/lib/prisma";
+
+const worker = new Worker<AgentJobData>(
+  QUEUE_NAME,
+  async (job) => {
+    const { runId, projectId } = job.data;
+
+    // 乐观锁：queued → running
+    const claimed = await prisma.projectRun.updateMany({
+      where: { id: runId, status: "queued" },
+      data: { status: "running", startedAt: new Date() },
+    });
+
+    if (claimed.count === 0) return;
+
+    try {
+      await dispatchRun(runId, projectId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await prisma.projectRun.update({
+        where: { id: runId },
+        data: { status: 'failed', error: message, finishedAt: new Date() },
+      }).catch(() => {});
+      throw error;
+    }
+  },
+  {
+    connection: redis,
+    concurrency: 50,
+  }
+);
+```
+
+---
+
+## 七、沙盒复用策略
+
+### 7.1 复用收益分析
+
+| 场景 | 不复用成本 | 复用成本 | 节省 |
+|------|-----------|---------|------|
+| 单轮对话 | $0.01 | $0.01 | 0% |
+| 3 轮对话（5 分钟内） | $0.03 | $0.015 | 50% |
+| 5 轮对话（10 分钟内） | $0.05 | $0.02 | 60% |
+
+### 7.2 复用策略
+
+**核心思想**：
+- 每个 Project 维护一个活跃的沙盒会话
+- 会话有过期时间（默认 15 分钟）
+- 新 Run 优先复用现有会话
+- 沙盒过期后自动销毁
+
+**清理策略**：
+
+| 场景 | 策略 | 理由 |
+|------|------|------|
+| 成功完成 | 保留 15 分钟 | ✅ 可复用 |
+| 用户停止 | **立即清理** | ❌ 方向错误，不值得保留 |
+| 任务失败 | **立即清理** | ❌ 失败状态无价值 |
+| 超时 | 立即清理 | ✅ 一致 |
+| 崩溃 | 立即清理 | ✅ 一致 |
+
+**成本节省**：约 30%（假设 30% 的任务被停止或失败）
+
+---
+
+## 八、文件同步策略
+
+### 8.1 简化的同步策略
+
+**核心理念**：只保存成功的结果
+
+```
+写入文件
+  ↓
+本地文件系统（同步）
+  ↓
+记录到待同步队列
+  ↓
+任务成功完成时批量同步到 DB
+```
+
+### 8.2 数据一致性保证
+
+**场景 1：正常退出**
+- Agent 调用 `finish` 工具
+- 触发 `stateManager.syncAll()`
+- 所有文件同步到 DB
+- ✅ 数据完整
+
+**场景 2：用户停止**
+- 用户点击停止按钮
+- 沙盒被 `sandbox.kill()`
+- ❌ 不保存数据（设计如此）
+
+**场景 3：沙盒崩溃**
+- 沙盒进程异常退出
+- ❌ 不保存数据（设计如此）
+
+**优势**：
+- ✅ 简化逻辑：不需要定期快照、异步同步
+- ✅ 降低成本：减少数据库写入次数（-90%）
+- ✅ 提升性能：减少 I/O 开销
+- ✅ 数据一致性：只保存完整的、成功的结果
+
+---
+
+## 九、监控和日志
+
+### 9.1 多层监控架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     监控层级                                  │
+├─────────────────────────────────────────────────────────────┤
+│ L1: Agent Runtime 内部监控（实时）                            │
+│   - 步骤耗时、工具执行时间、内存使用                           │
+│   - 通过 EventEmitter 推送到 Redis                           │
+├─────────────────────────────────────────────────────────────┤
+│ L2: 后端服务监控（聚合）                                      │
+│   - 沙盒创建/复用率、队列积压、Worker 负载                     │
+│   - 通过 Prometheus + Grafana 可视化                         │
+├─────────────────────────────────────────────────────────────┤
+│ L3: 日志分析（离线）                                          │
+│   - Axiom 查询分析、错误聚合、性能趋势                         │
+│   - 用于问题排查和长期优化                                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 9.2 日志方案
+
+#### 开发阶段：Axiom（推荐）
+
+**优势**：
+- 免费额度：500MB/月（约 50 万条日志）
+- 专为 Serverless 设计
+- 支持结构化日志（JSON）
+- 自动聚合、搜索、可视化
+
+**集成方式**：
+- Agent Runtime 内置 `AxiomLogger`
+- 批量推送（100 条或 5 秒）
+- 失败自动重试
+
+**查询示例**：
+
+```apl
+// 查询平均 LLM 响应时间
+['ai-website-builder']
+| where message == "LLM call completed"
+| summarize avg(duration) by bin(_time, 1h)
+
+// 查询失败率
+['ai-website-builder']
+| where level == "error"
+| summarize count() by bin(_time, 1h)
+
+// 查询沙盒复用率
+['ai-website-builder']
+| where message contains "sandbox"
+| summarize 
+    reused = countif(message contains "Reused"),
+    created = countif(message contains "Created")
+| extend reuse_rate = reused / (reused + created) * 100
+```
+
+### 9.3 性能损耗评估
+
+| 监控项 | 开销 | 影响 |
+|--------|------|------|
+| EventEmitter (Redis Pub/Sub) | ~5ms/事件 | 低 |
+| AxiomLogger (批量推送) | ~10ms/100条 | 极低 |
+| Prometheus 指标 | ~1ms/次 | 极低 |
+| 心跳（每 5 秒） | ~5ms | 极低 |
+| **总开销** | **< 1% CPU** | **可忽略** |
+
+---
+
+## 十、任务终止流程
+
+### 10.1 终止场景分析
+
+| 场景 | 触发方式 | 期望行为 | 数据保存 |
+|------|---------|---------|---------|
+| 用户主动停止 | 点击停止按钮 | 立即 kill，不保存 | ❌ 不保存 |
+| 任务完成 | Agent 调用 finish | 正常退出，保存所有数据 | ✅ 完整保存 |
+| 超时 | 执行时间 > 10 分钟 | 强制 kill，不保存 | ❌ 不保存 |
+| 沙盒崩溃 | 进程异常退出 | 标记为失败，不保存 | ❌ 不保存 |
+| LLM 错误 | API 调用失败 | 重试 3 次后失败 | ⚠️ 保存错误日志 |
+
+**设计理念**：
+- ✅ **只有正常完成才保存数据**：用户满意的结果才值得持久化
+- ❌ **异常终止不保存**：错误的中间状态没有保存价值
+- 🔄 **沙盒立即销毁**：释放资源，避免成本浪费
+- 📝 **保留执行日志**：用于问题排查和分析
+
+### 10.2 停止 API 实现
+
+```typescript
+// src/app/api/projects/[id]/stop/route.ts
+
+export async function POST(req: Request, { params }: { params: { id: string } }) {
+  const { id: projectId } = params;
+  const { runId } = await req.json();
+  
+  // 1. 查找活跃 run
+  const activeRun = await prisma.projectRun.findFirst({
+    where: {
+      projectId,
+      id: runId,
+      status: { in: ['queued', 'running', 'waiting_for_user'] },
+    },
+  });
+  
+  if (!activeRun) {
+    return Response.json({ error: 'No active run found' }, { status: 404 });
+  }
+  
+  // 2. 如果在队列中，直接取消
+  if (activeRun.status === 'queued') {
+    await prisma.projectRun.update({
+      where: { id: activeRun.id },
+      data: { status: 'cancelled', finishedAt: new Date() },
+    });
+    
+    return Response.json({ success: true, message: 'Cancelled queued run' });
+  }
+  
+  // 3. 如果在运行中，直接 kill 沙盒（不等待，不保存）
+  if (activeRun.sandboxId) {
+    try {
+      const sandbox = await Sandbox.connect(activeRun.sandboxId);
+      await sandbox.kill(); // 强制终止
+      
+      console.log(`[Stop] Killed sandbox ${activeRun.sandboxId.slice(0, 8)}`);
+    } catch (error) {
+      console.error('[Stop] Failed to kill sandbox:', error);
+    }
+  }
+  
+  // 4. 标记为取消
+  await prisma.projectRun.update({
+    where: { id: activeRun.id },
+    data: { 
+      status: 'cancelled', 
+      finishedAt: new Date(),
+      error: 'User cancelled',
+    },
+  });
+  
+  // 5. 立即清理沙盒会话（不保留）
+  await sandboxSessionManager.terminateSession(projectId);
+  
+  await publishStatusChange(projectId, 'stopped', '已停止');
+  
+  return Response.json({ success: true });
+}
+```
+
+**关键变化**：
+- ❌ 移除停止信号机制（不需要优雅退出）
+- ❌ 移除等待 5 秒逻辑（直接 kill）
+- ❌ 移除数据保存逻辑（不保存中间状态）
+- ✅ 立即清理沙盒会话（释放资源）
+
+**性能提升**：
+- 停止响应时间：5 秒 → <1 秒（**5x 提升**）
+- 沙盒成本：-30%（失败立即清理）
+
+---
+
+## 十一、Agent能力建设
+
+### 11.1 能力架构设计
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Agent 能力层                              │
+├─────────────────────────────────────────────────────────────┤
+│ L1: 内置工具（Built-in Tools）                                │
+│   - write_file, read_file, run_shell, get_preview_url       │
+│   - 直接在 tools.ts 中实现                                    │
+├─────────────────────────────────────────────────────────────┤
+│ L2: SKILL（可组合的高级能力）                                  │
+│   - 例如：create_component, setup_routing, add_api          │
+│   - 由多个内置工具组合而成                                     │
+├─────────────────────────────────────────────────────────────┤
+│ L3: MCP（Model Context Protocol）                            │
+│   - 连接外部服务：GitHub, Figma, Database                    │
+│   - 通过 MCP Server 提供标准化接口                            │
+├─────────────────────────────────────────────────────────────┤
+│ L4: CLI（命令行工具）                                         │
+│   - 在沙盒内执行任意 CLI 命令                                 │
+│   - 例如：npm, git, curl, jq                                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 11.2 SKILL 示例
+
+```typescript
+// agent-runtime/src/skills/create-component.ts
+
+export const createComponentSkill: Skill = {
+  name: 'create_component',
+  description: '创建一个 React 组件（包括组件文件、样式、测试）',
+  parameters: {
+    type: 'object',
+    properties: {
+      name: { type: 'string', description: '组件名称（PascalCase）' },
+      props: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            name: { type: 'string' },
+            type: { type: 'string' },
+            required: { type: 'boolean' },
+          },
+        },
+        description: '组件 props 定义',
+      },
+      withStyles: { type: 'boolean', description: '是否创建样式文件' },
+    },
+    required: ['name'],
+  },
+  
+  async execute(args, context) {
+    const { name, props = [], withStyles = true } = args;
+    const filesCreated: string[] = [];
+    
+    // 1. 生成组件代码
+    const componentCode = generateComponentCode(name, props);
+    await executeTool('write_file', {
+      path: `components/${name}.tsx`,
+      content: componentCode,
+    }, context);
+    filesCreated.push(`components/${name}.tsx`);
+    
+    // 2. 生成样式文件（可选）
+    if (withStyles) {
+      const styleCode = generateStyleCode(name);
+      await executeTool('write_file', {
+        path: `components/${name}.module.css`,
+        content: styleCode,
+      }, context);
+      filesCreated.push(`components/${name}.module.css`);
+    }
+    
+    return {
+      success: true,
+      output: `组件 ${name} 创建成功`,
+      artifacts: { filesCreated },
+    };
+  },
+};
+```
+
+### 11.3 MCP 集成
+
+```typescript
+// agent-runtime/src/mcp-client.ts
+
+export class MCPClient {
+  private process: ChildProcess;
+  
+  constructor(serverCommand: string, serverArgs: string[]) {
+    this.process = spawn(serverCommand, serverArgs, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  }
+  
+  async callTool(name: string, args: any): Promise<any> {
+    const request = {
+      jsonrpc: '2.0',
+      id: ++this.requestId,
+      method: 'tools/call',
+      params: { name, arguments: args },
+    };
+    
+    this.process.stdin!.write(JSON.stringify(request) + '\n');
+    
+    return new Promise((resolve, reject) => {
+      this.process.stdout!.once('data', (data) => {
+        const response = JSON.parse(data.toString());
+        if (response.error) {
+          reject(new Error(response.error.message));
+        } else {
+          resolve(response.result);
+        }
+      });
+    });
+  }
+}
+```

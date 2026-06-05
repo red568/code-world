@@ -1,91 +1,79 @@
 /**
- * POST /api/projects/:id/answer — 用户回答 ask_user 问题，恢复 Agent Loop
+ * POST /api/projects/:id/answer — 用户回答 ask_user 问题
+ *
+ * 通过 Redis LPUSH 将答案推送到沙盒内 agent-runtime 的 BRPOP 队列。
  */
 
 import { prisma } from "@/lib/prisma";
-import { agentQueue } from "@/lib/queue";
-
-const DEMO_USER_ID = "demo-user-001";
+import { redis } from "@/lib/redis";
 
 export async function POST(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const { id } = await params;
+  const { id: projectId } = await params;
   const body = await request.json();
-  const { runId, answerToken, answer, isOther, skipAndContinue } = body;
+  const { runId, answer, isOther, skipAndContinue, answerToken } = body;
 
-  if (!runId || !answerToken) {
+  // answerToken 就是 askCount（前端从 SSE 事件中获取）
+  const askCount = answerToken != null ? Number(answerToken) : null;
+
+  if (!runId || askCount == null) {
     return Response.json(
       { error: "runId and answerToken are required" },
       { status: 400 }
     );
   }
 
-  // 原子 claim：检查 + 翻转状态合为一条 SQL，防止双击/重试导致双重执行
-  // 设为 queued 而非 running，让 worker 走正常的 queued→running 路径
-  const claimed = await prisma.projectRun.updateMany({
-    where: { id: runId, projectId: id, status: "waiting_for_user" },
-    data: { status: "queued" },
-  });
-  if (claimed.count === 0) {
-    return Response.json(
-      { error: "Run not found or not waiting for user input" },
-      { status: 409 }
-    );
-  }
-
-  // 幂等检查：确认 answerToken 匹配
-  const loopState = await prisma.loopState.findUnique({ where: { runId } });
-  if (!loopState || loopState.answerToken !== answerToken) {
-    // answerToken 不匹配，回滚 run 状态
-    await prisma.projectRun.update({
-      where: { id: runId },
-      data: { status: "waiting_for_user" },
-    });
-    return Response.json(
-      { error: "Invalid or expired answerToken" },
-      { status: 409 }
-    );
-  }
-
-  // 构造用户回答的 tool result 内容
-  let toolResultContent: string;
+  // 构造回答内容
+  let answerContent: string;
   if (skipAndContinue) {
-    toolResultContent = "用户选择跳过，请自行选择最合理方案继续执行。";
+    answerContent = "用户选择跳过，请自行选择最合理方案继续执行。";
   } else if (isOther && answer) {
-    const sanitized = String(answer).slice(0, 200);
-    toolResultContent = `用户选择了 [其他]，补充说明：${sanitized}`;
+    answerContent = `用户选择了 [其他]，补充说明：${String(answer).slice(0, 200)}`;
   } else if (answer) {
-    toolResultContent = `用户选择了：${answer}`;
+    answerContent = `用户选择了：${answer}`;
   } else {
-    toolResultContent = "用户选择跳过，请自行选择最合理方案继续执行。";
+    answerContent = "用户选择跳过，请自行选择最合理方案继续执行。";
   }
 
-  // 将恢复信息写入 loopState，由 worker 恢复执行
-  const state = loopState.state as Record<string, unknown>;
-  await prisma.loopState.update({
-    where: { runId },
-    data: {
-      state: {
-        ...state,
-        userAnswer: toolResultContent,
-        resumeReady: true,
-      },
-    },
+  // 验证 run 状态
+  const run = await prisma.projectRun.findFirst({
+    where: { id: runId, projectId, status: "paused" },
   });
 
-  // 重新入队，用 answerToken 作为 jobId 避免与初始 job 的 runId 冲突
-  await agentQueue.add("agent-run", {
-    runId,
-    projectId: id,
-    userId: DEMO_USER_ID,
-  }, {
-    jobId: answerToken,
-    attempts: 3,
-    backoff: { type: "fixed", delay: 5000 },
-  });
+  if (!run) {
+    return Response.json(
+      { error: "Run not found or not paused" },
+      { status: 409 }
+    );
+  }
 
-  console.log(`[API] POST /api/projects/${id.slice(0, 8)}/answer | 200 | runId=${runId.slice(0, 8)} | answer="${toolResultContent.slice(0, 50)}"`);
+  // 验证 askCount 匹配
+  if (run.currentAskCount !== askCount) {
+    return Response.json(
+      { error: "askCount mismatch, question may have expired" },
+      { status: 409 }
+    );
+  }
+
+  // 原子防双击：SET NX
+  const dedupeKey = `answer:dedup:${runId}:${askCount}`;
+  const claimed = await redis.set(dedupeKey, "1", "EX", 300, "NX");
+  if (!claimed) {
+    return Response.json(
+      { error: "Answer already submitted" },
+      { status: 409 }
+    );
+  }
+
+  // 推送答案到 agent-runtime 的 BRPOP 队列
+  const answerKey = `loop:${runId}:answer:${askCount}`;
+  await redis.lpush(answerKey, answerContent);
+
+  console.log(
+    `[API] POST /answer | project=${projectId.slice(0, 8)} | run=${runId.slice(0, 8)} | askCount=${askCount}`
+  );
+
   return Response.json({ ok: true, runId });
 }
