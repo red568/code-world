@@ -1,4 +1,12 @@
-# v10 - 上下文管理系统 v2：全量落盘 + 动态组装
+# 上下文管理系统 v2：全量落盘 + 动态组装
+
+## 目标模型
+
+**DeepSeek V4 Flash** — 1M (1,000,000) token context window
+
+> 注意：虽然 1M 窗口很大，但 website builder 场景中每轮对话涉及 read_file / write_file 的完整文件内容，
+> 单轮实际消耗约 12-15K token（中位数）。因此 1M 窗口大约能撑 30~65 轮无压缩对话，
+> 超长 session 仍然需要压缩机制兜底。
 
 ## 目标
 
@@ -65,17 +73,21 @@
 
 压缩不再被动等待溢出，而是在以下任一条件满足时主动触发：
 
+> **设计依据**：假设拥有 1M context window，但 website builder 场景每轮消耗
+> 约 12-15K token（含完整文件读写）。压缩触发点设在窗口的 ~50%，为后续对话预留充足空间，
+> 同时避免单次 API 调用的 input token 过高导致成本失控。
+
 | 条件 | 阈值 | 说明 |
 |------|------|------|
-| 对话轮数 | 每 N 轮（默认 12 轮） | 轮数 = user message + assistant response 的完整往返 |
-| Token 累积 | 超过 M tokens（默认 50K） | 基于 tiktoken 估算，包含 tool results |
+| 对话轮数 | 每 N 轮（默认 35 轮） | 轮数 = user message + assistant response 的完整往返 |
+| Token 累积 | 超过 M tokens（默认 500K） | 基于 tiktoken 估算，包含 tool results |
 | 取较先触发者 | — | 避免短对话但大量工具输出的场景漏掉 |
 
 ```typescript
 // context-trigger.ts
 interface CompressionTrigger {
-  turnThreshold: number;      // 默认 12
-  tokenThreshold: number;     // 默认 50000
+  turnThreshold: number;      // 默认 35
+  tokenThreshold: number;     // 默认 500000
   currentTurns: number;
   currentTokens: number;
 }
@@ -159,33 +171,33 @@ ProjectFile (用户代码资产 - DB 或 OSS)
 
 ```
 时间线:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━→
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━→
 
-Step 1    5       10    12(压缩触发)  15      20    25    28(结束/销毁)
- │        │        │        │          │       │     │      │
- │        │        │        ├─ ① 发送历史到外部 DB               │
- │        │        │        ├─ ② 外部异步压缩，返回 summary       │
- │        │        │        ├─ Agent 用 summary 替换旧 messages   │
- │        │        │        ├─ Agent 保留 Repo Map + grep_ast    │
- │        │        │        │                                     │
- ├────────┼────────┼────────┼──────────┼───────┼─────┼──────────┤
- │        ③                 ③                  ③                  │
- │     周期性代码同步（每 5 步或每 3 分钟）                        │
- ├────────────────────────────────────────────────────────────────┤
- │                                                                │
- │                                                   ④ 销毁前:    │
- │                                                   ├─ 最终代码全量同步
- │                                                   ├─ 未压缩的剩余 messages 存储
- │                                                   └─ 更新 run 状态
+Step 1    10      20      30    35(压缩触发)  40      50    55    60(结束/销毁)
+ │        │        │       │        │          │       │     │      │
+ │        │        │       │        ├─ ① 发送历史到外部 DB               │
+ │        │        │       │        ├─ ② 外部异步压缩，返回 summary       │
+ │        │        │       │        ├─ Agent 用 summary 替换旧 messages   │
+ │        │        │       │        ├─ Agent 保留 Repo Map + grep_ast    │
+ │        │        │       │        │                                     │
+ ├────────┼────────┼───────┼────────┼──────────┼───────┼─────┼──────────┤
+ │        ③                ③                   ③             ③            │
+ │     周期性代码同步（每 10 步或每 5 分钟）                               │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │                                                                        │
+ │                                                           ④ 销毁前:    │
+ │                                                           ├─ 最终代码全量同步
+ │                                                           ├─ 未压缩的剩余 messages 存储
+ │                                                           └─ 更新 run 状态
 ```
 
 **四种写入触发点说明**：
 
 | 触发点 | 时机 | 写入内容 | 是否阻塞 Agent |
 |--------|------|----------|---------------|
-| ① 压缩触发 | 轮数 ≥ 12 或 token ≥ 50K | 全量历史 messages → 外部 DB | 是（等待 summary 返回） |
+| ① 压缩触发 | 轮数 ≥ 35 或 token ≥ 500K | 全量历史 messages → 外部 DB | 是（等待 summary 返回） |
 | ② 压缩返回 | 外部完成压缩后 | summary 注入 Agent context | — |
-| ③ 周期代码同步 | 每 5 步或每 3 分钟（取先到者） | 变更过的代码文件 → DB/OSS | 否（后台异步） |
+| ③ 周期代码同步 | 每 10 步或每 5 分钟（取先到者） | 变更过的代码文件 → DB/OSS | 否（后台异步） |
 | ④ 销毁前同步 | 沙盒生命周期 pre-destroy hook | 全量代码 + 剩余 messages | 是（必须完成才销毁） |
 
 ### 具体写入流程
@@ -248,7 +260,7 @@ async function handleCompress(req: Request): Promise<Response> {
     previousSummary,
     messages,
     preserveHints,
-    maxOutputTokens: 2000, // 压缩到 ~2000 token
+    maxOutputTokens: 6000, // 压缩到 ~6000 token（覆盖 35 轮需要更大的摘要空间）
   });
 
   // 3. 存压缩产物
@@ -304,8 +316,8 @@ class CodeSyncScheduler {
   private lastSyncStep: number = 0;
   private lastSyncTime: number = Date.now();
   private dirtyFiles: Set<string> = new Set();
-  private syncInterval = 3 * 60 * 1000;  // 3 分钟
-  private stepInterval = 5;               // 每 5 步
+  private syncInterval = 5 * 60 * 1000;  // 5 分钟
+  private stepInterval = 10;              // 每 10 步
 
   // 每次 write_file 时标记脏文件
   markDirty(filePath: string): void {
@@ -447,7 +459,7 @@ class SandboxLifecycle {
 **容错设计**：如果沙盒意外崩溃（未触发 pre-destroy hook），外部系统仍然拥有：
 - 最近一次压缩时存储的全量历史
 - 最近一次周期同步的代码文件
-- 数据丢失窗口 = min(5 步, 3 分钟) 的增量变更
+- 数据丢失窗口 = min(10 步, 5 分钟) 的增量变更
 
 ### 恢复流程（新 Run 启动 / 沙盒重建）
 
@@ -498,17 +510,17 @@ async function restoreAgentState(projectId: string, newRunId: string): Promise<A
 
 ### 数据量估算
 
-一次典型的 run（25 步）：
+一次典型的 run（60 步，大多数 run 不会触发压缩，只有超长 session 才触发）：
 
 ```
 ConversationHistory:
-  - 压缩触发 ~2 次 → 3 条记录（step 1-12, step 13-24, step 25）
-  - 每条 ~50-100KB（JSON messages）
-  - 总计 ~200-300KB
+  - 压缩触发 ~1 次（35 步时触发）→ 2 条记录（step 1-35, step 36-60）
+  - 每条 ~150-400KB（JSON messages，含完整文件内容）
+  - 总计 ~500KB-1MB
 
 CompressionSummary:
-  - 2 条记录（每次压缩产生一条）
-  - 每条 ~3-6KB（纯文本摘要，~2000 token）
+  - 1 条记录（仅在超 35 轮时产生）
+  - 每条 ~8-12KB（纯文本摘要，~6000 token）
 
 ProjectFile:
   - 10-20 个文件
@@ -518,10 +530,15 @@ ProjectFile:
 周期性同步开销:
   - 每次同步仅传输 dirty files（增量）
   - 平均每次 ~20-50KB
-  - 一次 run 中同步 3-5 次 → ~100-250KB 网络传输
+  - 一次 run 中同步 4-6 次（每 10 步）→ ~100-300KB 网络传输
+
+单轮 LLM 调用的 input token 消耗估算:
+  - 每轮（含 read_file / write_file 的完整文件内容）: ~12-15K token
+  - 35 轮后累积: ~420-525K token → 触发压缩
+  - 压缩后 context 大小: ~6K(summary) + 5K(repo map) + 5K(system) + 新对话
 ```
 
-一个活跃项目（10 次 iterate）：~3-5MB。完全不是负担。
+一个活跃项目（10 次 iterate）：~5-10MB。完全不是负担。
 
 ### 沙盒内存中保持的状态（不随压缩丢失，独立于对话历史）
 
@@ -598,7 +615,7 @@ model ProjectFile {
 |------|-------|----------|------|
 | 全量历史对话 | ConversationHistory | 压缩触发时 + 沙盒销毁前 | 分批存，按 step 范围索引，永不丢失 |
 | 压缩后的摘要 | CompressionSummary | 外部压缩服务生成后 | 返回给 Agent 继续使用，跨 run 恢复 |
-| 用户生成的代码 | ProjectFile | 周期同步(每5步/3分钟) + 销毁前全量 | 外部 DB 或 OSS，用户资产永久保存 |
+| 用户生成的代码 | ProjectFile | 周期同步(每10步/5分钟) + 销毁前全量 | 外部 DB 或 OSS，用户资产永久保存 |
 
 三者互相独立，任何一个丢了不影响另外两个。但组合起来可以：
 
@@ -609,10 +626,11 @@ model ProjectFile {
 ### Layer 1 验证标准
 
 - [ ] 压缩触发后，Agent 仍能通过 Repo Map 定位文件（证明结构索引未丢失）
-- [ ] 沙盒意外销毁后重建，代码文件丢失不超过最近 5 步的增量
-- [ ] 外部压缩耗时 < 5s（使用 haiku 级模型），Agent 阻塞感知 < 可接受阈值
+- [ ] 沙盒意外销毁后重建，代码文件丢失不超过最近 10 步的增量
+- [ ] 外部压缩耗时 < 8s（使用 haiku 级模型，summary 增大到 6000 token），Agent 阻塞感知 < 可接受阈值
 - [ ] 跨 run 恢复后，Agent 能正确理解之前的任务上下文（摘要质量人工评估）
 - [ ] 周期性同步不影响 Agent 响应延迟（后台异步，无阻塞）
+- [ ] 大多数短 run（< 35 轮）无需触发压缩，Agent 始终保有完整原始对话
 
 ---
 
@@ -626,20 +644,23 @@ model ProjectFile {
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ Slot A: System Prompt + Tool Definitions      (~3500 token) │  固定
+│ Slot A: System Prompt + Tool Definitions      (~5000 token) │  固定
 ├─────────────────────────────────────────────────────────────┤
-│ Slot B: Compression Summary                   (~2000 token) │  Layer 1 产出
+│ Slot B: Compression Summary                   (~6000 token) │  Layer 1 产出
 ├─────────────────────────────────────────────────────────────┤
-│ Slot C: Repo Map (代码骨架)                    (~1000 token) │  Layer 2 产出
+│ Slot C: Repo Map (代码骨架)                    (~5000 token) │  Layer 2 产出
 ├─────────────────────────────────────────────────────────────┤
-│ Slot D: Task Summary (任务状态)                 (~300 token)  │  Layer 3 产出
+│ Slot D: Task Summary (任务状态)                (~500 token)   │  Layer 3 产出
 ├─────────────────────────────────────────────────────────────┤
-│ Slot E: Retrieved Episodes (检索召回)           (动态分配)    │  Layer 3 产出
+│ Slot E: Retrieved Episodes (检索召回)          (~10000 token) │  Layer 3 产出
 ├─────────────────────────────────────────────────────────────┤
 │ Slot F: Recent Messages (最近对话)              (剩余空间)    │  Layer 1 维护
 ├─────────────────────────────────────────────────────────────┤
-│ [预留] Output Reserve                          (~4096 token) │  模型输出
+│ [预留] Output Reserve                          (~8192 token) │  模型输出
 └─────────────────────────────────────────────────────────────┘
+
+总固定开销: ~34,692 token (~3.5% of 1M)
+Slot F 可用空间: ~965K token（足够容纳 ~65 轮完整对话历史）
 ```
 
 ### 各层产出物的生命周期
@@ -721,7 +742,7 @@ async function restoreAgentState(projectId: string, newRunId: string): Promise<A
 ### 压缩触发时的完整动作清单
 
 ```
-触发条件: 轮数 >= 12 OR token >= 50K
+触发条件: 轮数 >= 35 OR token >= 500K
 ├── Layer 1: 发送 messages → 外部 DB 存储 + LLM 压缩 → 返回 summary
 └── Agent 侧: 用 summary 替换旧 messages，保留 Repo Map / grep_ast / Episodes / TaskSummary
 ```
@@ -779,7 +800,7 @@ from grep_ast import TreeContext, filename_to_lang
 from tree_sitter_languages import get_language, get_parser
 
 
-def get_repo_map(repo_path: str, max_tokens: int = 1024,
+def get_repo_map(repo_path: str, max_tokens: int = 5000,
                  focus_files: list[str] = None) -> dict:
     """生成仓库的结构骨架"""
     src_path = Path(repo_path) / "src"
@@ -874,7 +895,7 @@ if __name__ == "__main__":
     # CLI 模式: python repomap_service.py <repo_path> [max_tokens]
     if len(sys.argv) >= 2:
         repo_path = sys.argv[1]
-        max_tokens = int(sys.argv[2]) if len(sys.argv) > 2 else 1024
+        max_tokens = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
         result = get_repo_map(repo_path, max_tokens)
         print(json.dumps(result, ensure_ascii=False))
     else:
@@ -900,7 +921,7 @@ if __name__ == "__main__":
       properties: {
         max_tokens: {
           type: "number",
-          description: "骨架的最大 token 数，默认 1024。需要更多细节时可以增大。",
+          description: "骨架的最大 token 数，默认 5000。需要更多细节时可以增大。",
         },
       },
     },
@@ -939,7 +960,7 @@ async function executeGetRepoMap(
   args: { max_tokens?: number },
   ctx: ToolContext
 ): Promise<ToolResult> {
-  const maxTokens = args.max_tokens || 1024;
+  const maxTokens = args.max_tokens || 5000;
 
   return new Promise((resolve) => {
     execFile(
@@ -1002,7 +1023,7 @@ async function executeSearchSymbol(
 
 interface AssemblerConfig {
   // ... Layer 1 的配置
-  repoMapBudget: number;        // Repo Map 的 token 预算（默认 1000）
+  repoMapBudget: number;        // Repo Map 的 token 预算（默认 5000）
   autoInjectRepoMap: boolean;   // 是否在每次组装时自动注入骨架
 }
 
@@ -1042,7 +1063,8 @@ class ContextAssembler {
 **与 Layer 1 的配合**：
 - 压缩触发时，Repo Map 缓存不受影响（不属于 messages）
 - 沙盒重建时，文件恢复完毕后立即调用 `generateRepoMap()` 重新生成并 `setRepoMap()`
-- Repo Map 的 token 预算可根据任务阶段动态调节（planning 阶段多给，implementing 阶段少给）
+- Repo Map 的 token 预算可根据任务阶段动态调节（planning 阶段多给如 8000，implementing 阶段少给如 3000）
+- 在 1M context window 下，5000 token 的默认值对 20-30 文件的项目可以展示完整的骨架
 
 ### 2.5 Layer 2 验证标准
 
@@ -1292,4 +1314,4 @@ class TaskSummarizer {
 - [ ] 符号匹配准确率人工评估（抽样 20 个 case）
 - [ ] 对比 Layer 1 vs Layer 3 在跨文件修改任务上的完成质量
 - [ ] 对比有无 TaskSummary (Slot D) 时，压缩后第一步 Agent 的定位准确性
-- [ ] 确认 toSlotD() 的 token 开销 < 300 token
+- [ ] 确认 toSlotD() 的 token 开销 < 500 token
