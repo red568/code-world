@@ -1,7 +1,8 @@
 /**
  * Internal API: 批量同步项目文件
  *
- * agent-runtime 任务完成后调用，批量 upsert 所有项目文件。
+ * POST: agent-runtime 任务完成后调用，批量 upsert 所有项目文件。
+ * GET:  新 run 启动时调用，获取项目所有文件用于恢复沙盒文件系统。
  */
 
 import { prisma } from "@/lib/prisma";
@@ -44,4 +45,25 @@ export async function POST(request: Request) {
   }
 
   return NextResponse.json({ success: true, synced });
+}
+
+export async function GET(request: Request) {
+  const secret = request.headers.get("X-Internal-Secret");
+  if (secret !== process.env.INTERNAL_API_SECRET) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const { searchParams } = new URL(request.url);
+  const projectId = searchParams.get("projectId");
+
+  if (!projectId) {
+    return NextResponse.json({ error: "Missing projectId" }, { status: 400 });
+  }
+
+  const projectFiles = await prisma.projectFile.findMany({
+    where: { projectId },
+    select: { path: true, content: true },
+  });
+
+  return NextResponse.json({ files: projectFiles });
 }

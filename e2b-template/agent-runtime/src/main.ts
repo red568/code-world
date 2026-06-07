@@ -1,7 +1,7 @@
 /**
- * Agent Runtime 入口
+ * Agent Runtime 入口 v2
  *
- * CLI 参数解析 → 初始化模块 → 运行 Loop → 完成后同步文件 → 退出。
+ * CLI 参数解析 → 初始化模块 → 恢复状态 → 生成 Repo Map → 运行 Loop → 完成后同步 → 退出。
  */
 
 import Redis from "ioredis";
@@ -15,6 +15,8 @@ import { createLLMClient, getModel } from "./llm-client.js";
 import { selectMode, getPlanModeSystemAddition } from "./mode-selector.js";
 import { PlanStateManager } from "./plan-state-manager.js";
 import { callInternalAPI } from "./tools.js";
+import { restoreAgentState } from "./restore.js";
+import { generateRepoMap } from "./repo-map.js";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ToolContext, RuntimeConfig, LoggerInterface } from "./types.js";
@@ -28,6 +30,8 @@ const SYSTEM_PROMPT = `你是一个高级全栈网站开发 Agent。用户描述
 - list_files(): 列出 src/ 下所有源码文件
 - run_shell(command): 在项目目录执行 shell 命令
 - get_preview_url(port): 获取公网预览地址（启动 dev server 后调用）
+- get_repo_map(max_tokens): 获取项目代码骨架（函数签名、组件定义、类型声明），快速了解架构
+- search_symbol(pattern, scope): 在代码中搜索符号定义和引用，比 read_file 更精准
 - ask_user(question, options, context): 向用户提问以澄清需求或确认方向
 - finish(summary, success): 任务完成后调用此工具结束执行
 
@@ -72,11 +76,10 @@ const SYSTEM_PROMPT = `你是一个高级全栈网站开发 Agent。用户描述
 - 所有组件都是 TypeScript，带 proper types`;
 
 async function main() {
-  console.log("[AgentBoot] === Agent Runtime Process Started ===");
+  console.log("[AgentBoot] === Agent Runtime v2 Process Started ===");
   console.log(`[AgentBoot] PID=${process.pid} | Node=${process.version} | argv=${process.argv.slice(2).join(" ")}`);
   console.log(`[AgentBoot] CWD=${process.cwd()}`);
 
-  // 在 loadConfig 之前先检查关键环境变量
   const criticalEnvs = ["RUN_ID", "PROJECT_ID", "USER_ID", "REDIS_URL", "LLM_API_KEY", "LLM_BASE_URL", "API_BASE_URL", "INTERNAL_API_SECRET"];
   const envCheck = criticalEnvs.map(k => `${k}=${process.env[k] ? "✓" : "✗ MISSING"}`);
   console.log(`[AgentBoot] Env check: ${envCheck.join(", ")}`);
@@ -105,14 +108,13 @@ async function main() {
     await eventEmitter.connect();
     console.log(`[AgentBoot] EventEmitter connected | took=${Date.now() - emitterStart}ms`);
 
-    logger.info("Agent Runtime starting", {
+    logger.info("Agent Runtime v2 starting", {
       runId: config.runId,
       projectId: config.projectId,
       mode: config.mode,
       resume: config.resume,
     });
 
-    // 发射 running 状态
     await eventEmitter.emitStatusChange("running");
     console.log("[AgentBoot] Status 'running' emitted");
 
@@ -122,9 +124,21 @@ async function main() {
     await skillManager.loadSkills();
     console.log("[AgentBoot] Skills loaded");
 
-    // 获取用户消息（从后端 API 或环境变量）
+    // 获取用户消息
     const userMessage = process.env.USER_MESSAGE || "请根据项目需求继续工作";
     console.log(`[AgentBoot] User message (first 100): ${userMessage.slice(0, 100)}`);
+
+    // ─── v2: 恢复 Agent 状态 ──────────────────────────────────────────
+    console.log("[AgentBoot] Restoring agent state from external DB...");
+    const restoreStart = Date.now();
+    const restoredState = await restoreAgentState(config, logger);
+    console.log(`[AgentBoot] State restored | took=${Date.now() - restoreStart}ms | files=${restoredState.filesRestored} | hasSummary=${!!restoredState.compressionSummary}`);
+
+    // ─── v2: 生成 Repo Map ────────────────────────────────────────────
+    console.log("[AgentBoot] Generating Repo Map...");
+    const repoMapStart = Date.now();
+    const repoMap = await generateRepoMap(config.projectDir, 5000, logger);
+    console.log(`[AgentBoot] Repo Map generated | took=${Date.now() - repoMapStart}ms | length=${repoMap.length}`);
 
     // 模式选择
     const client = createLLMClient(config);
@@ -143,11 +157,15 @@ async function main() {
     }
 
     // 加载对话历史缓存（如果是 iterate 且沙盒复用）
+    // 当沙盒存活（skipFileRestore=true）时，Redis 缓存是最新状态，优先使用。
+    // 此时不需要 DB 恢复的 summary/pendingMessages（sandbox 内存还在）。
     let existingMessages = undefined;
+    let useRestoredState = true;
     if (config.mode === "iterate" && config.skipFileRestore) {
       const cached = await redis.get(`conversation:${config.projectId}`);
       if (cached) {
         existingMessages = JSON.parse(cached);
+        useRestoredState = false; // 沙盒存活，不需要 DB 恢复
         logger.info("Loaded conversation from cache", { messageCount: existingMessages.length });
         console.log(`[AgentBoot] Conversation cache loaded | messages=${existingMessages.length}`);
       } else {
@@ -155,8 +173,8 @@ async function main() {
       }
     }
 
-    // 运行 Agent Loop
-    console.log(`[AgentBoot] Starting Agent Loop | maxSteps=${config.maxSteps}`);
+    // ─── 运行 Agent Loop v2 ────────────────────────────────────────────
+    console.log(`[AgentBoot] Starting Agent Loop v2 | maxSteps=${config.maxSteps}`);
     const loopStart = Date.now();
     const result = await agentLoop({
       config,
@@ -166,6 +184,14 @@ async function main() {
       eventEmitter,
       logger,
       redis,
+      // v2: 仅在沙盒重建时注入恢复的状态
+      initialSummary: useRestoredState ? (restoredState.compressionSummary || undefined) : undefined,
+      initialSummaryCoversStep: useRestoredState ? (restoredState.summaryCoversStepEnd || undefined) : undefined,
+      initialSummaryVersion: useRestoredState ? (restoredState.summaryVersion || undefined) : undefined,
+      pendingMessages: useRestoredState && restoredState.pendingMessages.length > 0
+        ? restoredState.pendingMessages as any[]
+        : undefined,
+      repoMap: repoMap || undefined,
     });
 
     const loopElapsed = Math.round((Date.now() - loopStart) / 1000);
@@ -179,15 +205,10 @@ async function main() {
     // 缓存对话历史（供下次 iterate 复用）
     await redis.setex(
       `conversation:${config.projectId}`,
-      900, // 15 分钟 TTL，与沙盒生命周期一致
+      900,
       JSON.stringify(result.finalMessages)
     );
     console.log("[AgentBoot] Conversation cached to Redis");
-
-    // 同步文件到后端
-    if (result.success) {
-      await syncFilesToBackend(config, logger);
-    }
 
     // 通知后端完成
     const toolCtx: ToolContext = {
@@ -208,9 +229,9 @@ async function main() {
       error: result.success ? undefined : result.summary,
       summary: result.summary,
       previewUrl: result.previewUrl,
+      totalSteps: result.steps,
     });
 
-    // 发射最终状态
     await eventEmitter.emitStatusChange(result.success ? "succeeded" : "failed");
 
     // 清理
@@ -255,59 +276,6 @@ async function main() {
     await eventEmitter.close();
     await redis.quit();
     process.exit(1);
-  }
-}
-
-async function syncFilesToBackend(config: RuntimeConfig, logger: LoggerInterface): Promise<void> {
-  const srcDir = join(config.projectDir, "src");
-  const files: { path: string; content: string }[] = [];
-
-  try {
-    await collectFiles(srcDir, config.projectDir, files);
-  } catch {
-    logger.warn("Failed to collect files for sync");
-    return;
-  }
-
-  if (files.length === 0) return;
-
-  try {
-    const url = `${config.apiBaseUrl}/api/internal/files/sync`;
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Internal-Secret": config.internalApiSecret,
-      },
-      body: JSON.stringify({ projectId: config.projectId, files }),
-    });
-
-    if (response.ok) {
-      logger.info("Files synced to backend", { count: files.length });
-    } else {
-      logger.warn("File sync failed", { status: response.status });
-    }
-  } catch (error) {
-    logger.error("File sync error", { error: String(error) });
-  }
-}
-
-async function collectFiles(
-  dir: string,
-  baseDir: string,
-  files: { path: string; content: string }[]
-): Promise<void> {
-  const entries = await readdir(dir, { withFileTypes: true });
-  for (const entry of entries) {
-    const fullPath = join(dir, entry.name);
-    if (entry.isDirectory()) {
-      if (entry.name === "node_modules" || entry.name === ".git") continue;
-      await collectFiles(fullPath, baseDir, files);
-    } else if (/\.(tsx?|css|json|html|js)$/.test(entry.name)) {
-      const content = await readFile(fullPath, "utf-8");
-      const relativePath = fullPath.replace(baseDir + "/", "").replace(baseDir + "\\", "");
-      files.push({ path: relativePath, content });
-    }
   }
 }
 

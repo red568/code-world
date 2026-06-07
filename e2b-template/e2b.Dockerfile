@@ -8,10 +8,13 @@
 
 FROM node:20-slim
 
-# 安装系统依赖
+# 安装系统依赖 + Python（Repo Map 用）
 RUN apt-get update && apt-get install -y \
     git \
     curl \
+    python3-minimal \
+    python3-pip \
+    && pip3 install tree-sitter grep-ast tree-sitter-languages --break-system-packages \
     && rm -rf /var/lib/apt/lists/*
 
 # ─── Agent Runtime ────────────────────────────────────────────────────────────
@@ -26,6 +29,9 @@ RUN npm install
 COPY agent-runtime/tsconfig.json ./
 COPY agent-runtime/src/ ./src/
 RUN npx tsc
+
+# 复制 Python 工具
+COPY agent-runtime/tools/ ./tools/
 
 # 编译完成，清理 devDependencies 减小体积
 RUN npm prune --omit=dev

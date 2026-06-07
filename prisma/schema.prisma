@@ -45,15 +45,17 @@ model Project {
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
 
-  user              User               @relation(fields: [userId], references: [id])
-  messages          Message[]
-  files             ProjectFile[]
-  buildLogs         BuildLog[]
-  agentRuns         AgentRun[]
-  runs              ProjectRun[]
-  sandboxSession    SandboxSession?
-  agentConversation AgentConversation?
-  skills            Skill[]
+  user                 User                  @relation(fields: [userId], references: [id])
+  messages             Message[]
+  files                ProjectFile[]
+  buildLogs            BuildLog[]
+  agentRuns            AgentRun[]
+  runs                 ProjectRun[]
+  sandboxSession       SandboxSession?
+  agentConversation    AgentConversation?
+  skills               Skill[]
+  conversationHistory  ConversationHistory[]
+  compressionSummaries CompressionSummary[]
 
   @@index([userId])
 }
@@ -81,18 +83,21 @@ model Message {
 // ─── 项目文件快照 ─────────────────────────────────────────────────────────────────
 
 model ProjectFile {
-  id        String   @id @default(uuid())
-  projectId String
-  path      String
-  content   String
-  version   Int      @default(1)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id         String   @id @default(uuid())
+  projectId  String
+  path       String
+  content    String
+  size       Int?
+  version    Int      @default(1)
+  syncSource String   @default("periodic")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
 
   project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@unique([projectId, path])
   @@index([projectId])
+  @@index([projectId, updatedAt])
 }
 
 // ─── 构建日志 ────────────────────────────────────────────────────────────────────
@@ -228,6 +233,43 @@ model AgentConversation {
   project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@index([userId])
+}
+
+// ─── 上下文管理 v2：全量历史落盘 ─────────────────────────────────────────────────────
+
+model ConversationHistory {
+  id         String   @id @default(uuid())
+  projectId  String
+  runId      String
+  messages   Json
+  startStep  Int
+  endStep    Int
+  tokenCount Int
+  isFinal    Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, runId])
+  @@index([projectId, startStep])
+}
+
+model CompressionSummary {
+  id              String   @id @default(uuid())
+  projectId       String
+  runId           String
+  summary         String
+  summaryTokens   Int
+  coversStepStart Int
+  coversStepEnd   Int
+  version         Int
+  modelUsed       String?
+  createdAt       DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, version])
+  @@index([projectId, runId])
 }
 
 // ─── Agent Loop 挂起状态（ask_user 时保存） ──────────────────────────────────────

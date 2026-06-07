@@ -6,12 +6,13 @@
  */
 
 import { readFile, writeFile, mkdir, readdir, stat } from "node:fs/promises";
-import { exec } from "node:child_process";
+import { exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { join, dirname } from "node:path";
 import type { ToolContext, ToolResult, AskUserOption } from "./types.js";
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // ─── Tool Schema（传递给 LLM）──────────────────────────────────────────────────
 
@@ -159,6 +160,45 @@ export const AGENT_TOOLS = [
       },
     },
   },
+  {
+    type: "function" as const,
+    function: {
+      name: "get_repo_map",
+      description:
+        "获取项目源码的结构骨架视图（函数签名、组件定义、类型声明）。用于快速了解项目整体架构，无需逐个读取文件。",
+      parameters: {
+        type: "object",
+        properties: {
+          max_tokens: {
+            type: "number",
+            description: "骨架的最大 token 数，默认 5000",
+          },
+        },
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "search_symbol",
+      description:
+        "在项目代码中搜索符号（函数名、类名、变量名、类型名）的定义和引用。比 read_file 更精准。",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: {
+            type: "string",
+            description: "要搜索的符号名或模式",
+          },
+          scope: {
+            type: "string",
+            description: "限定搜索范围，如 'src/components/' 或 '*.tsx'",
+          },
+        },
+        required: ["pattern"],
+      },
+    },
+  },
 ] as const;
 
 // ─── 安全限制 ────────────────────────────────────────────────────────────────
@@ -196,6 +236,10 @@ export async function executeTool(
       );
     case "finish":
       return executeFinish(args as { summary: string; success: boolean });
+    case "get_repo_map":
+      return executeGetRepoMap(args as { max_tokens?: number }, ctx);
+    case "search_symbol":
+      return executeSearchSymbol(args as { pattern: string; scope?: string }, ctx);
     default:
       return { success: false, output: `Unknown tool: ${name}` };
   }
@@ -414,6 +458,67 @@ async function executeFinish(
     success: args.success,
     output: args.summary,
   };
+}
+
+async function executeGetRepoMap(
+  args: { max_tokens?: number },
+  ctx: ToolContext
+): Promise<ToolResult> {
+  const maxTokens = args.max_tokens || 5000;
+
+  return new Promise((resolve) => {
+    execFile(
+      "python3",
+      ["/agent-runtime/tools/python/repomap_service.py", ctx.projectDir, String(maxTokens)],
+      { timeout: 30000, maxBuffer: 5 * 1024 * 1024 },
+      (error, stdout, stderr) => {
+        if (error) {
+          // 降级：返回简单文件列表
+          executeListFiles(ctx).then((fallback) => {
+            resolve({
+              success: true,
+              output: `[Repo Map 降级为文件列表]\n${fallback.output}`,
+            });
+          });
+          return;
+        }
+        try {
+          const result = JSON.parse(stdout);
+          resolve({ success: true, output: result.map || "No definitions found." });
+        } catch {
+          resolve({ success: true, output: stdout });
+        }
+      }
+    );
+  });
+}
+
+async function executeSearchSymbol(
+  args: { pattern: string; scope?: string },
+  ctx: ToolContext
+): Promise<ToolResult> {
+  const scopeDir = args.scope || "src/";
+  const searchDir = join(ctx.projectDir, scopeDir);
+
+  try {
+    const { stdout } = await execAsync(
+      `grep -rn --include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" "${args.pattern}" "${searchDir}"`,
+      { timeout: 15000, maxBuffer: 2 * 1024 * 1024, cwd: ctx.projectDir }
+    );
+
+    const output = stdout.slice(0, 3000);
+    return { success: true, output: output || "No matches found." };
+  } catch (error) {
+    // grep returns exit 1 when no matches
+    const execError = error as { stdout?: string; code?: number };
+    if (execError.code === 1) {
+      return { success: true, output: "No matches found." };
+    }
+    return {
+      success: false,
+      output: `Search failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
 }
 
 // ─── 内部 API 调用辅助 ──────────────────────────────────────────────────────
